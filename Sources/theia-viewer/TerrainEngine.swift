@@ -23,8 +23,7 @@ final class TerrainEngine {
             }
             lastGraphMTime = graphModificationDate()
         } else {
-            sinkId = "out"
-            buildDefaultGraph()
+            sinkId = ""
         }
     }
 
@@ -51,6 +50,11 @@ final class TerrainEngine {
 
     func loadJSONText(_ text: String) -> Bool {
         theia.graph_load_json_text(handle, text)
+    }
+
+    func setGraphPath(_ path: String?) {
+        graphPath = path
+        lastGraphMTime = graphModificationDate()
     }
 
     private func graphModificationDate() -> Date? {

@@ -13,6 +13,7 @@ public:
         params.set("frequency", 4.0);
         params.set("lacunarity", 2.0);
         params.set("gain", 0.5);
+        params.set("heightScale", 1.0);
     }
     std::size_t inputCount() const override { return 0; }
     bool evaluate(GPUContext& ctx,

@@ -426,12 +426,12 @@ h.test("Graph node and parameter enumeration exposes slider data") {
     h.expect(type0 == "perlin", "first node type \(type0)")
 
     let paramCount = theia.graph_param_count(g, "base")
-    h.expect(paramCount == 5, "base param count \(paramCount)")
+    h.expect(paramCount == 6, "base param count \(paramCount)")
     var names: [String] = []
     for i in 0..<paramCount {
         names.append(readCxxString { theia.graph_param_name(g, "base", i, $0, $1) })
     }
-    h.expect(names == ["frequency", "gain", "lacunarity", "octaves", "seed"],
+    h.expect(names == ["frequency", "gain", "heightScale", "lacunarity", "octaves", "seed"],
              "ordered params \(names)")
     h.expect(theia.graph_param_value(g, "base", "frequency", -1) == 6.5, "frequency value")
     h.expect(theia.graph_param_value(g, "missing", "frequency", 42) == 42, "fallback value")
@@ -588,14 +588,94 @@ h.test("Default sink validation rejects unevaluable JSON transactionally") {
     }
 }
 
+h.test("Empty authoring graph is loadable and first Perlin source evaluates") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+
+    let empty = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "nodes": [],
+      "connections": [],
+      "ui": { "positions": {} }
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, empty),
+             "empty authoring graph should load: \(graphError(g))")
+    let emptyEval = theia.graph_evaluate(g, "", 32, 32, nil, nil)
+    h.expect(!emptyEval.ok, "empty graph should not evaluate without a sink")
+    h.expect(graphError(g).contains("no sink specified"),
+             "empty graph error should mention missing sink: \(graphError(g))")
+
+    let firstPerlin = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "perlin",
+      "nodes": [
+        { "id": "perlin", "type": "perlin", "params": { "seed": 1337 } }
+      ],
+      "connections": [],
+      "ui": {
+        "positions": {
+          "perlin": { "x": 120, "y": 120 }
+        }
+      }
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, firstPerlin),
+             "single Perlin graph should load: \(graphError(g))")
+    let perlinEval = theia.graph_evaluate(g, "", 32, 32, nil, nil)
+    h.expect(perlinEval.ok, "single Perlin should evaluate: \(graphError(g))")
+    h.expect(perlinEval.variance > 1e-5, "single Perlin should produce noise")
+}
+
+h.test("Perlin heightScale controls node-local terrain amplitude") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+
+    let full = """
+    {
+      "resolution": { "width": 64, "height": 64 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 42, "heightScale": 1.0 } }
+      ],
+      "connections": []
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, full), "full scale load: \(graphError(g))")
+    let fullEval = theia.graph_evaluate(g, "", 64, 64, nil, nil)
+    h.expect(fullEval.ok, "full scale eval: \(graphError(g))")
+
+    let low = """
+    {
+      "resolution": { "width": 64, "height": 64 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 42, "heightScale": 0.25 } }
+      ],
+      "connections": []
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, low), "low scale load: \(graphError(g))")
+    let lowEval = theia.graph_evaluate(g, "", 64, 64, nil, nil)
+    h.expect(lowEval.ok, "low scale eval: \(graphError(g))")
+    h.expect(lowEval.mean < fullEval.mean * 0.35,
+             "low scale should lower mean: \(lowEval.mean) vs \(fullEval.mean)")
+    h.expect(lowEval.maxHeight < fullEval.maxHeight * 0.35,
+             "low scale should lower max: \(lowEval.maxHeight) vs \(fullEval.maxHeight)")
+}
+
 h.test("Default node parameter enumeration supports node creation") {
     h.expect(theia.graph_node_type_input_count("perlin") == 0, "perlin inputs")
     h.expect(theia.graph_node_type_input_count("combine") == 2, "combine inputs")
-    h.expect(theia.graph_default_param_count("perlin") == 5, "perlin default count")
+    h.expect(theia.graph_default_param_count("perlin") == 6, "perlin default count")
     let p0 = readCxxString { theia.graph_default_param_name("perlin", 0, $0, $1) }
     h.expect(p0 == "frequency", "first perlin default \(p0)")
     h.expect(theia.graph_default_param_value("perlin", "seed", -1) == 1337,
              "perlin default seed")
+    h.expect(theia.graph_default_param_value("perlin", "heightScale", -1) == 1.0,
+             "perlin default heightScale")
     h.expect(theia.graph_default_param_value("scalebias", "scale", -1) == 1.0,
              "scalebias default scale")
     h.expect(theia.graph_default_param_value("combine", "t", -1) == 0.5,

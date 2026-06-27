@@ -16,7 +16,7 @@ final class TerrainMTKView: MTKView {
         let p = e.locationInWindow
         if let l = lastDrag {
             r.camera.azimuth -= Float(p.x - l.x) * 0.01
-            let el = r.camera.elevation + Float(p.y - l.y) * 0.01
+            let el = r.camera.elevation - Float(p.y - l.y) * 0.01
             r.camera.elevation = max(0.05, min(.pi / 2 - 0.02, el))
         }
         lastDrag = p

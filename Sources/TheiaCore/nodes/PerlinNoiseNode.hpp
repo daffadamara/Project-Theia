@@ -18,6 +18,7 @@ struct PerlinSettings {
     float frequency = 4.0f;
     float lacunarity = 2.0f;
     float gain = 0.5f;
+    float heightScale = 1.0f;
 };
 
 // Fill `hf` with fBm Perlin noise in [0,1]. Returns false + sets `error` on

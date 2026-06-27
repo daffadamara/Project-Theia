@@ -13,6 +13,7 @@
 import AppKit
 import MetalKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct Args {
     var graphPath: String?
@@ -80,23 +81,63 @@ final class HotReloadController: NSObject {
     }
 }
 
+final class AutosaveController: NSObject {
+    let model: TerrainModel
+    var timer: Timer?
+
+    init(model: TerrainModel) {
+        self.model = model
+        super.init()
+        timer = Timer.scheduledTimer(timeInterval: 300, target: self,
+                                     selector: #selector(tick), userInfo: nil,
+                                     repeats: true)
+    }
+
+    @MainActor @objc func tick() {
+        model.autosave()
+    }
+}
+
+@MainActor func saveModelWithPanel(_ model: TerrainModel) {
+    if model.graphPath != nil {
+        _ = model.save()
+        return
+    }
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [.json]
+    panel.nameFieldStringValue = "terrain-graph.json"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    _ = model.save(to: url.path)
+}
+
 let args = parseArgs()
 let viewSize: UInt32 = args.size != 0 ? args.size : 512
 
 guard let device = MTLCreateSystemDefaultDevice() else { fail("no Metal device available") }
 guard let engine = TerrainEngine(graphPath: args.graphPath) else { fail("graph init failed") }
-guard let eval = engine.evaluate(size: viewSize) else {
-    fail("evaluation failed: \(engine.lastError())")
+let initialEval = engine.evaluate(size: viewSize)
+if initialEval == nil, args.graphPath != nil {
+    let error = engine.lastError()
+    if !error.contains("no sink specified") {
+        fail("evaluation failed: \(error)")
+    }
 }
-let evalW = Int(eval.result.width), evalH = Int(eval.result.height)
-print("terrain \(evalW)x\(evalH)  range [\(eval.result.minHeight), \(eval.result.maxHeight)]  nodes run \(eval.result.evaluated)")
+let flatDim = max(2, Int(viewSize))
+let initialHeights = initialEval?.heights ?? [Float](repeating: 0, count: flatDim * flatDim)
+let initialW = initialEval.map { Int($0.result.width) } ?? flatDim
+let initialH = initialEval.map { Int($0.result.height) } ?? flatDim
+if let initialEval {
+    print("terrain \(initialW)x\(initialH)  range [\(initialEval.result.minHeight), \(initialEval.result.maxHeight)]  nodes run \(initialEval.result.evaluated)")
+} else {
+    print("terrain \(initialW)x\(initialH)  flat preview (empty graph)")
+}
 
 // --- Offscreen render mode ---------------------------------------------------
 if let shot = args.shotPath {
     guard let renderer = Renderer(device: device, colorFormat: .bgra8Unorm) else {
         fail("renderer init failed")
     }
-    renderer.setHeights(eval.heights, width: evalW, height: evalH)
+    renderer.setHeights(initialHeights, width: initialW, height: initialH)
     applyCameraOverrides(renderer)
     let ok = renderer.renderToPNG(path: shot, width: 1200, height: 800)
     print(ok ? "✅ wrote \(shot)" : "❌ offscreen render failed")
@@ -122,10 +163,12 @@ mtkView.clearColor = MTLClearColor(red: 0.09, green: 0.11, blue: 0.14, alpha: 1.
 guard let renderer = Renderer(device: device, colorFormat: mtkView.colorPixelFormat) else {
     fail("renderer init failed")
 }
-renderer.setHeights(eval.heights, width: evalW, height: evalH)
+renderer.setHeights(initialHeights, width: initialW, height: initialH)
 applyCameraOverrides(renderer)
 let model = TerrainModel(engine: engine, renderer: renderer, size: viewSize)
-model.record(eval.result)
+if let initialEval {
+    model.record(initialEval.result)
+}
 
 mtkView.rendererRef = renderer
 let viewportDelegate = ViewportDelegate(renderer: renderer)
@@ -134,11 +177,21 @@ mtkView.delegate = viewportDelegate
 let hotReloadController = args.graphPath.map {
     HotReloadController(graphPath: $0, model: model, view: mtkView)
 }
+let autosaveController = AutosaveController(model: model)
 
 let shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
     let chars = event.charactersIgnoringModifiers?.lowercased()
     if event.modifierFlags.contains(.command), chars == "s" {
-        model.save()
+        saveModelWithPanel(model)
+        return nil
+    }
+    if event.modifierFlags.contains(.command), chars == "z" {
+        if event.modifierFlags.contains(.shift) {
+            model.redo()
+        } else {
+            model.undo()
+        }
+        mtkView.setNeedsDisplay(mtkView.bounds)
         return nil
     }
     if event.keyCode == 51 || event.keyCode == 117 {

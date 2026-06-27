@@ -134,7 +134,8 @@ final class Renderer {
                              gridW: gridW, gridH: gridH, pad: 0)
             enc.setRenderPipelineState(pipeline)
             enc.setDepthStencilState(depthState)
-            enc.setCullMode(.none)
+            enc.setFrontFacing(.counterClockwise)
+            enc.setCullMode(.back)
             enc.setTriangleFillMode(wireframeEnabled ? .lines : .fill)
             enc.setVertexBuffer(hb, offset: 0, index: 0)
             enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -146,11 +147,9 @@ final class Renderer {
         enc.endEncoding()
     }
 
-    func applyViewportSettings(heightExaggeration: Double,
-                               lightAzimuthDegrees: Double,
+    func applyViewportSettings(lightAzimuthDegrees: Double,
                                lightElevationDegrees: Double,
                                wireframeEnabled: Bool) {
-        self.heightExaggeration = Float(heightExaggeration)
         self.lightAzimuthDegrees = Float(lightAzimuthDegrees)
         self.lightElevationDegrees = Float(lightElevationDegrees)
         self.wireframeEnabled = wireframeEnabled

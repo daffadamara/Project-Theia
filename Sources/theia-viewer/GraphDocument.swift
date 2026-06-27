@@ -36,39 +36,69 @@ struct GraphDocument: Codable {
     var connections: [GraphDocumentConnection]
     var ui: GraphDocumentUI?
 
+    enum CodingKeys: String, CodingKey {
+        case resolution, sink, nodes, connections, ui
+    }
+
+    init(resolution: GraphResolution,
+         sink: String,
+         nodes: [GraphDocumentNode],
+         connections: [GraphDocumentConnection],
+         ui: GraphDocumentUI?) {
+        self.resolution = resolution
+        self.sink = sink
+        self.nodes = nodes
+        self.connections = connections
+        self.ui = ui
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        resolution = try c.decodeIfPresent(GraphResolution.self, forKey: .resolution)
+            ?? GraphResolution(width: 512, height: 512)
+        sink = try c.decodeIfPresent(String.self, forKey: .sink) ?? ""
+        nodes = try c.decodeIfPresent([GraphDocumentNode].self, forKey: .nodes) ?? []
+        connections = try c.decodeIfPresent([GraphDocumentConnection].self, forKey: .connections) ?? []
+        ui = try c.decodeIfPresent(GraphDocumentUI.self, forKey: .ui)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(resolution, forKey: .resolution)
+        if !sink.isEmpty {
+            try c.encode(sink, forKey: .sink)
+        }
+        try c.encode(nodes, forKey: .nodes)
+        try c.encode(connections, forKey: .connections)
+        if let ui {
+            try c.encode(ui, forKey: .ui)
+        }
+    }
+
     static func load(path: String) throws -> GraphDocument {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         var doc = try JSONDecoder().decode(GraphDocument.self, from: data)
+        doc.ensureNodeDefaults()
         doc.ensureLayout()
         return doc
     }
 
     static func defaultDocument() -> GraphDocument {
-        var doc = GraphDocument(
-            resolution: GraphResolution(width: 512, height: 512),
-            sink: "out",
-            nodes: [
-                GraphDocumentNode(id: "base", type: "perlin",
-                                  params: defaultParams(for: "perlin")),
-                GraphDocumentNode(id: "ero", type: "hydraulic",
-                                  params: defaultParams(for: "hydraulic").merging(
-                                    ["iterations": 150]) { _, override in override }),
-                GraphDocumentNode(id: "settle", type: "thermal",
-                                  params: defaultParams(for: "thermal")),
-                GraphDocumentNode(id: "out", type: "normalize",
-                                  params: defaultParams(for: "normalize")),
-            ],
-            connections: [
-                GraphDocumentConnection(from: "base", to: "ero", input: 0),
-                GraphDocumentConnection(from: "ero", to: "settle", input: 0),
-                GraphDocumentConnection(from: "settle", to: "out", input: 0),
-            ],
-            ui: GraphDocumentUI())
+        var doc = GraphDocument.emptyDocument()
         doc.ensureLayout()
         return doc
     }
 
+    static func emptyDocument(width: UInt32 = 512, height: UInt32 = 512) -> GraphDocument {
+        GraphDocument(resolution: GraphResolution(width: width, height: height),
+                      sink: "",
+                      nodes: [],
+                      connections: [],
+                      ui: GraphDocumentUI())
+    }
+
     mutating func ensureLayout() {
+        ensureNodeDefaults()
         if ui == nil { ui = GraphDocumentUI() }
         var positions = ui?.positions ?? [:]
         for (index, node) in nodes.enumerated() where positions[node.id] == nil {
@@ -81,6 +111,13 @@ struct GraphDocument: Codable {
         ui?.positions = positions
     }
 
+    mutating func ensureNodeDefaults() {
+        for index in nodes.indices {
+            let defaults = Self.defaultParams(for: nodes[index].type)
+            nodes[index].params = defaults.merging(nodes[index].params) { _, saved in saved }
+        }
+    }
+
     func encodedString() throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -88,7 +125,7 @@ struct GraphDocument: Codable {
         return String(decoding: data, as: UTF8.self)
     }
 
-    mutating func addNode(type: String) -> String {
+    mutating func addNode(type: String, after previousId: String? = nil) -> String {
         let base = type
         var id = base
         var suffix = 1
@@ -98,7 +135,17 @@ struct GraphDocument: Codable {
         }
         nodes.append(GraphDocumentNode(id: id, type: type, params: Self.defaultParams(for: type)))
         if ui == nil { ui = GraphDocumentUI() }
-        ui?.positions[id] = GraphNodePosition(x: 120, y: 120)
+        if let previousId, let previous = ui?.positions[previousId] {
+            ui?.positions[id] = GraphNodePosition(x: previous.x + 220, y: previous.y)
+        } else if let last = nodes.dropLast().last,
+                  let previous = ui?.positions[last.id] {
+            ui?.positions[id] = GraphNodePosition(x: previous.x + 220, y: previous.y)
+        } else {
+            ui?.positions[id] = GraphNodePosition(x: 120, y: 120)
+        }
+        if sink.isEmpty && inputCount(for: type) == 0 {
+            sink = id
+        }
         return id
     }
 
@@ -107,6 +154,17 @@ struct GraphDocument: Codable {
         connections.removeAll { $0.from == id || $0.to == id }
         ui?.positions.removeValue(forKey: id)
         if sink == id { sink = nodes.last?.id ?? "" }
+    }
+
+    mutating func deleteNodes(ids: Set<String>) {
+        nodes.removeAll { ids.contains($0.id) }
+        connections.removeAll { ids.contains($0.from) || ids.contains($0.to) }
+        for id in ids {
+            ui?.positions.removeValue(forKey: id)
+        }
+        if ids.contains(sink) {
+            sink = nodes.last?.id ?? ""
+        }
     }
 
     mutating func setParam(nodeId: String, key: String, value: Double) {

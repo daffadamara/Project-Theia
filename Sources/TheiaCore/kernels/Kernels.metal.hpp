@@ -48,7 +48,7 @@ struct PerlinParams {
     float frequency;    // base cells across the unit domain
     float lacunarity;   // frequency multiplier per octave
     float gain;         // amplitude multiplier per octave (persistence)
-    float _pad;
+    float heightScale;  // per-node amplitude for graph authoring
 };
 
 // Integer hash (Wang/xxHash-style mixing) -> uint.
@@ -99,7 +99,8 @@ kernel void perlin_fbm(device float*           out [[buffer(0)]],
     }
     float n = (norm > 0.0) ? (sum / norm) : 0.0;   // ~[-0.707, 0.707]
     n *= 1.41421356;                               // -> ~[-1, 1]
-    out[gid.y * P.width + gid.x] = clamp(0.5 * n + 0.5, 0.0, 1.0);  // -> [0,1]
+    out[gid.y * P.width + gid.x] =
+        clamp((0.5 * n + 0.5) * P.heightScale, 0.0, 1.0);  // -> [0,1]
 }
 )METAL";
 

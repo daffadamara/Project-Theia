@@ -20,7 +20,7 @@ struct PerlinParamsGPU {
     float frequency;
     float lacunarity;
     float gain;
-    float _pad;
+    float heightScale;
 };
 } // namespace
 
@@ -39,6 +39,7 @@ bool generatePerlin(GPUContext& ctx, Heightfield& hf,
     p.frequency = s.frequency;
     p.lacunarity = s.lacunarity;
     p.gain = s.gain;
+    p.heightScale = s.heightScale;
 
     return ctx.dispatch2D(
         "perlin_fbm", kernels::kPerlinFbm, "perlin_fbm", hf.width(), hf.height(),

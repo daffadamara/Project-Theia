@@ -1,5 +1,7 @@
 import MetalKit
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TerrainViewport: NSViewRepresentable {
     let view: TerrainMTKView
@@ -16,12 +18,12 @@ struct ContentView: View {
         HSplitView {
             VSplitView {
                 TerrainViewport(view: viewport)
-                    .frame(minWidth: 560, minHeight: 320)
+                    .frame(minWidth: 560, minHeight: 260, idealHeight: 360)
 
                 NodeEditorCanvas(model: model, viewport: viewport)
-                    .frame(minWidth: 560, minHeight: 240, idealHeight: 320)
+                    .frame(minWidth: 560, minHeight: 320, idealHeight: 460)
             }
-            .frame(minWidth: 560, minHeight: 620)
+            .frame(minWidth: 560, minHeight: 680)
 
             InspectorPanel(model: model, viewport: viewport)
                 .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
@@ -85,16 +87,23 @@ struct GraphActions: View {
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 Button {
-                    model.save()
+                    openDocument()
+                    viewport.setNeedsDisplay(viewport.bounds)
+                } label: {
+                    Label("Load", systemImage: "folder")
+                }
+                .buttonStyle(.borderless)
+                Button {
+                    saveDocument()
+                    viewport.setNeedsDisplay(viewport.bounds)
                 } label: {
                     Label("Save", systemImage: "square.and.arrow.down")
                 }
-                .disabled(!model.isDirty)
                 .buttonStyle(.borderless)
             }
 
             HStack {
-                Text(model.isDirty ? "unsaved changes" : (model.saveStatus.isEmpty ? "saved in memory" : model.saveStatus))
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(model.isDirty ? .orange : .secondary)
                 Spacer()
@@ -110,14 +119,6 @@ struct GraphActions: View {
                         .font(.caption.monospaced())
                         .lineLimit(1)
                     Spacer()
-                    Button {
-                        model.setSink(node.id)
-                        viewport.setNeedsDisplay(viewport.bounds)
-                    } label: {
-                        Label("Sink", systemImage: "target")
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(model.document.sink == node.id)
                 }
             } else if model.selectedConnectionId != nil {
                 HStack {
@@ -136,6 +137,34 @@ struct GraphActions: View {
             }
         }
     }
+
+    private var statusText: String {
+        let state = model.isDirty ? "unsaved changes" :
+            (model.saveStatus.isEmpty ? "saved in memory" : model.saveStatus)
+        guard let path = model.graphPath else { return state }
+        return "\(state) - \(URL(fileURLWithPath: path).lastPathComponent)"
+    }
+
+    private func saveDocument() {
+        if let _ = model.graphPath {
+            _ = model.save()
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "terrain-graph.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        _ = model.save(to: url.path)
+    }
+
+    private func openDocument() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.load(from: url.path)
+    }
 }
 
 struct NodeParameterInspector: View {
@@ -147,7 +176,7 @@ struct NodeParameterInspector: View {
            let node = model.nodes.first(where: { $0.id == selected }) {
             return [node]
         }
-        return model.nodes
+        return []
     }
 
     var body: some View {
@@ -156,6 +185,12 @@ struct NodeParameterInspector: View {
                 Text(model.selectedNodeId == nil ? "Parameters" : "Selected Node")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
+            }
+
+            if visibleNodes.isEmpty {
+                Text(model.document.nodes.isEmpty ? "No nodes" : "No node selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             ForEach(visibleNodes) { node in
@@ -207,12 +242,6 @@ struct ViewportControls: View {
                 }
                 .buttonStyle(.borderless)
             }
-
-            SettingSlider(title: "height",
-                          value: setting(\.heightExaggeration),
-                          range: 0.05...2.0,
-                          step: 0.05,
-                          precision: 2)
 
             SettingSlider(title: "light azimuth",
                           value: setting(\.lightAzimuthDegrees),
@@ -286,7 +315,7 @@ struct ParameterSlider: View {
         self.param = param
         self.onChange = onChange
         _value = State(initialValue: param.value)
-        config = SliderConfig.forParam(name: param.name, value: param.value)
+        config = SliderConfig.forParam(param)
     }
 
     var body: some View {
@@ -320,7 +349,9 @@ struct SliderConfig {
         String(format: "%.\(precision)f", value)
     }
 
-    static func forParam(name: String, value: Double) -> SliderConfig {
+    static func forParam(_ param: GraphParameter) -> SliderConfig {
+        let name = param.name
+        let value = param.value
         switch name {
         case "seed":
             return SliderConfig(range: 0...9999, step: 1, precision: 0)
@@ -346,6 +377,9 @@ struct SliderConfig {
         case "talusAngle":
             return SliderConfig(range: 1...60, step: 0.5, precision: 1)
         case "heightScale":
+            if param.nodeType == "perlin" {
+                return SliderConfig(range: 0...2, step: 0.05, precision: 2)
+            }
             return SliderConfig(range: 1...160, step: 1, precision: 0)
         case "dt":
             return SliderConfig(range: 0.001...0.1, step: 0.001, precision: 3)
