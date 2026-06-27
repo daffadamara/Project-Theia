@@ -4,6 +4,7 @@
 // so this is a plain executable: it runs checks, prints a report, and exits
 // non-zero if anything fails. Run with `swift run theia-tests`.
 
+import Foundation
 import TheiaCore
 
 // --- tiny assertion harness --------------------------------------------------
@@ -97,6 +98,188 @@ h.test("Different seeds produce different terrain") {
     h.expect(a.ok && b.ok, "generation failed")
     h.expect(a.mean != b.mean || a.variance != b.variance,
              "seeds 1 and 2 produced identical stats")
+}
+
+// --- M2: node graph engine ---------------------------------------------------
+
+func graphError(_ g: OpaquePointer) -> String {
+    readCxxString { theia.graph_last_error(g, $0, $1) }
+}
+
+h.test("Graph evaluates a linear chain (topological order)") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_add_node(g, "a", "perlin"), "add a")
+    h.expect(theia.graph_add_node(g, "b", "scalebias"), "add b")
+    h.expect(theia.graph_add_node(g, "c", "scalebias"), "add c")
+    h.expect(theia.graph_connect(g, "a", "b", 0), "connect a->b")
+    h.expect(theia.graph_connect(g, "b", "c", 0), "connect b->c")
+
+    let r = theia.graph_evaluate(g, "c", 256, 256, nil, nil)
+    h.expect(r.ok, "eval failed: \(graphError(g))")
+    h.expect(r.evaluated == 3, "expected 3 evaluated, got \(r.evaluated)")
+    h.expect(r.reused == 0, "expected 0 reused, got \(r.reused)")
+    h.expect(r.variance > 1e-5, "degenerate output")
+}
+
+h.test("Incremental cache recomputes only the affected subgraph") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "a", "perlin")
+    _ = theia.graph_add_node(g, "b", "scalebias")
+    _ = theia.graph_add_node(g, "c", "scalebias")
+    _ = theia.graph_connect(g, "a", "b", 0)
+    _ = theia.graph_connect(g, "b", "c", 0)
+
+    let r1 = theia.graph_evaluate(g, "c", 256, 256, nil, nil)
+    h.expect(r1.evaluated == 3 && r1.reused == 0, "cold: \(r1.evaluated)/\(r1.reused)")
+
+    // No change => full cache hit.
+    let r2 = theia.graph_evaluate(g, "c", 256, 256, nil, nil)
+    h.expect(r2.evaluated == 0 && r2.reused == 3, "warm: \(r2.evaluated)/\(r2.reused)")
+
+    // Change the sink's param => only the sink recomputes; upstream reused.
+    _ = theia.graph_set_param(g, "c", "bias", 0.1)
+    let r3 = theia.graph_evaluate(g, "c", 256, 256, nil, nil)
+    h.expect(r3.evaluated == 1 && r3.reused == 2, "leaf change: \(r3.evaluated)/\(r3.reused)")
+
+    // Change the root's param => everything downstream recomputes.
+    _ = theia.graph_set_param(g, "a", "seed", 4242)
+    let r4 = theia.graph_evaluate(g, "c", 256, 256, nil, nil)
+    h.expect(r4.evaluated == 3 && r4.reused == 0, "root change: \(r4.evaluated)/\(r4.reused)")
+}
+
+h.test("Diamond DAG reuses the unaffected branch") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "a", "perlin")
+    _ = theia.graph_add_node(g, "b", "perlin")
+    _ = theia.graph_add_node(g, "mix", "combine")
+    _ = theia.graph_connect(g, "a", "mix", 0)
+    _ = theia.graph_connect(g, "b", "mix", 1)
+
+    let r1 = theia.graph_evaluate(g, "mix", 256, 256, nil, nil)
+    h.expect(r1.ok && r1.evaluated == 3, "cold: \(r1.evaluated) (\(graphError(g)))")
+
+    // Change only branch "a": a + mix recompute, b reused.
+    _ = theia.graph_set_param(g, "a", "frequency", 8.0)
+    let r2 = theia.graph_evaluate(g, "mix", 256, 256, nil, nil)
+    h.expect(r2.evaluated == 2 && r2.reused == 1, "after a-change: \(r2.evaluated)/\(r2.reused)")
+}
+
+h.test("Cycles are detected and rejected") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "x", "scalebias")
+    _ = theia.graph_add_node(g, "y", "scalebias")
+    _ = theia.graph_connect(g, "x", "y", 0)
+    _ = theia.graph_connect(g, "y", "x", 0)
+    let r = theia.graph_evaluate(g, "y", 64, 64, nil, nil)
+    h.expect(!r.ok, "cycle should fail evaluation")
+    h.expect(graphError(g).contains("cycle"), "error should mention cycle: \(graphError(g))")
+}
+
+h.test("Unknown node type and duplicate id are rejected") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(!theia.graph_add_node(g, "n", "nonsense"), "unknown type should fail")
+    h.expect(theia.graph_add_node(g, "n", "perlin"), "first add ok")
+    h.expect(!theia.graph_add_node(g, "n", "perlin"), "duplicate id should fail")
+}
+
+h.test("JSON round-trip preserves graph behavior") {
+    let tmp = NSTemporaryDirectory() + "theia_rt_\(getpid()).json"
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    var original = theia.GraphEvalResult()
+    do {
+        guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+        defer { theia.graph_destroy(g) }
+        _ = theia.graph_add_node(g, "a", "perlin")
+        _ = theia.graph_add_node(g, "out", "scalebias")
+        _ = theia.graph_set_param(g, "out", "scale", 1.3)
+        _ = theia.graph_connect(g, "a", "out", 0)
+        original = theia.graph_evaluate(g, "out", 256, 256, nil, nil)
+        h.expect(original.ok, "original eval: \(graphError(g))")
+        h.expect(theia.graph_save_json_file(g, tmp), "save failed: \(graphError(g))")
+    }
+
+    guard let g2 = theia.graph_create() else { h.expect(false, "create2 failed"); return }
+    defer { theia.graph_destroy(g2) }
+    h.expect(theia.graph_load_json_file(g2, tmp), "load failed: \(graphError(g2))")
+    let reloaded = theia.graph_evaluate(g2, "out", 256, 256, nil, nil)
+    h.expect(reloaded.ok, "reloaded eval: \(graphError(g2))")
+    h.expect(reloaded.minHeight == original.minHeight, "min differs")
+    h.expect(reloaded.maxHeight == original.maxHeight, "max differs")
+    h.expect(reloaded.mean == original.mean, "mean differs")
+    h.expect(reloaded.variance == original.variance, "variance differs")
+}
+
+h.test("Loads the bundled example graph") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    if theia.graph_load_json_file(g, "examples/terrain.json") {
+        let r = theia.graph_evaluate(g, "", 256, 256, nil, nil)  // "" => default sink
+        h.expect(r.ok, "example eval: \(graphError(g))")
+        h.expect(r.evaluated == 4, "expected 4 nodes, got \(r.evaluated)")
+        h.expect(r.variance > 1e-5, "degenerate example output")
+    } else {
+        print("  (skipping example: \(graphError(g)))")
+    }
+}
+
+// --- M3: erosion -------------------------------------------------------------
+
+h.test("Hydraulic erosion alters terrain and is deterministic") {
+    func run() -> (base: theia.GraphEvalResult, ero: theia.GraphEvalResult)? {
+        guard let g = theia.graph_create() else { return nil }
+        defer { theia.graph_destroy(g) }
+        _ = theia.graph_add_node(g, "p", "perlin")
+        _ = theia.graph_set_param(g, "p", "seed", 2024)
+        _ = theia.graph_add_node(g, "e", "hydraulic")
+        _ = theia.graph_set_param(g, "e", "iterations", 50)
+        _ = theia.graph_connect(g, "p", "e", 0)
+        let base = theia.graph_evaluate(g, "p", 128, 128, nil, nil)
+        let ero = theia.graph_evaluate(g, "e", 128, 128, nil, nil)
+        return (base, ero)
+    }
+    guard let r1 = run(), let r2 = run() else { h.expect(false, "run failed"); return }
+    h.expect(r1.ero.ok, "hydraulic eval failed")
+    h.expect(r1.ero.variance > 1e-6, "degenerate erosion output")
+    h.expect(r1.ero.mean != r1.base.mean, "erosion did not change the terrain")
+    h.expect(r1.ero.mean == r2.ero.mean && r1.ero.variance == r2.ero.variance,
+             "hydraulic erosion is non-deterministic")
+}
+
+h.test("Thermal erosion smooths slopes and lowers peaks") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    _ = theia.graph_set_param(g, "p", "seed", 7)
+    _ = theia.graph_add_node(g, "t", "thermal")
+    _ = theia.graph_set_param(g, "t", "talusAngle", 12.0)
+    _ = theia.graph_set_param(g, "t", "iterations", 80)
+    _ = theia.graph_connect(g, "p", "t", 0)
+
+    let base = theia.graph_evaluate(g, "p", 128, 128, nil, nil)
+    let th = theia.graph_evaluate(g, "t", 128, 128, nil, nil)
+    h.expect(th.ok, "thermal eval failed: \(graphError(g))")
+    h.expect(th.variance < base.variance,
+             "thermal should reduce variance: \(base.variance) -> \(th.variance)")
+    h.expect(th.maxHeight <= base.maxHeight + 1e-4, "thermal should not raise peaks")
+}
+
+h.test("Loads the erosion example graph (perlin->hydraulic->thermal)") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    if theia.graph_load_json_file(g, "examples/erosion.json") {
+        let r = theia.graph_evaluate(g, "", 128, 128, nil, nil)  // default sink
+        h.expect(r.ok, "erosion example eval: \(graphError(g))")
+        h.expect(r.evaluated == 3, "expected 3 nodes, got \(r.evaluated)")
+        h.expect(r.variance > 1e-6, "degenerate erosion-example output")
+    } else {
+        print("  (skipping erosion example: \(graphError(g)))")
+    }
 }
 
 print("\n\(h.checks) checks, \(h.failures) failure(s)")

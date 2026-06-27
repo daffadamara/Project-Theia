@@ -103,5 +103,40 @@ kernel void perlin_fbm(device float*           out [[buffer(0)]],
 }
 )METAL";
 
+// Elementwise affine remap: out = clamp(in * scale + bias, 0, 1).
+inline constexpr const char* kScaleBias = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void scalebias(device float*         out [[buffer(0)]],
+                      device const float*   in  [[buffer(1)]],
+                      constant float2&      sb  [[buffer(2)]],  // x=scale, y=bias
+                      constant uint2&       dim [[buffer(3)]],
+                      uint2                 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+    uint i = gid.y * dim.x + gid.x;
+    out[i] = clamp(in[i] * sb.x + sb.y, 0.0, 1.0);
+}
+)METAL";
+
+// Linear blend of two inputs: out = clamp(mix(a, b, t), 0, 1).
+inline constexpr const char* kCombine = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void combine(device float*         out [[buffer(0)]],
+                    device const float*   a   [[buffer(1)]],
+                    device const float*   b   [[buffer(2)]],
+                    constant float&       t   [[buffer(3)]],
+                    constant uint2&       dim [[buffer(4)]],
+                    uint2                 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+    uint i = gid.y * dim.x + gid.x;
+    out[i] = clamp(mix(a[i], b[i], t), 0.0, 1.0);
+}
+)METAL";
+
 } // namespace kernels
 } // namespace theia

@@ -7,6 +7,7 @@
 // pimpl so this header stays dependency-light.
 //
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@ namespace MTL {
 class Device;
 class CommandQueue;
 class ComputePipelineState;
+class ComputeCommandEncoder;
 } // namespace MTL
 
 namespace theia {
@@ -42,6 +44,16 @@ public:
                                         const char* source,
                                         const char* fnName,
                                         std::string& error);
+
+    // Dispatch a compute kernel over a 2D grid of (width x height) threads,
+    // one thread per heightmap texel. The pipeline is compiled from `source`
+    // (entry `fnName`) and cached under `key`. `bindArgs` is called to bind all
+    // buffers/bytes for the kernel (output buffer, inputs, params). The call is
+    // synchronous (waits for GPU completion). Returns false + sets `error`.
+    bool dispatch2D(const std::string& key, const char* source, const char* fnName,
+                    std::uint32_t width, std::uint32_t height,
+                    const std::function<void(MTL::ComputeCommandEncoder*)>& bindArgs,
+                    std::string& error);
 
     // M0: dispatch the "fill" kernel over `count` floats, writing `value` to
     // each, then read the buffer back into `out`. Returns false + sets `error`

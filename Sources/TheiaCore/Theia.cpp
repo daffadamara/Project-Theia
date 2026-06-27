@@ -70,30 +70,16 @@ GenerateResult generate_perlin(const PerlinParams& p,
     }
 
     // --- Stats (also our determinism / non-degeneracy check) -----------------
-    const float* d = hf.data();
-    const std::size_t n = hf.count();
-    float mn = d[0], mx = d[0];
-    double sum = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const float v = d[i];
-        mn = std::min(mn, v);
-        mx = std::max(mx, v);
-        sum += v;
-    }
-    const double mean = sum / double(n);
-    double var = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double dv = double(d[i]) - mean;
-        var += dv * dv;
-    }
-    var /= double(n);
-
+    float mn, mx;
+    double mean, var;
+    hf.stats(mn, mx, mean, var);
     r.minHeight = mn;
     r.maxHeight = mx;
     r.mean = mean;
     r.variance = var;
 
     // --- Export --------------------------------------------------------------
+    const float* d = hf.data();
     if (pfmPath && pfmPath[0]) {
         if (!writePFM(pfmPath, d, p.width, p.height, error)) {
             r.error = error;

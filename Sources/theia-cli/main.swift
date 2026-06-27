@@ -27,7 +27,46 @@ func usage() {
                                         write a PNG preview + PFM float export.
                                         Defaults: size=1024, out=terrain.png, seed=1337
 
+      theia-cli run GRAPH.json [--sink ID] [--size N] [--out PATH]
+                                        Evaluate a node graph and write outputs.
+                                        sink/size default to values in the JSON.
+                                        Default out=terrain.png
+
     """)
+}
+
+func runGraph(jsonPath: String, sink: String, size: UInt32, outPNG: String) -> Int32 {
+    guard let g = theia.graph_create() else {
+        print("❌ failed to create graph")
+        return 1
+    }
+    defer { theia.graph_destroy(g) }
+
+    if !theia.graph_load_json_file(g, jsonPath) {
+        let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+        print("❌ failed to load \(jsonPath): \(err)")
+        return 1
+    }
+
+    let pfmPath = outPNG.hasSuffix(".png")
+        ? String(outPNG.dropLast(4)) + ".pfm"
+        : outPNG + ".pfm"
+
+    let r = theia.graph_evaluate(g, sink, size, size, outPNG, pfmPath)
+    if r.ok {
+        print("✅ Evaluated graph \(jsonPath)")
+        print("   resolution:   \(r.width)x\(r.height)")
+        print("   nodes run:    \(r.evaluated) (reused \(r.reused) from cache)")
+        print("   height range: [\(r.minHeight), \(r.maxHeight)]")
+        print("   mean / var:   \(r.mean) / \(r.variance)")
+        print("   PNG preview:  \(outPNG)")
+        print("   PFM export:   \(pfmPath)")
+        return 0
+    } else {
+        let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+        print("❌ Evaluation FAILED: \(err)")
+        return 1
+    }
 }
 
 func runDemo(size: UInt32, outPNG: String, seed: UInt32) -> Int32 {
@@ -106,6 +145,26 @@ case "demo":
         i += 1
     }
     exit(runDemo(size: size, outPNG: out, seed: seed))
+case "run":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        print("usage: theia-cli run GRAPH.json [--sink ID] [--size N] [--out PATH]")
+        exit(2)
+    }
+    let jsonPath = args[1]
+    var sink = ""
+    var size: UInt32 = 0  // 0 => use graph default resolution
+    var out = "terrain.png"
+    var i = 2
+    while i < args.count {
+        switch args[i] {
+        case "--sink": if i + 1 < args.count { sink = args[i + 1]; i += 1 }
+        case "--size": if i + 1 < args.count { size = UInt32(args[i + 1]) ?? size; i += 1 }
+        case "--out": if i + 1 < args.count { out = args[i + 1]; i += 1 }
+        default: print("ignoring unknown option: \(args[i])")
+        }
+        i += 1
+    }
+    exit(runGraph(jsonPath: jsonPath, sink: sink, size: size, outPNG: out))
 case "-h", "--help", "help":
     usage()
     exit(0)

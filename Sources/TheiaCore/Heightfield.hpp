@@ -39,6 +39,10 @@ public:
     float* data();
     const float* data() const;
 
+    // Compute min/max/mean/variance over all texels (CPU scan). Also serves as
+    // a non-degeneracy check (variance > 0 means real structure).
+    void stats(float& minV, float& maxV, double& mean, double& variance) const;
+
 private:
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;

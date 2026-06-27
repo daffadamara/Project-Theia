@@ -113,6 +113,46 @@ MTL::ComputePipelineState* GPUContext::pipeline(const std::string& key,
     return pso;
 }
 
+bool GPUContext::dispatch2D(
+    const std::string& key, const char* source, const char* fnName,
+    std::uint32_t width, std::uint32_t height,
+    const std::function<void(MTL::ComputeCommandEncoder*)>& bindArgs,
+    std::string& error) {
+    if (width == 0 || height == 0) {
+        error = "dispatch2D: zero-sized grid";
+        return false;
+    }
+    MTL::ComputePipelineState* pso = pipeline(key, source, fnName, error);
+    if (!pso) return false;
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    MTL::CommandBuffer* cb = impl_->queue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    bindArgs(enc);
+
+    // Non-uniform threadgroups (supported on Apple GPUs): pick a 2D group from
+    // the pipeline's execution width / max threads.
+    const NS::UInteger w = pso->threadExecutionWidth();
+    const NS::UInteger h =
+        std::max<NS::UInteger>(1, pso->maxTotalThreadsPerThreadgroup() / w);
+    MTL::Size grid(width, height, 1);
+    MTL::Size tg(w, h, 1);
+    enc->dispatchThreads(grid, tg);
+    enc->endEncoding();
+    cb->commit();
+    cb->waitUntilCompleted();
+
+    const bool ok = cb->status() == MTL::CommandBufferStatusCompleted;
+    if (!ok) {
+        error = "kernel '" + key + "' did not complete (status " +
+                std::to_string(static_cast<int>(cb->status())) + ")";
+    }
+    pool->release();
+    return ok;
+}
+
 bool GPUContext::runFill(std::uint32_t count, float value,
                          std::vector<float>& out, std::string& error) {
     if (count == 0) {

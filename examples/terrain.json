@@ -1,0 +1,31 @@
+{
+  "resolution": { "width": 1024, "height": 1024 },
+  "sink": "out",
+  "nodes": [
+    {
+      "id": "base",
+      "type": "perlin",
+      "params": { "seed": 1337, "octaves": 6, "frequency": 4.0, "lacunarity": 2.0, "gain": 0.5 }
+    },
+    {
+      "id": "detail",
+      "type": "perlin",
+      "params": { "seed": 99, "octaves": 8, "frequency": 16.0, "lacunarity": 2.0, "gain": 0.45 }
+    },
+    {
+      "id": "mix",
+      "type": "combine",
+      "params": { "t": 0.35 }
+    },
+    {
+      "id": "out",
+      "type": "scalebias",
+      "params": { "scale": 1.15, "bias": -0.05 }
+    }
+  ],
+  "connections": [
+    { "from": "base", "to": "mix", "input": 0 },
+    { "from": "detail", "to": "mix", "input": 1 },
+    { "from": "mix", "to": "out", "input": 0 }
+  ]
+}
