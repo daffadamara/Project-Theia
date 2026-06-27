@@ -120,6 +120,26 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
 
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap);
 
+// Like graph_evaluate, but instead of writing image files it copies the sink's
+// heightfield into `dst` (row-major float, width*height elements) when `dst` is
+// non-null and `capElems >= width*height`. For the 3D viewer.
+GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
+                                       std::uint32_t width, std::uint32_t height,
+                                       float* dst, std::size_t capElems);
+
+// Node/parameter enumeration for the viewer inspector. Strings use the same
+// copy-into-caller-buffer convention as the other Swift-facing accessors.
+std::uint32_t graph_node_count(GraphHandle* g);
+std::size_t graph_node_id(GraphHandle* g, std::uint32_t index,
+                          char* out, std::size_t cap);
+std::size_t graph_node_type(GraphHandle* g, std::uint32_t index,
+                            char* out, std::size_t cap);
+std::uint32_t graph_param_count(GraphHandle* g, const char* nodeId);
+std::size_t graph_param_name(GraphHandle* g, const char* nodeId,
+                             std::uint32_t index, char* out, std::size_t cap);
+double graph_param_value(GraphHandle* g, const char* nodeId, const char* key,
+                         double fallback);
+
 // Comma-separated list of registered node type names (for CLI/help).
 std::size_t node_type_list(char* out, std::size_t cap);
 

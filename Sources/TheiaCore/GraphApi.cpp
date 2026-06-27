@@ -130,6 +130,87 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
     return r;
 }
 
+GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
+                                       std::uint32_t width, std::uint32_t height,
+                                       float* dst, std::size_t capElems) {
+    GraphEvalResult r;
+    if (!g) return r;
+    if (!g->ensureGPU()) return r;
+
+    std::string sink = (sinkId && sinkId[0]) ? sinkId : g->graph.defaultSink();
+    if (sink.empty()) {
+        g->lastError = "no sink specified and graph has no default sink";
+        return r;
+    }
+    const std::uint32_t w = width ? width : g->graph.defaultWidth();
+    const std::uint32_t h = height ? height : g->graph.defaultHeight();
+
+    EvalStats stats;
+    const Heightfield* out =
+        g->graph.evaluate(*g->ctx, sink, w, h, stats, g->lastError);
+    if (!out) return r;
+
+    r.width = w;
+    r.height = h;
+    r.evaluated = stats.evaluated;
+    r.reused = stats.reused;
+    float mn, mx;
+    double mean, var;
+    out->stats(mn, mx, mean, var);
+    r.minHeight = mn;
+    r.maxHeight = mx;
+    r.mean = mean;
+    r.variance = var;
+
+    const std::size_t need = std::size_t(w) * h;
+    if (dst && capElems >= need) {
+        std::memcpy(dst, out->data(), need * sizeof(float));
+    }
+    r.ok = true;
+    return r;
+}
+
+std::uint32_t graph_node_count(GraphHandle* g) {
+    if (!g) return 0;
+    return static_cast<std::uint32_t>(g->graph.nodeCount());
+}
+
+std::size_t graph_node_id(GraphHandle* g, std::uint32_t index,
+                          char* out, std::size_t cap) {
+    const Node* n = g ? g->graph.nodeAt(index) : nullptr;
+    static const std::string empty;
+    return copyOutStr(n ? n->id() : empty, out, cap);
+}
+
+std::size_t graph_node_type(GraphHandle* g, std::uint32_t index,
+                            char* out, std::size_t cap) {
+    const Node* n = g ? g->graph.nodeAt(index) : nullptr;
+    static const std::string empty;
+    return copyOutStr(n ? n->type() : empty, out, cap);
+}
+
+std::uint32_t graph_param_count(GraphHandle* g, const char* nodeId) {
+    if (!g) return 0;
+    return static_cast<std::uint32_t>(
+        g->graph.paramCount(nodeId ? nodeId : ""));
+}
+
+std::size_t graph_param_name(GraphHandle* g, const char* nodeId,
+                             std::uint32_t index, char* out, std::size_t cap) {
+    std::string key;
+    double value = 0.0;
+    if (g) {
+        (void)g->graph.paramAt(nodeId ? nodeId : "", index, key, value);
+    }
+    return copyOutStr(key, out, cap);
+}
+
+double graph_param_value(GraphHandle* g, const char* nodeId, const char* key,
+                         double fallback) {
+    if (!g) return fallback;
+    return g->graph.paramValue(nodeId ? nodeId : "", key ? key : "", fallback);
+}
+
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap) {
     static const std::string empty;
     return copyOutStr(g ? g->lastError : empty, out, cap);

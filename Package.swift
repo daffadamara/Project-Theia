@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "theia-cli", targets: ["theia-cli"]),
+        .executable(name: "theia-viewer", targets: ["theia-viewer"]),
         .executable(name: "theia-tests", targets: ["theia-tests"]),
         .library(name: "TheiaCore", targets: ["TheiaCore"]),
     ],
@@ -40,6 +41,25 @@ let package = Package(
             path: "Sources/theia-cli",
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
+            ]
+        ),
+        // Interactive 3D viewport. Windowed AppKit + MetalKit app (built via
+        // SwiftPM, no Xcode); also supports an offscreen --shot render mode.
+        .executableTarget(
+            name: "theia-viewer",
+            dependencies: ["TheiaCore"],
+            path: "Sources/theia-viewer",
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ],
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("ImageIO"),
+                .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),
         // Self-contained test runner. `swift test` (XCTest) is unavailable in a

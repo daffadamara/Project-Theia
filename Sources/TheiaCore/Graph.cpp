@@ -40,6 +40,41 @@ Node* Graph::node(const std::string& id) {
     return it == nodes_.end() ? nullptr : it->second.get();
 }
 
+std::size_t Graph::nodeCount() const {
+    return nodes_.size();
+}
+
+const Node* Graph::nodeAt(std::size_t index) const {
+    if (index >= nodes_.size()) return nullptr;
+    auto it = nodes_.begin();
+    std::advance(it, index);
+    return it->second.get();
+}
+
+std::size_t Graph::paramCount(const std::string& id) const {
+    auto it = nodes_.find(id);
+    return it == nodes_.end() ? 0 : it->second->params.values.size();
+}
+
+bool Graph::paramAt(const std::string& id, std::size_t index,
+                    std::string& key, double& value) const {
+    auto nit = nodes_.find(id);
+    if (nit == nodes_.end() || index >= nit->second->params.values.size()) {
+        return false;
+    }
+    auto pit = nit->second->params.values.begin();
+    std::advance(pit, index);
+    key = pit->first;
+    value = pit->second;
+    return true;
+}
+
+double Graph::paramValue(const std::string& id, const std::string& key,
+                         double fallback) const {
+    auto it = nodes_.find(id);
+    return it == nodes_.end() ? fallback : it->second->params.get(key, fallback);
+}
+
 bool Graph::setParam(const std::string& id, const std::string& key, double value,
                      std::string& error) {
     Node* n = node(id);
@@ -208,22 +243,22 @@ bool Graph::fromJSON(const std::string& text, std::string& error) {
         return false;
     }
 
-    nodes_.clear();
-    inputs_.clear();
-    cache_.clear();
+    Graph next;
+    next.defaultWidth_ = defaultWidth_;
+    next.defaultHeight_ = defaultHeight_;
 
     if (j.contains("resolution")) {
         const auto& r = j["resolution"];
-        defaultWidth_ = r.value("width", defaultWidth_);
-        defaultHeight_ = r.value("height", defaultHeight_);
+        next.defaultWidth_ = r.value("width", next.defaultWidth_);
+        next.defaultHeight_ = r.value("height", next.defaultHeight_);
     }
-    defaultSink_ = j.value("sink", std::string{});
+    next.defaultSink_ = j.value("sink", std::string{});
 
     if (j.contains("nodes")) {
         for (const auto& jn : j["nodes"]) {
             const std::string id = jn.value("id", std::string{});
             const std::string type = jn.value("type", std::string{});
-            Node* n = addNode(id, type, error);
+            Node* n = next.addNode(id, type, error);
             if (!n) return false;
             if (jn.contains("params")) {
                 for (auto it = jn["params"].begin(); it != jn["params"].end(); ++it) {
@@ -240,8 +275,22 @@ bool Graph::fromJSON(const std::string& text, std::string& error) {
             const std::string from = jc.value("from", std::string{});
             const std::string to = jc.value("to", std::string{});
             const std::uint32_t input = jc.value("input", 0u);
-            if (!connect(from, to, input, error)) return false;
+            if (!next.connect(from, to, input, error)) return false;
         }
+    }
+
+    // Preserve the cache across successful reloads: cache keys are content
+    // hashes, so unchanged nodes can reuse outputs and changed subgraphs still
+    // recompute. Failed reloads leave the previous graph intact.
+    nodes_ = std::move(next.nodes_);
+    inputs_ = std::move(next.inputs_);
+    defaultSink_ = std::move(next.defaultSink_);
+    defaultWidth_ = next.defaultWidth_;
+    defaultHeight_ = next.defaultHeight_;
+
+    // Drop cache entries for nodes that no longer exist.
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        it = nodes_.count(it->first) ? std::next(it) : cache_.erase(it);
     }
     return true;
 }

@@ -57,6 +57,14 @@ public:
     std::uint32_t defaultHeight() const { return defaultHeight_; }
     void setDefaults(const std::string& sink, std::uint32_t w, std::uint32_t h);
 
+    std::size_t nodeCount() const;
+    const Node* nodeAt(std::size_t index) const;
+    std::size_t paramCount(const std::string& id) const;
+    bool paramAt(const std::string& id, std::size_t index,
+                 std::string& key, double& value) const;
+    double paramValue(const std::string& id, const std::string& key,
+                      double fallback) const;
+
 private:
     // Post-order DFS from `sinkId` over connected inputs => topological order
     // (dependencies first). Detects cycles and missing nodes.

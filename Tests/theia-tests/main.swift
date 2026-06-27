@@ -215,6 +215,34 @@ h.test("JSON round-trip preserves graph behavior") {
     h.expect(reloaded.variance == original.variance, "variance differs")
 }
 
+h.test("Failed JSON reload leaves the previous graph usable") {
+    let bad = NSTemporaryDirectory() + "theia_bad_\(getpid()).json"
+    defer { try? FileManager.default.removeItem(atPath: bad) }
+    try? """
+    {
+      "sink": "out",
+      "nodes": [
+        { "id": "out", "type": "not-a-node", "params": {} }
+      ]
+    }
+    """.write(toFile: bad, atomically: true, encoding: .utf8)
+
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "a", "perlin")
+    _ = theia.graph_add_node(g, "out", "scalebias")
+    _ = theia.graph_connect(g, "a", "out", 0)
+
+    let before = theia.graph_evaluate(g, "out", 64, 64, nil, nil)
+    h.expect(before.ok, "before eval failed: \(graphError(g))")
+    h.expect(!theia.graph_load_json_file(g, bad), "bad reload should fail")
+
+    let after = theia.graph_evaluate(g, "out", 64, 64, nil, nil)
+    h.expect(after.ok, "graph should survive failed reload: \(graphError(g))")
+    h.expect(after.mean == before.mean, "surviving graph mean changed")
+    h.expect(after.reused == 2, "surviving graph should still use cache, got \(after.reused)")
+}
+
 h.test("Loads the bundled example graph") {
     guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
     defer { theia.graph_destroy(g) }
@@ -348,6 +376,65 @@ h.test("Loads the showcase graph (full pipeline)") {
     } else {
         print("  (skipping showcase: \(graphError(g)))")
     }
+}
+
+// --- Phase 2: viewer support API ---------------------------------------------
+
+h.test("graph_evaluate_heights fills a buffer matching the stats") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    _ = theia.graph_set_param(g, "p", "seed", 2024)
+
+    let w = 64, n = w * w
+    var buf = [Float](repeating: -1, count: n)
+    let r = buf.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "p", UInt32(w), UInt32(w), $0.baseAddress, $0.count)
+    }
+    h.expect(r.ok, "eval failed: \(graphError(g))")
+    h.expect(r.width == 64 && r.height == 64, "dims")
+
+    let mn = buf.min() ?? 0, mx = buf.max() ?? 0
+    h.expect(abs(mn - r.minHeight) < 1e-5, "buffer min \(mn) != stat \(r.minHeight)")
+    h.expect(abs(mx - r.maxHeight) < 1e-5, "buffer max \(mx) != stat \(r.maxHeight)")
+    h.expect(mn >= 0 && mx <= 1, "values out of [0,1]")
+    h.expect(mx > mn, "buffer is flat")
+}
+
+h.test("graph_evaluate_heights tolerates a null/too-small buffer") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    let probe = theia.graph_evaluate_heights(g, "p", 32, 32, nil, 0)
+    h.expect(probe.ok, "null-buffer probe should still evaluate")
+    h.expect(probe.width == 32 && probe.height == 32, "probe dims")
+}
+
+h.test("Graph node and parameter enumeration exposes slider data") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "base", "perlin")
+    _ = theia.graph_set_param(g, "base", "seed", 2024)
+    _ = theia.graph_set_param(g, "base", "frequency", 6.5)
+    _ = theia.graph_add_node(g, "out", "scalebias")
+    _ = theia.graph_set_param(g, "out", "scale", 1.2)
+
+    h.expect(theia.graph_node_count(g) == 2, "expected 2 nodes")
+    let id0 = readCxxString { theia.graph_node_id(g, 0, $0, $1) }
+    let type0 = readCxxString { theia.graph_node_type(g, 0, $0, $1) }
+    h.expect(id0 == "base", "first node id \(id0)")
+    h.expect(type0 == "perlin", "first node type \(type0)")
+
+    let paramCount = theia.graph_param_count(g, "base")
+    h.expect(paramCount == 5, "base param count \(paramCount)")
+    var names: [String] = []
+    for i in 0..<paramCount {
+        names.append(readCxxString { theia.graph_param_name(g, "base", i, $0, $1) })
+    }
+    h.expect(names == ["frequency", "gain", "lacunarity", "octaves", "seed"],
+             "ordered params \(names)")
+    h.expect(theia.graph_param_value(g, "base", "frequency", -1) == 6.5, "frequency value")
+    h.expect(theia.graph_param_value(g, "missing", "frequency", 42) == 42, "fallback value")
 }
 
 print("\n\(h.checks) checks, \(h.failures) failure(s)")
