@@ -1,0 +1,12 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Generated output (heightmaps, previews)
+*.pfm
+*.png
+!docs/**/*.png
