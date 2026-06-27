@@ -87,7 +87,7 @@ GenerateResult generate_perlin(const PerlinParams& p,
         }
     }
     if (pngPath && pngPath[0]) {
-        if (!writePNG8(pngPath, d, p.width, p.height, mn, mx, error)) {
+        if (!writePNG16(pngPath, d, p.width, p.height, mn, mx, error)) {
             r.error = error;
             return r;
         }

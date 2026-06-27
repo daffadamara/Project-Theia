@@ -282,5 +282,73 @@ h.test("Loads the erosion example graph (perlin->hydraulic->thermal)") {
     }
 }
 
+// --- M4: filters + polish ----------------------------------------------------
+
+func perlinThen(_ type: String, configure: (OpaquePointer) -> Void = { _ in })
+    -> theia.GraphEvalResult? {
+    guard let g = theia.graph_create() else { return nil }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    _ = theia.graph_set_param(g, "p", "seed", 2024)
+    _ = theia.graph_add_node(g, "f", type)
+    _ = theia.graph_connect(g, "p", "f", 0)
+    configure(g)
+    return theia.graph_evaluate(g, "f", 128, 128, nil, nil)
+}
+
+h.test("Normalize stretches the range to [0,1]") {
+    guard let r = perlinThen("normalize") else { h.expect(false, "run"); return }
+    h.expect(r.ok, "normalize eval failed")
+    h.expect(r.minHeight < 0.001, "min not ~0: \(r.minHeight)")
+    h.expect(r.maxHeight > 0.999, "max not ~1: \(r.maxHeight)")
+}
+
+h.test("Terrace produces a valid, non-degenerate field") {
+    guard let a = perlinThen("terrace"), let b = perlinThen("terrace") else {
+        h.expect(false, "run"); return
+    }
+    h.expect(a.ok, "terrace eval failed")
+    h.expect(a.minHeight >= 0.0 && a.maxHeight <= 1.0, "out of [0,1]")
+    h.expect(a.variance > 1e-6, "degenerate terrace")
+    h.expect(a.mean == b.mean && a.variance == b.variance, "terrace non-deterministic")
+}
+
+h.test("Slope mask is a valid [0,1] mask with variation") {
+    guard let r = perlinThen("slopemask") else { h.expect(false, "run"); return }
+    h.expect(r.ok, "slopemask eval failed")
+    h.expect(r.minHeight >= 0.0 && r.maxHeight <= 1.0, "mask out of [0,1]")
+    h.expect(r.variance > 1e-6, "mask has no variation")
+}
+
+h.test("16-bit PNG export is well-formed") {
+    let tmp = NSTemporaryDirectory() + "theia_png16_\(getpid()).png"
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    let r = theia.graph_evaluate(g, "p", 64, 64, tmp, nil)
+    h.expect(r.ok, "eval failed: \(graphError(g))")
+
+    guard let bytes = FileManager.default.contents(atPath: tmp) else {
+        h.expect(false, "png not written"); return
+    }
+    let sig: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    h.expect(Array(bytes.prefix(8)) == sig, "bad PNG signature")
+    // IHDR bit-depth byte is at offset 24 (8 sig + 4 len + 4 'IHDR' + 8 w/h).
+    h.expect(bytes.count > 24 && bytes[24] == 16, "expected 16-bit depth, got \(bytes.count > 24 ? Int(bytes[24]) : -1)")
+}
+
+h.test("Loads the showcase graph (full pipeline)") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    if theia.graph_load_json_file(g, "examples/showcase.json") {
+        let r = theia.graph_evaluate(g, "", 128, 128, nil, nil)
+        h.expect(r.ok, "showcase eval: \(graphError(g))")
+        h.expect(r.evaluated == 5, "expected 5 nodes, got \(r.evaluated)")
+    } else {
+        print("  (skipping showcase: \(graphError(g)))")
+    }
+}
+
 print("\n\(h.checks) checks, \(h.failures) failure(s)")
 exit(h.failures == 0 ? 0 : 1)

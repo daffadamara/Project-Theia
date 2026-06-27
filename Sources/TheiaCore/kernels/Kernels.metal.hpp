@@ -138,5 +138,58 @@ kernel void combine(device float*         out [[buffer(0)]],
 }
 )METAL";
 
+// Terrace: quantize heights into N bands with a shaped riser between them,
+// producing stratified plateaus. sharpness >= 1 flattens band tops and steepens
+// the risers.
+inline constexpr const char* kTerrace = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void terrace(device float*        out [[buffer(0)]],
+                    device const float*  in  [[buffer(1)]],
+                    constant float2&     ps  [[buffer(2)]],  // x=steps, y=sharpness
+                    constant uint2&      dim [[buffer(3)]],
+                    uint2                gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+    uint i = gid.y * dim.x + gid.x;
+    float steps = max(1.0, ps.x);
+    float sharp = max(0.001, ps.y);
+    float h = clamp(in[i], 0.0, 1.0);
+    float s = h * steps;
+    float f = floor(s);
+    float r = s - f;                 // position within band [0,1)
+    float shaped = pow(r, sharp);    // flat low, steep riser
+    out[i] = clamp((f + shaped) / steps, 0.0, 1.0);
+}
+)METAL";
+
+// Slope mask: gradient magnitude (in vertically-scaled space) mapped through a
+// smoothstep band -> [0,1]. Useful to drive material/colour by steepness.
+inline constexpr const char* kSlopeMask = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void slopemask(device float*        out [[buffer(0)]],
+                      device const float*  in  [[buffer(1)]],
+                      constant float4&     pr  [[buffer(2)]],  // x=low, y=high, z=heightScale, w=cellSize
+                      constant uint2&      dim [[buffer(3)]],
+                      uint2                gid [[thread_position_in_grid]])
+{
+    uint W = dim.x, H = dim.y;
+    if (gid.x >= W || gid.y >= H) { return; }
+    uint x = gid.x, y = gid.y, i = y * W + x;
+
+    float hL = in[(x > 0)     ? i - 1 : i];
+    float hR = in[(x < W - 1) ? i + 1 : i];
+    float hT = in[(y > 0)     ? i - W : i];
+    float hB = in[(y < H - 1) ? i + W : i];
+    float gx = 0.5 * (hR - hL) * pr.z / pr.w;
+    float gy = 0.5 * (hB - hT) * pr.z / pr.w;
+    float slope = sqrt(gx * gx + gy * gy);
+    out[i] = smoothstep(pr.x, pr.y, slope);
+}
+)METAL";
+
 } // namespace kernels
 } // namespace theia

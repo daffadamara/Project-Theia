@@ -32,6 +32,8 @@ func usage() {
                                         sink/size default to values in the JSON.
                                         Default out=terrain.png
 
+      theia-cli nodes                   List available node types.
+
     """)
 }
 
@@ -165,6 +167,10 @@ case "run":
         i += 1
     }
     exit(runGraph(jsonPath: jsonPath, sink: sink, size: size, outPNG: out))
+case "nodes":
+    let types = readCxxString { theia.node_type_list($0, $1) }
+    print("Available node types: \(types)")
+    exit(0)
 case "-h", "--help", "help":
     usage()
     exit(0)

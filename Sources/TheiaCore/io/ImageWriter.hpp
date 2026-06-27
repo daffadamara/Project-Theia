@@ -20,4 +20,11 @@ bool writePNG8(const char* path, const float* data,
                std::uint32_t width, std::uint32_t height,
                float minV, float maxV, std::string& error);
 
+// Write a 16-bit grayscale PNG, normalizing [minV,maxV] -> [0,65535]. Avoids the
+// banding of 8-bit for heightmaps. Self-contained (stored-block DEFLATE), no
+// external compression dependency.
+bool writePNG16(const char* path, const float* data,
+                std::uint32_t width, std::uint32_t height,
+                float minV, float maxV, std::string& error);
+
 } // namespace theia

@@ -8,6 +8,7 @@
 #include "GPUContext.hpp"
 #include "Graph.hpp"
 #include "Heightfield.hpp"
+#include "Node.hpp"
 #include "io/ImageWriter.hpp"
 
 namespace theia {
@@ -122,7 +123,7 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
         if (!writePFM(pfmPath, out->data(), w, h, g->lastError)) return r;
     }
     if (pngPath && pngPath[0]) {
-        if (!writePNG8(pngPath, out->data(), w, h, mn, mx, g->lastError)) return r;
+        if (!writePNG16(pngPath, out->data(), w, h, mn, mx, g->lastError)) return r;
     }
 
     r.ok = true;
@@ -132,6 +133,15 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap) {
     static const std::string empty;
     return copyOutStr(g ? g->lastError : empty, out, cap);
+}
+
+std::size_t node_type_list(char* out, std::size_t cap) {
+    std::string joined;
+    for (const auto& t : registeredNodeTypes()) {
+        if (!joined.empty()) joined += ", ";
+        joined += t;
+    }
+    return copyOutStr(joined, out, cap);
 }
 
 } // namespace theia

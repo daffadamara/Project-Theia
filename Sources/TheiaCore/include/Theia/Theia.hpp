@@ -81,7 +81,8 @@ std::size_t generate_error(const GenerateResult& r, char* out, std::size_t cap);
 // retrievable via graph_last_error().
 //
 // Node types: "perlin" (0 inputs), "scalebias" (1 input), "combine" (2 inputs),
-// "hydraulic" (1 input, pipe-model erosion), "thermal" (1 input, talus relaxation).
+// "hydraulic" (1 input, pipe-model erosion), "thermal" (1 input, talus relaxation),
+// "terrace" (1 input), "normalize" (1 input), "slopemask" (1 input).
 
 struct GraphHandle;  // opaque; defined in the implementation
 
@@ -118,5 +119,8 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
                                const char* pngPath, const char* pfmPath);
 
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap);
+
+// Comma-separated list of registered node type names (for CLI/help).
+std::size_t node_type_list(char* out, std::size_t cap);
 
 } // namespace theia
