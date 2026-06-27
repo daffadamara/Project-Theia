@@ -437,5 +437,170 @@ h.test("Graph node and parameter enumeration exposes slider data") {
     h.expect(theia.graph_param_value(g, "missing", "frequency", 42) == 42, "fallback value")
 }
 
+h.test("Graph loads JSON text transactionally and ignores editor UI metadata") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    let valid = """
+    {
+      "resolution": { "width": 64, "height": 64 },
+      "sink": "out",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": { "seed": 2024 } },
+        { "id": "out", "type": "normalize", "params": {} }
+      ],
+      "connections": [
+        { "from": "base", "to": "out", "input": 0 }
+      ],
+      "ui": {
+        "positions": {
+          "base": { "x": 120, "y": 80 },
+          "out": { "x": 320, "y": 80 }
+        }
+      }
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, valid), "valid JSON text failed: \(graphError(g))")
+    let first = theia.graph_evaluate(g, "", 64, 64, nil, nil)
+    h.expect(first.ok, "eval failed after JSON text load: \(graphError(g))")
+
+    let bad = """
+    {
+      "sink": "broken",
+      "nodes": [
+        { "id": "broken", "type": "not-a-node", "params": {} }
+      ]
+    }
+    """
+    h.expect(!theia.graph_load_json_text(g, bad), "bad JSON text should fail")
+    let after = theia.graph_evaluate(g, "", 64, 64, nil, nil)
+    h.expect(after.ok, "previous graph should survive failed text load: \(graphError(g))")
+    h.expect(after.reused == 2, "surviving graph should reuse cache, got \(after.reused)")
+}
+
+h.test("Malformed graph JSON shapes fail without aborting or replacing the graph") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    let valid = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "out",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": {} },
+        { "id": "out", "type": "normalize", "params": {} }
+      ],
+      "connections": [
+        { "from": "base", "to": "out", "input": 0 }
+      ]
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, valid), "valid baseline load")
+    let before = theia.graph_evaluate(g, "", 32, 32, nil, nil)
+    h.expect(before.ok, "baseline eval: \(graphError(g))")
+
+    let badCases = [
+        "[]",
+        #"{"resolution":"wide","nodes":[]}"#,
+        #"{"resolution":{"width":0},"nodes":[]}"#,
+        #"{"resolution":{"width":-1},"nodes":[]}"#,
+        #"{"resolution":{"width":"64"},"nodes":[]}"#,
+        #"{"sink":"","nodes":[]}"#,
+        #"{"sink":4,"nodes":[]}"#,
+        #"{"nodes":"oops"}"#,
+        #"{"nodes":["oops"]}"#,
+        #"{"nodes":[{"id":7,"type":"perlin","params":{}}]}"#,
+        #"{"nodes":[{"id":"base","type":7,"params":{}}]}"#,
+        #"{"nodes":[{"id":"base","type":"perlin","params":[]}]}"#,
+        #"{"nodes":[{"id":"base","type":"perlin","params":{"seed":"42"}}]}"#,
+        #"{"nodes":[],"connections":"oops"}"#,
+        #"{"nodes":[],"connections":["oops"]}"#,
+        #"{"nodes":[],"connections":[{"from":7,"to":"out","input":0}]}"#,
+        #"{"nodes":[],"connections":[{"from":"base","to":"out","input":-1}]}"#,
+    ]
+
+    for bad in badCases {
+        h.expect(!theia.graph_load_json_text(g, bad),
+                 "malformed graph JSON should fail: \(bad)")
+        let after = theia.graph_evaluate(g, "", 32, 32, nil, nil)
+        h.expect(after.ok, "graph should survive malformed JSON: \(bad) / \(graphError(g))")
+    }
+}
+
+h.test("Default sink validation rejects unevaluable JSON transactionally") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    let valid = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "out",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": {} },
+        { "id": "out", "type": "normalize", "params": {} }
+      ],
+      "connections": [
+        { "from": "base", "to": "out", "input": 0 }
+      ]
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, valid), "valid baseline load")
+    let before = theia.graph_evaluate(g, "", 32, 32, nil, nil)
+    h.expect(before.ok, "baseline eval: \(graphError(g))")
+
+    let badCases = [
+        """
+        {
+          "sink": "missing",
+          "nodes": [
+            { "id": "base", "type": "perlin", "params": {} }
+          ],
+          "connections": []
+        }
+        """,
+        """
+        {
+          "sink": "out",
+          "nodes": [
+            { "id": "base", "type": "perlin", "params": {} },
+            { "id": "out", "type": "normalize", "params": {} }
+          ],
+          "connections": []
+        }
+        """,
+        """
+        {
+          "sink": "a",
+          "nodes": [
+            { "id": "a", "type": "scalebias", "params": {} },
+            { "id": "b", "type": "scalebias", "params": {} }
+          ],
+          "connections": [
+            { "from": "a", "to": "b", "input": 0 },
+            { "from": "b", "to": "a", "input": 0 }
+          ]
+        }
+        """,
+    ]
+
+    for bad in badCases {
+        h.expect(!theia.graph_load_json_text(g, bad),
+                 "unevaluable default sink should fail load")
+        let after = theia.graph_evaluate(g, "", 32, 32, nil, nil)
+        h.expect(after.ok, "previous graph should survive failed sink validation: \(graphError(g))")
+    }
+}
+
+h.test("Default node parameter enumeration supports node creation") {
+    h.expect(theia.graph_node_type_input_count("perlin") == 0, "perlin inputs")
+    h.expect(theia.graph_node_type_input_count("combine") == 2, "combine inputs")
+    h.expect(theia.graph_default_param_count("perlin") == 5, "perlin default count")
+    let p0 = readCxxString { theia.graph_default_param_name("perlin", 0, $0, $1) }
+    h.expect(p0 == "frequency", "first perlin default \(p0)")
+    h.expect(theia.graph_default_param_value("perlin", "seed", -1) == 1337,
+             "perlin default seed")
+    h.expect(theia.graph_default_param_value("scalebias", "scale", -1) == 1.0,
+             "scalebias default scale")
+    h.expect(theia.graph_default_param_value("combine", "t", -1) == 0.5,
+             "combine default t")
+}
+
 print("\n\(h.checks) checks, \(h.failures) failure(s)")
 exit(h.failures == 0 ? 0 : 1)

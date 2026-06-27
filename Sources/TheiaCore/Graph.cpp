@@ -1,6 +1,7 @@
 #include "Graph.hpp"
 
 #include <functional>
+#include <limits>
 
 #include "Hash.hpp"
 #include "Heightfield.hpp"
@@ -142,6 +143,26 @@ bool Graph::topoOrder(const std::string& sinkId, std::vector<std::string>& order
     return ok;
 }
 
+bool Graph::validateSink(const std::string& sinkId, std::string& error) const {
+    std::vector<std::string> order;
+    if (!topoOrder(sinkId, order, error)) return false;
+    for (const std::string& id : order) {
+        const Node* n = nodes_.at(id).get();
+        auto it = inputs_.find(id);
+        static const std::vector<std::string> emptyInputs;
+        const auto& srcs = it == inputs_.end() ? emptyInputs : it->second;
+        for (std::size_t p = 0; p < n->inputCount(); ++p) {
+            const std::string src = (p < srcs.size()) ? srcs[p] : std::string{};
+            if (src.empty()) {
+                error = "node '" + id + "' input port " + std::to_string(p) +
+                        " is not connected";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 const Heightfield* Graph::evaluate(GPUContext& ctx, const std::string& sinkId,
                                    std::uint32_t w, std::uint32_t h,
                                    EvalStats& stats, std::string& error) {
@@ -242,6 +263,46 @@ bool Graph::fromJSON(const std::string& text, std::string& error) {
         error = "invalid JSON";
         return false;
     }
+    if (!j.is_object()) {
+        error = "graph JSON must be an object";
+        return false;
+    }
+    auto readString = [&](const json& obj, const char* key, std::string& out,
+                          const std::string& context) -> bool {
+        if (!obj.contains(key) || !obj[key].is_string()) {
+            error = context + " '" + key + "' must be a string";
+            return false;
+        }
+        out = obj[key].get<std::string>();
+        return true;
+    };
+    auto readOptionalU32 = [&](const json& obj, const char* key,
+                               std::uint32_t& out,
+                               const std::string& context) -> bool {
+        if (!obj.contains(key)) return true;
+        const auto& value = obj[key];
+        if (!value.is_number_integer()) {
+            error = context + " '" + key + "' must be a non-negative integer";
+            return false;
+        }
+        std::uint64_t wide = 0;
+        if (value.is_number_unsigned()) {
+            wide = value.get<std::uint64_t>();
+        } else {
+            const auto signedValue = value.get<std::int64_t>();
+            if (signedValue < 0) {
+                error = context + " '" + key + "' must be a non-negative integer";
+                return false;
+            }
+            wide = static_cast<std::uint64_t>(signedValue);
+        }
+        if (wide > std::numeric_limits<std::uint32_t>::max()) {
+            error = context + " '" + key + "' is too large";
+            return false;
+        }
+        out = static_cast<std::uint32_t>(wide);
+        return true;
+    };
 
     Graph next;
     next.defaultWidth_ = defaultWidth_;
@@ -249,34 +310,83 @@ bool Graph::fromJSON(const std::string& text, std::string& error) {
 
     if (j.contains("resolution")) {
         const auto& r = j["resolution"];
-        next.defaultWidth_ = r.value("width", next.defaultWidth_);
-        next.defaultHeight_ = r.value("height", next.defaultHeight_);
+        if (!r.is_object()) {
+            error = "resolution must be an object";
+            return false;
+        }
+        if (!readOptionalU32(r, "width", next.defaultWidth_, "resolution")) return false;
+        if (!readOptionalU32(r, "height", next.defaultHeight_, "resolution")) return false;
+        if (next.defaultWidth_ == 0 || next.defaultHeight_ == 0) {
+            error = "resolution width and height must be > 0";
+            return false;
+        }
     }
-    next.defaultSink_ = j.value("sink", std::string{});
+    if (j.contains("sink")) {
+        if (!j["sink"].is_string()) {
+            error = "sink must be a string";
+            return false;
+        }
+        next.defaultSink_ = j["sink"].get<std::string>();
+        if (next.defaultSink_.empty()) {
+            error = "sink must not be empty";
+            return false;
+        }
+    }
 
     if (j.contains("nodes")) {
+        if (!j["nodes"].is_array()) {
+            error = "nodes must be an array";
+            return false;
+        }
         for (const auto& jn : j["nodes"]) {
-            const std::string id = jn.value("id", std::string{});
-            const std::string type = jn.value("type", std::string{});
+            if (!jn.is_object()) {
+                error = "node entries must be objects";
+                return false;
+            }
+            std::string id;
+            std::string type;
+            if (!readString(jn, "id", id, "node")) return false;
+            if (!readString(jn, "type", type, "node '" + id + "'")) return false;
             Node* n = next.addNode(id, type, error);
             if (!n) return false;
             if (jn.contains("params")) {
+                if (!jn["params"].is_object()) {
+                    error = "node '" + id + "' params must be an object";
+                    return false;
+                }
                 for (auto it = jn["params"].begin(); it != jn["params"].end(); ++it) {
-                    if (it.value().is_number()) {
-                        n->params.set(it.key(), it.value().get<double>());
+                    if (!it.value().is_number()) {
+                        error = "node '" + id + "' param '" + it.key() +
+                                "' must be a number";
+                        return false;
                     }
+                    n->params.set(it.key(), it.value().get<double>());
                 }
             }
         }
     }
 
     if (j.contains("connections")) {
+        if (!j["connections"].is_array()) {
+            error = "connections must be an array";
+            return false;
+        }
         for (const auto& jc : j["connections"]) {
-            const std::string from = jc.value("from", std::string{});
-            const std::string to = jc.value("to", std::string{});
-            const std::uint32_t input = jc.value("input", 0u);
+            if (!jc.is_object()) {
+                error = "connection entries must be objects";
+                return false;
+            }
+            std::string from;
+            std::string to;
+            std::uint32_t input = 0;
+            if (!readString(jc, "from", from, "connection")) return false;
+            if (!readString(jc, "to", to, "connection")) return false;
+            if (!readOptionalU32(jc, "input", input, "connection")) return false;
             if (!next.connect(from, to, input, error)) return false;
         }
+    }
+    if (!next.defaultSink_.empty() && !next.validateSink(next.defaultSink_, error)) {
+        return false;
     }
 
     // Preserve the cache across successful reloads: cache keys are content

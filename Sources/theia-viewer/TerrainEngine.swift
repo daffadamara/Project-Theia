@@ -49,6 +49,10 @@ final class TerrainEngine {
         readCxxString { theia.graph_last_error(handle, $0, $1) }
     }
 
+    func loadJSONText(_ text: String) -> Bool {
+        theia.graph_load_json_text(handle, text)
+    }
+
     private func graphModificationDate() -> Date? {
         guard let graphPath else { return nil }
         let attrs = try? FileManager.default.attributesOfItem(atPath: graphPath)

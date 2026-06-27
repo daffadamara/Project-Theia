@@ -135,6 +135,20 @@ let hotReloadController = args.graphPath.map {
     HotReloadController(graphPath: $0, model: model, view: mtkView)
 }
 
+let shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+    let chars = event.charactersIgnoringModifiers?.lowercased()
+    if event.modifierFlags.contains(.command), chars == "s" {
+        model.save()
+        return nil
+    }
+    if event.keyCode == 51 || event.keyCode == 117 {
+        model.deleteSelection()
+        mtkView.setNeedsDisplay(mtkView.bounds)
+        return nil
+    }
+    return event
+}
+
 window.contentView = NSHostingView(
     rootView: ContentView(model: model, viewport: mtkView))
 window.center()
@@ -149,3 +163,6 @@ if args.smoke {
 }
 
 app.run()
+if let shortcutMonitor {
+    NSEvent.removeMonitor(shortcutMonitor)
+}

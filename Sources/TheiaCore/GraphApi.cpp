@@ -71,6 +71,11 @@ bool graph_load_json_file(GraphHandle* g, const char* path) {
     return g->graph.fromJSON(ss.str(), g->lastError);
 }
 
+bool graph_load_json_text(GraphHandle* g, const char* text) {
+    if (!g || !text) return false;
+    return g->graph.fromJSON(text, g->lastError);
+}
+
 bool graph_save_json_file(GraphHandle* g, const char* path) {
     if (!g || !path) return false;
     std::ofstream f(path);
@@ -209,6 +214,34 @@ double graph_param_value(GraphHandle* g, const char* nodeId, const char* key,
                          double fallback) {
     if (!g) return fallback;
     return g->graph.paramValue(nodeId ? nodeId : "", key ? key : "", fallback);
+}
+
+std::uint32_t graph_node_type_input_count(const char* type) {
+    auto n = createNode(type ? type : "", "__defaults__");
+    return n ? static_cast<std::uint32_t>(n->inputCount()) : 0;
+}
+
+std::uint32_t graph_default_param_count(const char* type) {
+    auto n = createNode(type ? type : "", "__defaults__");
+    return n ? static_cast<std::uint32_t>(n->params.values.size()) : 0;
+}
+
+std::size_t graph_default_param_name(const char* type, std::uint32_t index,
+                                     char* out, std::size_t cap) {
+    auto n = createNode(type ? type : "", "__defaults__");
+    std::string key;
+    if (n && index < n->params.values.size()) {
+        auto it = n->params.values.begin();
+        std::advance(it, index);
+        key = it->first;
+    }
+    return copyOutStr(key, out, cap);
+}
+
+double graph_default_param_value(const char* type, const char* key,
+                                 double fallback) {
+    auto n = createNode(type ? type : "", "__defaults__");
+    return n ? n->params.get(key ? key : "", fallback) : fallback;
 }
 
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap) {

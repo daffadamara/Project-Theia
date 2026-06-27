@@ -14,8 +14,14 @@ struct ContentView: View {
 
     var body: some View {
         HSplitView {
-            TerrainViewport(view: viewport)
-                .frame(minWidth: 520, minHeight: 420)
+            VSplitView {
+                TerrainViewport(view: viewport)
+                    .frame(minWidth: 560, minHeight: 320)
+
+                NodeEditorCanvas(model: model, viewport: viewport)
+                    .frame(minWidth: 560, minHeight: 240, idealHeight: 320)
+            }
+            .frame(minWidth: 560, minHeight: 620)
 
             InspectorPanel(model: model, viewport: viewport)
                 .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
@@ -30,7 +36,7 @@ struct InspectorPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Parameters")
+                Text("Inspector")
                     .font(.headline)
                 Spacer()
                 if !model.lastStats.isEmpty {
@@ -46,39 +52,140 @@ struct InspectorPanel: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
+                    GraphActions(model: model, viewport: viewport)
+                        .padding(.horizontal, 14)
+
+                    Divider()
+                        .padding(.horizontal, 14)
+
                     ViewportControls(model: model, viewport: viewport)
                         .padding(.horizontal, 14)
 
                     Divider()
                         .padding(.horizontal, 14)
 
-                    ForEach(model.nodes) { node in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text(node.id)
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text(node.type)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            ForEach(node.params) { param in
-                                ParameterSlider(param: param) { value in
-                                    model.apply(nodeId: param.nodeId,
-                                                param: param.name,
-                                                value: value)
-                                    viewport.setNeedsDisplay(viewport.bounds)
-                                }
-                            }
-                        }
+                    NodeParameterInspector(model: model, viewport: viewport)
                         .padding(.horizontal, 14)
-                    }
                 }
                 .padding(.vertical, 14)
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+}
+
+struct GraphActions: View {
+    @ObservedObject var model: TerrainModel
+    let viewport: TerrainMTKView
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Graph")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Button {
+                    model.save()
+                } label: {
+                    Label("Save", systemImage: "square.and.arrow.down")
+                }
+                .disabled(!model.isDirty)
+                .buttonStyle(.borderless)
+            }
+
+            HStack {
+                Text(model.isDirty ? "unsaved changes" : (model.saveStatus.isEmpty ? "saved in memory" : model.saveStatus))
+                    .font(.caption)
+                    .foregroundStyle(model.isDirty ? .orange : .secondary)
+                Spacer()
+            }
+
+            if let nodeId = model.selectedNodeId,
+               let node = model.document.node(id: nodeId) {
+                HStack {
+                    Text("selected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("\(node.id) / \(node.type)")
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        model.setSink(node.id)
+                        viewport.setNeedsDisplay(viewport.bounds)
+                    } label: {
+                        Label("Sink", systemImage: "target")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(model.document.sink == node.id)
+                }
+            } else if model.selectedConnectionId != nil {
+                HStack {
+                    Text("edge selected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        model.deleteSelection()
+                        viewport.setNeedsDisplay(viewport.bounds)
+                    } label: {
+                        Label("Disconnect", systemImage: "xmark")
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+        }
+    }
+}
+
+struct NodeParameterInspector: View {
+    @ObservedObject var model: TerrainModel
+    let viewport: TerrainMTKView
+
+    var visibleNodes: [GraphNodeInfo] {
+        if let selected = model.selectedNodeId,
+           let node = model.nodes.first(where: { $0.id == selected }) {
+            return [node]
+        }
+        return model.nodes
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(model.selectedNodeId == nil ? "Parameters" : "Selected Node")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+            }
+
+            ForEach(visibleNodes) { node in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(node.id)
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text(node.type)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if node.params.isEmpty {
+                        Text("No parameters")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ForEach(node.params) { param in
+                        ParameterSlider(param: param) { value in
+                            model.apply(nodeId: param.nodeId,
+                                        param: param.name,
+                                        value: value)
+                            viewport.setNeedsDisplay(viewport.bounds)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -95,6 +95,7 @@ bool graph_connect(GraphHandle* g, const char* fromId, const char* toId,
                    std::uint32_t inputIndex);
 
 bool graph_load_json_file(GraphHandle* g, const char* path);
+bool graph_load_json_text(GraphHandle* g, const char* text);
 bool graph_save_json_file(GraphHandle* g, const char* path);
 
 struct GraphEvalResult {
@@ -139,6 +140,12 @@ std::size_t graph_param_name(GraphHandle* g, const char* nodeId,
                              std::uint32_t index, char* out, std::size_t cap);
 double graph_param_value(GraphHandle* g, const char* nodeId, const char* key,
                          double fallback);
+std::uint32_t graph_node_type_input_count(const char* type);
+std::uint32_t graph_default_param_count(const char* type);
+std::size_t graph_default_param_name(const char* type, std::uint32_t index,
+                                     char* out, std::size_t cap);
+double graph_default_param_value(const char* type, const char* key,
+                                 double fallback);
 
 // Comma-separated list of registered node type names (for CLI/help).
 std::size_t node_type_list(char* out, std::size_t cap);

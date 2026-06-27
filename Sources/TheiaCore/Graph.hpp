@@ -70,6 +70,7 @@ private:
     // (dependencies first). Detects cycles and missing nodes.
     bool topoOrder(const std::string& sinkId, std::vector<std::string>& order,
                    std::string& error) const;
+    bool validateSink(const std::string& sinkId, std::string& error) const;
 
     struct CacheEntry {
         std::uint64_t key = 0;
