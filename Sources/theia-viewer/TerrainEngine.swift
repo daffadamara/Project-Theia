@@ -78,27 +78,30 @@ final class TerrainEngine {
     }
 
     // Evaluate the (default) sink at `size` x `size`. Returns heights + result.
-    func evaluate(size: UInt32) -> (heights: [Float], result: theia.GraphEvalResult)? {
+    func evaluate(size: UInt32, sink: String = "") -> (heights: [Float], result: theia.GraphEvalResult)? {
+        let evalSink = sink.isEmpty ? sinkId : sink
         if size > 0 {
             let n = Int(size) * Int(size)
             guard n > 0 else { return nil }
             var buf = [Float](repeating: 0, count: n)
             let r = buf.withUnsafeMutableBufferPointer {
-                theia.graph_evaluate_heights(handle, sinkId, size, size, $0.baseAddress, $0.count)
+                theia.graph_evaluate_heights(handle, evalSink, size, size,
+                                             $0.baseAddress, $0.count)
             }
             guard r.ok else { return nil }
             return (buf, r)
         }
 
         // Probe to learn the resolution (cheap: a second pass reuses the cache).
-        let probe = theia.graph_evaluate_heights(handle, sinkId, size, size, nil, 0)
+        let probe = theia.graph_evaluate_heights(handle, evalSink, size, size, nil, 0)
         guard probe.ok else { return nil }
         let n = Int(probe.width) * Int(probe.height)
         guard n > 0 else { return nil }
 
         var buf = [Float](repeating: 0, count: n)
         let r = buf.withUnsafeMutableBufferPointer {
-            theia.graph_evaluate_heights(handle, sinkId, size, size, $0.baseAddress, $0.count)
+            theia.graph_evaluate_heights(handle, evalSink, size, size,
+                                         $0.baseAddress, $0.count)
         }
         guard r.ok else { return nil }
         return (buf, r)

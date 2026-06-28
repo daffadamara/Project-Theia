@@ -80,9 +80,10 @@ std::size_t generate_error(const GenerateResult& r, char* out, std::size_t cap);
 // evaluate a sink at a resolution. Bool-returning calls store a message
 // retrievable via graph_last_error().
 //
-// Node types: "perlin" (0 inputs), "scalebias" (1 input), "combine" (2 inputs),
-// "hydraulic" (1 input, pipe-model erosion), "thermal" (1 input, talus relaxation),
-// "terrace" (1 input), "normalize" (1 input), "slopemask" (1 input).
+// Node types include generators ("perlin", "ridged"), unary filters/remaps
+// ("scalebias", "invert", "clamp", "remap", "blur", "warp", "hydraulic",
+// "thermal", "terrace", "normalize", "slopemask"), and binary combiners
+// ("combine", "blend").
 
 struct GraphHandle;  // opaque; defined in the implementation
 

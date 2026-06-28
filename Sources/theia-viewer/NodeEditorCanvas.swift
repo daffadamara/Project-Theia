@@ -346,7 +346,7 @@ struct NodeCard: View {
                 .fill(Color(nsColor: .controlBackgroundColor))
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(selected ? Color.accentColor : Color.secondary.opacity(0.35),
+                        .stroke(borderColor,
                                 lineWidth: selected ? 2 : 1))
                 .shadow(color: .black.opacity(0.22), radius: 4, y: 2)
 
@@ -363,6 +363,13 @@ struct NodeCard: View {
                 Spacer()
             }
             .padding(10)
+
+            if isMaskNode {
+                Image(systemName: "circle.lefthalf.filled")
+                    .font(.caption2)
+                    .foregroundStyle(Color.cyan.opacity(0.85))
+                    .position(x: nodeSize.width - 14, y: 14)
+            }
 
             ForEach(0..<Int(inputCount), id: \.self) { input in
                 PortView(color: .green)
@@ -391,6 +398,16 @@ struct NodeCard: View {
         .contextMenu {
             Button("Delete", role: .destructive, action: onDelete)
         }
+    }
+
+    private var isMaskNode: Bool {
+        node.type == "slopemask"
+    }
+
+    private var borderColor: Color {
+        if selected { return .accentColor }
+        if isMaskNode { return Color.cyan.opacity(0.55) }
+        return Color.secondary.opacity(0.35)
     }
 }
 

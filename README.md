@@ -7,7 +7,8 @@ Terrain is built as a graph of operations on a heightfield: generate base noise,
 carve it with hydraulic and thermal erosion, then shape it with filters. All the
 heavy work runs as Metal compute kernels on the GPU.
 
-> **Status:** headless core engine + CLI. No GUI / node editor yet.
+> **Status:** headless core engine + CLI + macOS 3D viewer/node editor with
+> mask/material preview modes.
 
 ## Requirements
 
@@ -42,18 +43,30 @@ swift run theia-tests
 Each run writes a 16-bit grayscale PNG (preview) and a `.pfm` (lossless float
 heightmap) next to it.
 
+The viewer can display the active node as shaded terrain, height, mask, slope,
+normal, or material preview. In `auto` mode, mask-style nodes such as
+`slopemask` are shown as an overlay on their upstream terrain instead of being
+treated as displaced terrain geometry.
+
 ## Node types
 
 | type        | inputs | description                                              |
 |-------------|:------:|----------------------------------------------------------|
 | `perlin`    |   0    | fBm Perlin noise (seed, octaves, frequency, lacunarity, gain) |
+| `ridged`    |   0    | ridged multifractal-style fBm generator                       |
 | `hydraulic` |   1    | hydraulic erosion, Mei et al. 2007 virtual-pipes model   |
 | `thermal`   |   1    | thermal erosion (talus-angle relaxation)                 |
 | `terrace`   |   1    | quantize heights into stratified terraces                |
 | `normalize` |   1    | stretch the actual range to [0,1]                        |
-| `slopemask` |   1    | [0,1] mask from terrain steepness                        |
+| `slopemask` |   1    | [0,1] mask from terrain slope angle                      |
 | `scalebias` |   1    | affine remap `clamp(in*scale + bias)`                    |
 | `combine`   |   2    | linear blend of two inputs                               |
+| `invert`    |   1    | crossfade between heightfield and inverse                 |
+| `clamp`     |   1    | clamp heights to a min/max band                           |
+| `remap`     |   1    | remap an input interval with gamma shaping                |
+| `blur`      |   1    | deterministic clamped-edge box blur                       |
+| `warp`      |   1    | domain-warp source sampling with procedural displacement  |
+| `blend`     |   2    | blend two inputs with mix/add/multiply/max/min/screen     |
 
 See `examples/` for graph files.
 
@@ -71,5 +84,6 @@ See `examples/` for graph files.
 
 ## Roadmap
 
-The core is in place (noise, erosion, filters, graph engine, JSON I/O). Next:
-richer/more realistic erosion, more nodes, a 3D viewport, and a node-editor GUI.
+The core is in place (noise, erosion, filters, graph engine, JSON I/O) and the
+viewer now supports graph authoring plus analysis/material preview. Next:
+export pipeline, richer material workflows, and more natural-process nodes.

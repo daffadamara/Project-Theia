@@ -29,6 +29,9 @@ final class TerrainModel: ObservableObject {
     @Published var lightAzimuthDegrees = 35.0
     @Published var lightElevationDegrees = 58.0
     @Published var wireframeEnabled = false
+    @Published var displayMode: ViewportDisplayMode = .auto
+    @Published var materialPreset: MaterialPreset = .natural
+    @Published var maskOpacity = 0.65
 
     let engine: TerrainEngine
     let renderer: Renderer
@@ -40,6 +43,7 @@ final class TerrainModel: ObservableObject {
     private var redoStack: [GraphDocument] = []
     private var isRestoringHistory = false
     private var isInteractiveMove = false
+    private let maskUtilityTypes: Set<String> = ["invert", "clamp", "remap", "blur"]
 
     init(engine: TerrainEngine, renderer: Renderer, size: UInt32) {
         self.engine = engine
@@ -55,6 +59,7 @@ final class TerrainModel: ObservableObject {
         } else {
             document = GraphDocument.defaultDocument()
         }
+        loadPreviewSettingsFromDocument()
         reloadInspector()
         syncPreviewWithDocument(markDirty: false)
         applyViewportSettings()
@@ -64,14 +69,39 @@ final class TerrainModel: ObservableObject {
         lastStats = "nodes \(result.evaluated), reused \(result.reused)"
     }
 
-    func applyViewportSettings() {
+    func applyViewportSettings(displayMode override: ViewportDisplayMode? = nil) {
         renderer.applyViewportSettings(lightAzimuthDegrees: lightAzimuthDegrees,
                                        lightElevationDegrees: lightElevationDegrees,
-                                       wireframeEnabled: wireframeEnabled)
+                                       wireframeEnabled: wireframeEnabled,
+                                       displayMode: override ?? effectiveDisplayMode(for: document.sink),
+                                       materialPreset: materialPreset,
+                                       maskOpacity: maskOpacity)
     }
 
     func resetCamera() {
         renderer.resetCamera()
+    }
+
+    func setDisplayMode(_ mode: ViewportDisplayMode) {
+        displayMode = mode
+        persistPreviewSettings()
+        _ = refreshTerrain()
+    }
+
+    func setMaterialPreset(_ preset: MaterialPreset) {
+        materialPreset = preset
+        persistPreviewSettings()
+        applyViewportSettings()
+    }
+
+    func setMaskOpacity(_ opacity: Double) {
+        maskOpacity = min(max(opacity, 0), 1)
+        persistPreviewSettings()
+        applyViewportSettings()
+    }
+
+    func activeDisplayModeLabel() -> String {
+        effectiveDisplayMode(for: document.sink).label
     }
 
     func reloadInspector() {
@@ -98,20 +128,47 @@ final class TerrainModel: ObservableObject {
 
     @discardableResult
     func refreshTerrain() -> Bool {
-        guard let updated = engine.evaluate(size: size) else {
+        let dataSink = document.sink
+        guard !dataSink.isEmpty else {
+            setFlatPreview(status: document.nodes.isEmpty ? "empty graph" : "no output")
+            return true
+        }
+
+        let mode = effectiveDisplayMode(for: dataSink)
+        let geometrySink = geometrySink(for: dataSink, mode: mode) ?? dataSink
+        guard let geometry = engine.evaluate(size: size, sink: geometrySink) else {
             lastStats = engine.lastError()
             return false
         }
-        let w = Int(updated.result.width)
-        let h = Int(updated.result.height)
-        renderer.setHeights(updated.heights, width: w, height: h)
-        lastStats = "nodes \(updated.result.evaluated), reused \(updated.result.reused)"
+        let data: (heights: [Float], result: theia.GraphEvalResult)
+        if geometrySink == dataSink {
+            data = geometry
+        } else {
+            guard let evaluatedData = engine.evaluate(size: size, sink: dataSink) else {
+                lastStats = engine.lastError()
+                return false
+            }
+            data = evaluatedData
+        }
+
+        let w = Int(geometry.result.width)
+        let h = Int(geometry.result.height)
+        renderer.setPreview(heights: geometry.heights, data: data.heights, width: w, height: h)
+        applyViewportSettings(displayMode: mode)
+
+        let evaluated = geometry.result.evaluated +
+            (geometrySink == dataSink ? 0 : data.result.evaluated)
+        let reused = geometry.result.reused +
+            (geometrySink == dataSink ? 0 : data.result.reused)
+        lastStats = "nodes \(evaluated), reused \(reused)"
         return true
     }
 
     func setFlatPreview(status: String = "flat preview") {
         let dim = max(2, Int(size == 0 ? document.resolution.width : size))
-        renderer.setHeights([Float](repeating: 0, count: dim * dim), width: dim, height: dim)
+        let flat = [Float](repeating: 0, count: dim * dim)
+        renderer.setPreview(heights: flat, data: flat, width: dim, height: dim)
+        applyViewportSettings(displayMode: .terrain)
         lastStats = status
     }
 
@@ -120,6 +177,7 @@ final class TerrainModel: ObservableObject {
         guard engine.reloadIfChanged() else { return false }
         if let loaded = try? GraphDocument.load(path: path) {
             document = loaded
+            loadPreviewSettingsFromDocument()
             isDirty = false
             saveStatus = "reloaded"
         } else {
@@ -272,13 +330,41 @@ final class TerrainModel: ObservableObject {
             ? (selectedNodeId.map { Set([$0]) } ?? [])
             : selectedNodeIds
         guard !ids.isEmpty else { return }
+        let fallback = fallbackSelectionAfterDeleting(ids: ids)
         pushUndo()
         document.deleteNodes(ids: ids)
-        selectedNodeId = document.nodes.last?.id
+        selectedNodeId = fallback
         selectedNodeIds = selectedNodeId.map { Set([$0]) } ?? []
         document.sink = selectedNodeId ?? ""
         syncPreviewWithDocument(markDirty: true)
         reloadInspector()
+    }
+
+    private func fallbackSelectionAfterDeleting(ids: Set<String>) -> String? {
+        let primary = selectedNodeId.flatMap { ids.contains($0) ? $0 : nil }
+        if let primary,
+           let upstream = document.connections
+               .filter({ $0.to == primary && !ids.contains($0.from) })
+               .sorted(by: { $0.input < $1.input })
+               .first?.from,
+           document.node(id: upstream) != nil {
+            return upstream
+        }
+
+        if let upstream = document.connections
+            .filter({ ids.contains($0.to) && !ids.contains($0.from) })
+            .sorted(by: { $0.input < $1.input })
+            .first?.from,
+           document.node(id: upstream) != nil {
+            return upstream
+        }
+
+        if let firstDeletedIndex = document.nodes.firstIndex(where: { ids.contains($0.id) }) {
+            let before = document.nodes[..<firstDeletedIndex].last { !ids.contains($0.id) }
+            if let before { return before.id }
+        }
+
+        return document.nodes.first { !ids.contains($0.id) }?.id
     }
 
     func connect(from: String, to: String, input: UInt32) {
@@ -369,6 +455,7 @@ final class TerrainModel: ObservableObject {
             document = loaded
             undoStack.removeAll()
             redoStack.removeAll()
+            loadPreviewSettingsFromDocument()
             selectedNodeId = document.sink.isEmpty ? document.nodes.last?.id : document.sink
             selectedNodeIds = selectedNodeId.map { Set([$0]) } ?? []
             selectedConnectionId = nil
@@ -420,6 +507,7 @@ final class TerrainModel: ObservableObject {
         isRestoringHistory = true
         document = snapshot
         document.ensureLayout()
+        loadPreviewSettingsFromDocument()
         selectedNodeId = document.sink.isEmpty ? document.nodes.last?.id : document.sink
         selectedNodeIds = selectedNodeId.map { Set([$0]) } ?? []
         selectedConnectionId = nil
@@ -473,6 +561,69 @@ final class TerrainModel: ObservableObject {
             }
             setFlatPreview(status: "invalid graph")
         }
+    }
+
+    private func loadPreviewSettingsFromDocument() {
+        let preview = document.ui?.preview ?? GraphPreviewSettings()
+        displayMode = preview.displayMode
+        materialPreset = preview.materialPreset
+        maskOpacity = preview.maskOpacity
+    }
+
+    private func persistPreviewSettings() {
+        document.setPreviewSettings(GraphPreviewSettings(
+            displayMode: displayMode,
+            materialPreset: materialPreset,
+            maskOpacity: maskOpacity))
+        documentCanSave = true
+        markDirty()
+    }
+
+    private func effectiveDisplayMode(for nodeId: String) -> ViewportDisplayMode {
+        guard displayMode == .auto else { return displayMode }
+        guard !nodeId.isEmpty, isMaskPreviewNode(nodeId) else { return .terrain }
+        return .mask
+    }
+
+    private func geometrySink(for dataSink: String, mode: ViewportDisplayMode) -> String? {
+        // Terrain tools such as Gaea and World Machine treat masks/coverage maps
+        // as data layered over terrain. Keep geometry from the upstream height
+        // source only when the selected node is actually a mask chain. Terrain
+        // nodes in material mode must keep their own output as geometry.
+        if let maskGeometry = maskGeometrySink(for: dataSink) {
+            return maskGeometry
+        }
+        return dataSink
+    }
+
+    private func isMaskPreviewNode(_ nodeId: String,
+                                   visited: Set<String> = []) -> Bool {
+        guard !visited.contains(nodeId),
+              let node = document.node(id: nodeId) else { return false }
+        if node.type == "slopemask" { return true }
+        guard maskUtilityTypes.contains(node.type),
+              let upstream = inputNodeId(to: nodeId, input: 0) else { return false }
+        var nextVisited = visited
+        nextVisited.insert(nodeId)
+        return isMaskPreviewNode(upstream, visited: nextVisited)
+    }
+
+    private func maskGeometrySink(for nodeId: String,
+                                  visited: Set<String> = []) -> String? {
+        guard !visited.contains(nodeId),
+              let node = document.node(id: nodeId) else { return nil }
+        if node.type == "slopemask" {
+            return inputNodeId(to: nodeId, input: 0)
+        }
+        guard maskUtilityTypes.contains(node.type),
+              let upstream = inputNodeId(to: nodeId, input: 0) else { return nil }
+        var nextVisited = visited
+        nextVisited.insert(nodeId)
+        return maskGeometrySink(for: upstream, visited: nextVisited) ?? upstream
+    }
+
+    private func inputNodeId(to nodeId: String, input: UInt32) -> String? {
+        document.connections.first { $0.to == nodeId && $0.input == input }?.from
     }
 
     private func markDirty() {

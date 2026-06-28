@@ -233,6 +233,9 @@ struct ViewportControls: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Viewport")
                     .font(.subheadline.weight(.semibold))
+                Text(model.activeDisplayModeLabel())
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button {
                     model.resetCamera()
@@ -242,6 +245,55 @@ struct ViewportControls: View {
                 }
                 .buttonStyle(.borderless)
             }
+
+            HStack {
+                Text("display")
+                    .font(.caption)
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { model.displayMode },
+                    set: { mode in
+                        model.setDisplayMode(mode)
+                        redraw()
+                    })) {
+                    ForEach(ViewportDisplayMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 130)
+            }
+
+            HStack {
+                Text("material")
+                    .font(.caption)
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { model.materialPreset },
+                    set: { preset in
+                        model.setMaterialPreset(preset)
+                        redraw()
+                    })) {
+                    ForEach(MaterialPreset.allCases) { preset in
+                        Text(preset.label).tag(preset)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 130)
+            }
+
+            SettingSlider(title: "mask opacity",
+                          value: Binding(
+                            get: { model.maskOpacity },
+                            set: { value in
+                                model.setMaskOpacity(value)
+                                redraw()
+                            }),
+                          range: 0...1,
+                          step: 0.01,
+                          precision: 2)
 
             SettingSlider(title: "light azimuth",
                           value: setting(\.lightAzimuthDegrees),
@@ -324,19 +376,49 @@ struct ParameterSlider: View {
                 Text(param.name)
                     .font(.caption)
                 Spacer()
-                Text(config.format(value))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                if param.nodeType == "blend", param.name == "mode" {
+                    Text(blendModeName(Int(round(value))))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(config.format(value))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
-            Slider(value: $value, in: config.range, step: config.step) { editing in
-                if !editing {
-                    onChange(value)
+            if param.nodeType == "blend", param.name == "mode" {
+                Picker("", selection: Binding(
+                    get: { Int(round(value)) },
+                    set: { mode in
+                        value = Double(mode)
+                        onChange(value)
+                    })) {
+                        ForEach(0..<blendModeNames.count, id: \.self) { mode in
+                            Text(blendModeNames[mode]).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+            } else {
+                Slider(value: $value, in: config.range, step: config.step) { editing in
+                    if !editing {
+                        onChange(value)
+                    }
                 }
             }
         }
         .onChange(of: param.value) { _, newValue in
             value = newValue
         }
+    }
+
+    private var blendModeNames: [String] {
+        ["mix", "add", "multiply", "max", "min", "screen"]
+    }
+
+    private func blendModeName(_ mode: Int) -> String {
+        guard blendModeNames.indices.contains(mode) else { return "mix" }
+        return blendModeNames[mode]
     }
 }
 
@@ -364,21 +446,42 @@ struct SliderConfig {
         case "lacunarity":
             return SliderConfig(range: 1...4, step: 0.05, precision: 2)
         case "gain", "t", "rain", "evaporation", "sedimentCapacity",
-             "suspension", "deposition", "strength", "minTilt":
+             "suspension", "deposition", "minTilt", "opacity", "amount":
             return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "strength":
+            if param.nodeType == "warp" {
+                return SliderConfig(range: 0...0.35, step: 0.005, precision: 3)
+            }
+            return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "mode":
+            return SliderConfig(range: 0...5, step: 1, precision: 0)
+        case "low", "high":
+            if param.nodeType == "slopemask" {
+                return SliderConfig(range: 0...90, step: 1, precision: 0)
+            }
+            return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "min", "max", "inLow", "inHigh", "outLow", "outHigh", "clamp":
+            return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "gamma":
+            return SliderConfig(range: 0.1...4, step: 0.05, precision: 2)
         case "scale":
             return SliderConfig(range: -4...4, step: 0.01, precision: 2)
         case "bias":
             return SliderConfig(range: -1...1, step: 0.01, precision: 2)
+        case "radius":
+            return SliderConfig(range: 0...16, step: 1, precision: 0)
         case "steps":
             return SliderConfig(range: 2...32, step: 1, precision: 0)
-        case "sharpness":
+        case "sharpness", "ridgeSharpness":
             return SliderConfig(range: 0.1...10, step: 0.1, precision: 1)
         case "talusAngle":
             return SliderConfig(range: 1...60, step: 0.5, precision: 1)
         case "heightScale":
-            if param.nodeType == "perlin" {
+            if param.nodeType == "perlin" || param.nodeType == "ridged" {
                 return SliderConfig(range: 0...2, step: 0.05, precision: 2)
+            }
+            if param.nodeType == "slopemask" {
+                return SliderConfig(range: 0...8, step: 0.05, precision: 2)
             }
             return SliderConfig(range: 1...160, step: 1, precision: 0)
         case "dt":

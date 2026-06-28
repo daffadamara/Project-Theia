@@ -7,9 +7,9 @@ namespace theia {
 class SlopeMaskNode : public Node {
 public:
     explicit SlopeMaskNode(std::string id) : Node(std::move(id), "slopemask") {
-        params.set("low", 0.2);
-        params.set("high", 0.8);
-        params.set("heightScale", 64.0);
+        params.set("low", 15.0);
+        params.set("high", 55.0);
+        params.set("heightScale", 1.0);
         params.set("cellSize", 1.0);
     }
     std::size_t inputCount() const override { return 1; }

@@ -9,10 +9,8 @@ import simd
 struct Uniforms {
     var mvp: float4x4
     var lightDirection: SIMD4<Float>
-    var heightScale: Float
-    var gridW: UInt32
-    var gridH: UInt32
-    var pad: UInt32
+    var viewportParams: SIMD4<Float>
+    var gridParams: SIMD4<UInt32>
 }
 
 // Renders a heightfield as a lit, displaced triangle grid. Shared by the live
@@ -27,6 +25,7 @@ final class Renderer {
     private var depthState: MTLDepthStencilState
 
     private var heightBuffer: MTLBuffer?
+    private var dataBuffer: MTLBuffer?
     private var indexBuffer: MTLBuffer?
     private var indexCount = 0
     private(set) var gridW: UInt32 = 0
@@ -37,6 +36,9 @@ final class Renderer {
     var heightExaggeration: Float = 0.5
     private var lightAzimuthDegrees: Float = 35.0
     private var lightElevationDegrees: Float = 58.0
+    private var displayMode: ViewportDisplayMode = .terrain
+    private var materialPreset: MaterialPreset = .natural
+    private var maskOpacity: Float = 0.65
     var wireframeEnabled = false
     var clear = MTLClearColor(red: 0.09, green: 0.11, blue: 0.14, alpha: 1.0)
 
@@ -67,17 +69,29 @@ final class Renderer {
     }
 
     func setHeights(_ heights: [Float], width: Int, height: Int) {
+        setPreview(heights: heights, data: heights, width: width, height: height)
+    }
+
+    func setPreview(heights: [Float], data: [Float], width: Int, height: Int) {
         guard width > 1, height > 1, heights.count >= width * height else { return }
-        let sampled = Self.viewerHeights(heights, width: width, height: height,
-                                         maxGrid: maxViewerGrid)
-        heightBuffer = device.makeBuffer(bytes: sampled.values,
-                                         length: sampled.values.count * MemoryLayout<Float>.stride,
+        let sampledHeights = Self.viewerHeights(heights, width: width, height: height,
+                                                maxGrid: maxViewerGrid)
+        let sourceData = data.count >= width * height ? data : heights
+        let sampledData = Self.viewerHeights(sourceData, width: width, height: height,
+                                            maxGrid: maxViewerGrid)
+        heightBuffer = device.makeBuffer(bytes: sampledHeights.values,
+                                         length: sampledHeights.values.count *
+                                            MemoryLayout<Float>.stride,
                                          options: .storageModeShared)
-        if gridW != UInt32(sampled.width) || gridH != UInt32(sampled.height) ||
+        dataBuffer = device.makeBuffer(bytes: sampledData.values,
+                                       length: sampledData.values.count *
+                                            MemoryLayout<Float>.stride,
+                                         options: .storageModeShared)
+        if gridW != UInt32(sampledHeights.width) || gridH != UInt32(sampledHeights.height) ||
             indexBuffer == nil {
-            buildIndices(width: sampled.width, height: sampled.height)
-            gridW = UInt32(sampled.width)
-            gridH = UInt32(sampled.height)
+            buildIndices(width: sampledHeights.width, height: sampledHeights.height)
+            gridW = UInt32(sampledHeights.width)
+            gridH = UInt32(sampledHeights.height)
         }
     }
 
@@ -126,12 +140,17 @@ final class Renderer {
         guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
             return
         }
-        if let hb = heightBuffer, let ib = indexBuffer, indexCount > 0 {
+        if let hb = heightBuffer, let db = dataBuffer, let ib = indexBuffer,
+           indexCount > 0 {
             let aspect = Float(viewportSize.width / max(1, viewportSize.height))
             var u = Uniforms(mvp: camera.viewProjection(aspect: aspect),
                              lightDirection: lightDirection(),
-                             heightScale: heightExaggeration,
-                             gridW: gridW, gridH: gridH, pad: 0)
+                             viewportParams: SIMD4<Float>(
+                                heightExaggeration,
+                                min(max(maskOpacity, 0), 1),
+                                Float(displayMode.rendererMode),
+                                Float(materialPreset.rendererPreset)),
+                             gridParams: SIMD4<UInt32>(gridW, gridH, 0, 0))
             enc.setRenderPipelineState(pipeline)
             enc.setDepthStencilState(depthState)
             enc.setFrontFacing(.counterClockwise)
@@ -139,6 +158,7 @@ final class Renderer {
             enc.setTriangleFillMode(wireframeEnabled ? .lines : .fill)
             enc.setVertexBuffer(hb, offset: 0, index: 0)
             enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setVertexBuffer(db, offset: 0, index: 2)
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
                                       indexType: .uint32, indexBuffer: ib,
@@ -149,10 +169,16 @@ final class Renderer {
 
     func applyViewportSettings(lightAzimuthDegrees: Double,
                                lightElevationDegrees: Double,
-                               wireframeEnabled: Bool) {
+                               wireframeEnabled: Bool,
+                               displayMode: ViewportDisplayMode,
+                               materialPreset: MaterialPreset,
+                               maskOpacity: Double) {
         self.lightAzimuthDegrees = Float(lightAzimuthDegrees)
         self.lightElevationDegrees = Float(lightElevationDegrees)
         self.wireframeEnabled = wireframeEnabled
+        self.displayMode = displayMode == .auto ? .terrain : displayMode
+        self.materialPreset = materialPreset
+        self.maskOpacity = Float(maskOpacity)
     }
 
     func resetCamera() {

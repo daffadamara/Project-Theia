@@ -1,5 +1,6 @@
 #include "Graph.hpp"
 
+#include <cmath>
 #include <functional>
 #include <limits>
 
@@ -11,6 +12,28 @@
 using json = nlohmann::json;
 
 namespace theia {
+
+namespace {
+
+bool nearlyEqual(double a, double b) {
+    return std::abs(a - b) < 1e-9;
+}
+
+void migrateLegacySlopeMaskDefaults(Node& n) {
+    if (n.type() != "slopemask") return;
+    const double low = n.params.get("low", 15.0);
+    const double high = n.params.get("high", 55.0);
+    const double heightScale = n.params.get("heightScale", 1.0);
+    if ((low >= -1.0 && low <= 1.0 && high >= -1.0 && high <= 1.0) ||
+        high <= low ||
+        nearlyEqual(heightScale, 64.0)) {
+        n.params.set("low", 15.0);
+        n.params.set("high", 55.0);
+        n.params.set("heightScale", 1.0);
+    }
+}
+
+} // namespace
 
 Graph::Graph() = default;
 Graph::~Graph() = default;
@@ -363,6 +386,7 @@ bool Graph::fromJSON(const std::string& text, std::string& error) {
                     n->params.set(it.key(), it.value().get<double>());
                 }
             }
+            migrateLegacySlopeMaskDefaults(*n);
         }
     }
 

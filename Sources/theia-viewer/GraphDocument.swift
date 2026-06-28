@@ -25,8 +25,134 @@ struct GraphNodePosition: Codable, Equatable {
     var y: Double
 }
 
+enum ViewportDisplayMode: String, CaseIterable, Identifiable {
+    case auto
+    case terrain
+    case height
+    case mask
+    case slope
+    case normal
+    case material
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .auto: return "auto"
+        case .terrain: return "terrain"
+        case .height: return "height"
+        case .mask: return "mask"
+        case .slope: return "slope"
+        case .normal: return "normal"
+        case .material: return "material"
+        }
+    }
+
+    var rendererMode: UInt32 {
+        switch self {
+        case .auto, .terrain: return 0
+        case .height: return 1
+        case .mask: return 2
+        case .slope: return 3
+        case .normal: return 4
+        case .material: return 5
+        }
+    }
+}
+
+extension ViewportDisplayMode: Codable {
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = ViewportDisplayMode(rawValue: value) ?? .auto
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
+}
+
+enum MaterialPreset: String, CaseIterable, Identifiable {
+    case natural
+    case alpine
+    case arid
+    case analysis
+
+    var id: String { rawValue }
+
+    var label: String { rawValue }
+
+    var rendererPreset: UInt32 {
+        switch self {
+        case .natural: return 0
+        case .alpine: return 1
+        case .arid: return 2
+        case .analysis: return 3
+        }
+    }
+}
+
+extension MaterialPreset: Codable {
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = MaterialPreset(rawValue: value) ?? .natural
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
+}
+
+struct GraphPreviewSettings: Codable {
+    var displayMode: ViewportDisplayMode = .auto
+    var materialPreset: MaterialPreset = .natural
+    var maskOpacity: Double = 0.65
+
+    enum CodingKeys: String, CodingKey {
+        case displayMode, materialPreset, maskOpacity
+    }
+
+    init(displayMode: ViewportDisplayMode = .auto,
+         materialPreset: MaterialPreset = .natural,
+         maskOpacity: Double = 0.65) {
+        self.displayMode = displayMode
+        self.materialPreset = materialPreset
+        self.maskOpacity = min(max(maskOpacity, 0), 1)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        displayMode = try c.decodeIfPresent(ViewportDisplayMode.self,
+                                            forKey: .displayMode) ?? .auto
+        materialPreset = try c.decodeIfPresent(MaterialPreset.self,
+                                               forKey: .materialPreset) ?? .natural
+        let opacity = try c.decodeIfPresent(Double.self, forKey: .maskOpacity) ?? 0.65
+        maskOpacity = min(max(opacity, 0), 1)
+    }
+}
+
 struct GraphDocumentUI: Codable {
     var positions: [String: GraphNodePosition] = [:]
+    var preview = GraphPreviewSettings()
+
+    enum CodingKeys: String, CodingKey {
+        case positions, preview
+    }
+
+    init(positions: [String: GraphNodePosition] = [:],
+         preview: GraphPreviewSettings = GraphPreviewSettings()) {
+        self.positions = positions
+        self.preview = preview
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        positions = try c.decodeIfPresent([String: GraphNodePosition].self,
+                                          forKey: .positions) ?? [:]
+        preview = try c.decodeIfPresent(GraphPreviewSettings.self,
+                                        forKey: .preview) ?? GraphPreviewSettings()
+    }
 }
 
 struct GraphDocument: Codable {
@@ -115,6 +241,22 @@ struct GraphDocument: Codable {
         for index in nodes.indices {
             let defaults = Self.defaultParams(for: nodes[index].type)
             nodes[index].params = defaults.merging(nodes[index].params) { _, saved in saved }
+            migrateLegacySlopeMaskDefaults(index: index)
+        }
+    }
+
+    private mutating func migrateLegacySlopeMaskDefaults(index: Int) {
+        guard nodes[index].type == "slopemask" else { return }
+        let params = nodes[index].params
+        let low = params["low"] ?? 15.0
+        let high = params["high"] ?? 55.0
+        let heightScale = params["heightScale"] ?? 1.0
+        if (low >= -1.0 && low <= 1.0 && high >= -1.0 && high <= 1.0) ||
+            high <= low ||
+            heightScale == 64.0 {
+            nodes[index].params["low"] = 15.0
+            nodes[index].params["high"] = 55.0
+            nodes[index].params["heightScale"] = 1.0
         }
     }
 
@@ -175,6 +317,11 @@ struct GraphDocument: Codable {
     mutating func setPosition(nodeId: String, x: Double, y: Double) {
         if ui == nil { ui = GraphDocumentUI() }
         ui?.positions[nodeId] = GraphNodePosition(x: x, y: y)
+    }
+
+    mutating func setPreviewSettings(_ settings: GraphPreviewSettings) {
+        if ui == nil { ui = GraphDocumentUI() }
+        ui?.preview = settings
     }
 
     mutating func connect(from: String, to: String, input: UInt32) {

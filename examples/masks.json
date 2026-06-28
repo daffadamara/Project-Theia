@@ -1,0 +1,107 @@
+{
+  "connections": [
+    {
+      "from": "base",
+      "input": 0,
+      "to": "band"
+    },
+    {
+      "from": "band",
+      "input": 0,
+      "to": "limited"
+    },
+    {
+      "from": "limited",
+      "input": 0,
+      "to": "inverted"
+    },
+    {
+      "from": "band",
+      "input": 0,
+      "to": "maskBlend"
+    },
+    {
+      "from": "inverted",
+      "input": 1,
+      "to": "maskBlend"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "base",
+      "params": {
+        "frequency": 4.0,
+        "gain": 0.5,
+        "heightScale": 1.0,
+        "lacunarity": 2.0,
+        "octaves": 6,
+        "seed": 412
+      },
+      "type": "perlin"
+    },
+    {
+      "id": "band",
+      "params": {
+        "clamp": 1,
+        "gamma": 1.7,
+        "inHigh": 0.78,
+        "inLow": 0.32,
+        "outHigh": 1.0,
+        "outLow": 0.0
+      },
+      "type": "remap"
+    },
+    {
+      "id": "limited",
+      "params": {
+        "max": 0.82,
+        "min": 0.18
+      },
+      "type": "clamp"
+    },
+    {
+      "id": "inverted",
+      "params": {
+        "amount": 1.0
+      },
+      "type": "invert"
+    },
+    {
+      "id": "maskBlend",
+      "params": {
+        "mode": 2,
+        "opacity": 0.55
+      },
+      "type": "blend"
+    }
+  ],
+  "resolution": {
+    "height": 512,
+    "width": 512
+  },
+  "sink": "maskBlend",
+  "ui": {
+    "positions": {
+      "band": {
+        "x": 320,
+        "y": 100
+      },
+      "base": {
+        "x": 80,
+        "y": 100
+      },
+      "inverted": {
+        "x": 800,
+        "y": 100
+      },
+      "limited": {
+        "x": 560,
+        "y": 100
+      },
+      "maskBlend": {
+        "x": 1040,
+        "y": 100
+      }
+    }
+  }
+}

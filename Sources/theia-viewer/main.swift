@@ -137,8 +137,11 @@ if let shot = args.shotPath {
     guard let renderer = Renderer(device: device, colorFormat: .bgra8Unorm) else {
         fail("renderer init failed")
     }
-    renderer.setHeights(initialHeights, width: initialW, height: initialH)
     applyCameraOverrides(renderer)
+    let model = TerrainModel(engine: engine, renderer: renderer, size: viewSize)
+    if let initialEval {
+        model.record(initialEval.result)
+    }
     let ok = renderer.renderToPNG(path: shot, width: 1200, height: 800)
     print(ok ? "✅ wrote \(shot)" : "❌ offscreen render failed")
     exit(ok ? 0 : 1)

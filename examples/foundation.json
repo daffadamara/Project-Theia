@@ -1,0 +1,127 @@
+{
+  "connections": [
+    {
+      "from": "ridges",
+      "input": 0,
+      "to": "warped"
+    },
+    {
+      "from": "warped",
+      "input": 0,
+      "to": "shaped"
+    },
+    {
+      "from": "shaped",
+      "input": 0,
+      "to": "softened"
+    },
+    {
+      "from": "base",
+      "input": 0,
+      "to": "mix"
+    },
+    {
+      "from": "softened",
+      "input": 1,
+      "to": "mix"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "base",
+      "params": {
+        "frequency": 2.5,
+        "gain": 0.45,
+        "heightScale": 0.8,
+        "lacunarity": 2.0,
+        "octaves": 5,
+        "seed": 1102
+      },
+      "type": "perlin"
+    },
+    {
+      "id": "ridges",
+      "params": {
+        "frequency": 5.5,
+        "gain": 0.52,
+        "heightScale": 1.0,
+        "lacunarity": 2.15,
+        "octaves": 6,
+        "ridgeSharpness": 2.4,
+        "seed": 77
+      },
+      "type": "ridged"
+    },
+    {
+      "id": "warped",
+      "params": {
+        "frequency": 3.0,
+        "octaves": 3,
+        "seed": 904,
+        "strength": 0.075
+      },
+      "type": "warp"
+    },
+    {
+      "id": "shaped",
+      "params": {
+        "clamp": 1,
+        "gamma": 0.75,
+        "inHigh": 0.95,
+        "inLow": 0.18,
+        "outHigh": 1.0,
+        "outLow": 0.05
+      },
+      "type": "remap"
+    },
+    {
+      "id": "softened",
+      "params": {
+        "radius": 2,
+        "strength": 0.35
+      },
+      "type": "blur"
+    },
+    {
+      "id": "mix",
+      "params": {
+        "mode": 3,
+        "opacity": 0.72
+      },
+      "type": "blend"
+    }
+  ],
+  "resolution": {
+    "height": 512,
+    "width": 512
+  },
+  "sink": "mix",
+  "ui": {
+    "positions": {
+      "base": {
+        "x": 80,
+        "y": 220
+      },
+      "mix": {
+        "x": 1040,
+        "y": 120
+      },
+      "ridges": {
+        "x": 80,
+        "y": 60
+      },
+      "shaped": {
+        "x": 560,
+        "y": 60
+      },
+      "softened": {
+        "x": 800,
+        "y": 60
+      },
+      "warped": {
+        "x": 320,
+        "y": 60
+      }
+    }
+  }
+}

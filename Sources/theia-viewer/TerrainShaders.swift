@@ -11,48 +11,93 @@ using namespace metal;
 struct Uniforms {
     float4x4 mvp;
     float4 lightDirection;
-    float heightScale;
-    uint  gridW;
-    uint  gridH;
-    uint  _pad;
+    float4 viewportParams; // x=heightScale, y=maskOpacity, z=displayMode, w=materialPreset
+    uint4  gridParams;     // x=gridW, y=gridH
 };
 
 struct VOut {
     float4 position [[position]];
     float3 normal;
     float  height;
+    float  data;
 };
 
 vertex VOut terrain_vertex(uint vid [[vertex_id]],
                            const device float* heights [[buffer(0)]],
-                           constant Uniforms& U [[buffer(1)]]) {
-    uint gx = vid % U.gridW;
-    uint gz = vid / U.gridW;
-    float h = heights[gz * U.gridW + gx];
+                           constant Uniforms& U [[buffer(1)]],
+                           const device float* dataValues [[buffer(2)]]) {
+    uint gridW = U.gridParams.x;
+    uint gridH = U.gridParams.y;
+    float heightScale = U.viewportParams.x;
 
-    float fx = (float(gx) / float(U.gridW - 1)) * 2.0 - 1.0;
-    float fz = (float(gz) / float(U.gridH - 1)) * 2.0 - 1.0;
-    float y = h * U.heightScale;
+    uint gx = vid % gridW;
+    uint gz = vid / gridW;
+    float h = heights[gz * gridW + gx];
+    float d = dataValues[gz * gridW + gx];
+
+    float fx = (float(gx) / float(gridW - 1)) * 2.0 - 1.0;
+    float fz = (float(gz) / float(gridH - 1)) * 2.0 - 1.0;
+    float y = h * heightScale;
 
     uint gxl = gx > 0 ? gx - 1 : gx;
-    uint gxr = gx < U.gridW - 1 ? gx + 1 : gx;
+    uint gxr = gx < gridW - 1 ? gx + 1 : gx;
     uint gzd = gz > 0 ? gz - 1 : gz;
-    uint gzu = gz < U.gridH - 1 ? gz + 1 : gz;
-    float hl = heights[gz * U.gridW + gxl];
-    float hr = heights[gz * U.gridW + gxr];
-    float hd = heights[gzd * U.gridW + gx];
-    float hu = heights[gzu * U.gridW + gx];
-    float sx = 2.0 / float(U.gridW - 1);
-    float sz = 2.0 / float(U.gridH - 1);
-    float slopeX = (hr - hl) * U.heightScale / (2.0 * sx);
-    float slopeZ = (hu - hd) * U.heightScale / (2.0 * sz);
+    uint gzu = gz < gridH - 1 ? gz + 1 : gz;
+    float hl = heights[gz * gridW + gxl];
+    float hr = heights[gz * gridW + gxr];
+    float hd = heights[gzd * gridW + gx];
+    float hu = heights[gzu * gridW + gx];
+    float sx = 2.0 / float(gridW - 1);
+    float sz = 2.0 / float(gridH - 1);
+    float slopeX = (hr - hl) * heightScale / (2.0 * sx);
+    float slopeZ = (hu - hd) * heightScale / (2.0 * sz);
     float3 N = normalize(float3(-slopeX, 1.0, -slopeZ));
 
     VOut o;
     o.position = U.mvp * float4(fx, y, fz, 1.0);
     o.normal = N;
     o.height = h;
+    o.data = d;
     return o;
+}
+
+float3 terrainRamp(float h, float slope) {
+    float3 low = float3(0.24, 0.43, 0.22);   // lowland green
+    float3 mid = float3(0.50, 0.39, 0.28);   // rock brown
+    float3 hi  = float3(0.93, 0.94, 0.97);   // snow
+    float3 col = mix(low, mid, smoothstep(0.20, 0.55, h));
+    col = mix(col, hi, smoothstep(0.76, 0.94, h));
+    return mix(col, float3(0.32, 0.31, 0.29), smoothstep(0.32, 0.72, slope));
+}
+
+float3 materialRamp(float h, float slope, float mask, uint preset) {
+    if (preset == 1) {
+        float3 meadow = float3(0.22, 0.42, 0.25);
+        float3 cliff = float3(0.42, 0.43, 0.42);
+        float3 snow = float3(0.91, 0.94, 0.98);
+        float3 col = mix(meadow, cliff, smoothstep(0.24, 0.70, slope));
+        col = mix(col, snow, smoothstep(0.55, 0.90, h));
+        return mix(col, snow, mask * 0.55);
+    }
+    if (preset == 2) {
+        float3 sand = float3(0.66, 0.52, 0.32);
+        float3 scrub = float3(0.40, 0.45, 0.25);
+        float3 rock = float3(0.36, 0.32, 0.27);
+        float3 col = mix(sand, scrub, smoothstep(0.18, 0.45, h));
+        col = mix(col, rock, smoothstep(0.22, 0.68, slope));
+        return mix(col, float3(0.48, 0.32, 0.22), mask * 0.45);
+    }
+    if (preset == 3) {
+        float3 low = float3(0.07, 0.18, 0.62);
+        float3 mid = float3(0.10, 0.62, 0.36);
+        float3 high = float3(0.92, 0.28, 0.14);
+        float3 col = mix(low, mid, smoothstep(0.10, 0.55, h));
+        col = mix(col, high, smoothstep(0.52, 0.92, max(h, slope)));
+        return mix(col, float3(1.0, 0.88, 0.18), mask * 0.55);
+    }
+
+    float3 col = terrainRamp(h, slope);
+    return mix(col, float3(0.24, 0.24, 0.23), mask * 0.55);
 }
 
 fragment float4 terrain_fragment(VOut in [[stage_in]],
@@ -63,17 +108,47 @@ fragment float4 terrain_fragment(VOut in [[stage_in]],
     float amb = 0.32;
 
     float h = in.height;
-    float3 low = float3(0.24, 0.43, 0.22);   // lowland green
-    float3 mid = float3(0.50, 0.39, 0.28);   // rock brown
-    float3 hi  = float3(0.93, 0.94, 0.97);   // snow
-    float3 col = mix(low, mid, smoothstep(0.20, 0.55, h));
-    col = mix(col, hi, smoothstep(0.76, 0.94, h));
-
-    // Steep faces trend toward bare rock.
     float slope = 1.0 - N.y;
-    col = mix(col, float3(0.32, 0.31, 0.29), smoothstep(0.32, 0.72, slope));
+    float mask = clamp(in.data, 0.0, 1.0);
+    uint mode = uint(U.viewportParams.z + 0.5);
+    uint preset = uint(U.viewportParams.w + 0.5);
+    float opacity = clamp(U.viewportParams.y, 0.0, 1.0);
+    float lit = amb + diff * 0.95;
+    float3 shaded = terrainRamp(h, slope) * lit;
 
-    float3 outc = col * (amb + diff * 0.95);
-    return float4(outc, 1.0);
+    if (mode == 1) {
+        return float4(float3(h), 1.0);
+    }
+
+    if (mode == 2) {
+        float3 lowMask = float3(0.04, 0.07, 0.10);
+        float3 highMask = float3(0.06, 0.52, 1.00);
+        float3 maskRamp = mix(lowMask, highMask, smoothstep(0.0, 1.0, mask));
+        return float4(mix(shaded, maskRamp, opacity), 1.0);
+    }
+
+    // Slope/normal preview follows the same terrain-derived-map idea as GDAL's
+    // gdaldem slope/hillshade tools: derive analysis color from local gradient.
+    if (mode == 3) {
+        float slopeDeg = acos(clamp(N.y, 0.0, 1.0)) * 57.2957795;
+        float slope01 = smoothstep(0.0, 70.0, slopeDeg);
+        float3 lowSlope = float3(0.08, 0.20, 0.30);
+        float3 midSlope = float3(0.83, 0.68, 0.30);
+        float3 highSlope = float3(0.86, 0.22, 0.16);
+        float3 col = mix(lowSlope, midSlope, smoothstep(0.0, 0.55, slope01));
+        col = mix(col, highSlope, smoothstep(0.50, 1.0, slope01));
+        return float4(col, 1.0);
+    }
+
+    if (mode == 4) {
+        return float4(N * 0.5 + 0.5, 1.0);
+    }
+
+    if (mode == 5) {
+        float3 col = materialRamp(h, slope, mask, preset);
+        return float4(col * lit, 1.0);
+    }
+
+    return float4(shaded, 1.0);
 }
 """

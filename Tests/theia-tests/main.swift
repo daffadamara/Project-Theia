@@ -348,6 +348,64 @@ h.test("Slope mask is a valid [0,1] mask with variation") {
     h.expect(r.variance > 1e-6, "mask has no variation")
 }
 
+h.test("Legacy slope mask defaults migrate to preview-safe values") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    let json = """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "mask",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 42, "frequency": 5.0 } },
+        { "id": "mask", "type": "slopemask", "params": {
+          "low": 0.2, "high": 0.8, "heightScale": 64.0, "cellSize": 1.0
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "mask", "input": 0 }
+      ]
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, json), "load: \(graphError(g))")
+    h.expect(theia.graph_param_value(g, "mask", "heightScale", -1) == 1.0,
+             "legacy slopemask heightScale should migrate")
+    h.expect(theia.graph_param_value(g, "mask", "low", -1) == 15.0,
+             "legacy slopemask low should migrate")
+    h.expect(theia.graph_param_value(g, "mask", "high", -1) == 55.0,
+             "legacy slopemask high should migrate")
+    let r = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    h.expect(r.ok, "eval: \(graphError(g))")
+    h.expect(r.variance > 1e-6, "migrated mask should retain variation")
+}
+
+h.test("Invalid slope mask thresholds are migrated before evaluation") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    let json = """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "mask",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 42, "frequency": 5.0 } },
+        { "id": "mask", "type": "slopemask", "params": {
+          "low": 0.12, "high": -0.94, "heightScale": 1.2, "cellSize": 2.4
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "mask", "input": 0 }
+      ]
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, json), "load: \(graphError(g))")
+    h.expect(theia.graph_param_value(g, "mask", "low", -1) == 15.0,
+             "invalid slopemask low should migrate")
+    h.expect(theia.graph_param_value(g, "mask", "high", -1) == 55.0,
+             "invalid slopemask high should migrate")
+    let r = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    h.expect(r.ok, "eval: \(graphError(g))")
+    h.expect(r.variance > 1e-6, "invalid migrated mask should retain variation")
+}
+
 h.test("16-bit PNG export is well-formed") {
     let tmp = NSTemporaryDirectory() + "theia_png16_\(getpid()).png"
     defer { try? FileManager.default.removeItem(atPath: tmp) }
@@ -629,6 +687,44 @@ h.test("Empty authoring graph is loadable and first Perlin source evaluates") {
     h.expect(perlinEval.variance > 1e-5, "single Perlin should produce noise")
 }
 
+h.test("Viewer preview metadata is optional and ignored by the core loader") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+
+    let json = """
+    {
+      "resolution": { "width": 64, "height": 64 },
+      "sink": "mask",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": { "seed": 42 } },
+        { "id": "mask", "type": "slopemask", "params": {} }
+      ],
+      "connections": [
+        { "from": "base", "to": "mask", "input": 0 }
+      ],
+      "ui": {
+        "positions": {
+          "base": { "x": 120, "y": 120 },
+          "mask": { "x": 340, "y": 120 }
+        },
+        "preview": {
+          "displayMode": "mask",
+          "materialPreset": "alpine",
+          "maskOpacity": 0.72
+        }
+      }
+    }
+    """
+
+    h.expect(theia.graph_load_json_text(g, json), "load preview ui: \(graphError(g))")
+    let base = theia.graph_evaluate(g, "base", 64, 64, nil, nil)
+    let mask = theia.graph_evaluate(g, "mask", 64, 64, nil, nil)
+    h.expect(base.ok, "base arbitrary sink eval: \(graphError(g))")
+    h.expect(mask.ok, "mask arbitrary sink eval: \(graphError(g))")
+    h.expect(base.variance > 1e-6, "base terrain should vary")
+    h.expect(mask.minHeight >= 0 && mask.maxHeight <= 1, "mask stays normalized")
+}
+
 h.test("Perlin heightScale controls node-local terrain amplitude") {
     guard let g = theia.graph_create() else { h.expect(false, "create"); return }
     defer { theia.graph_destroy(g) }
@@ -680,6 +776,148 @@ h.test("Default node parameter enumeration supports node creation") {
              "scalebias default scale")
     h.expect(theia.graph_default_param_value("combine", "t", -1) == 0.5,
              "combine default t")
+    h.expect(theia.graph_default_param_value("slopemask", "heightScale", -1) == 1.0,
+             "slopemask default heightScale")
+    h.expect(theia.graph_default_param_value("slopemask", "low", -1) == 15.0,
+             "slopemask default low")
+    h.expect(theia.graph_default_param_value("slopemask", "high", -1) == 55.0,
+             "slopemask default high")
+}
+
+// --- P4: foundation node pack ------------------------------------------------
+
+@MainActor
+func evalGraphJSON(_ json: String, sink: String = "", size: UInt32 = 96) -> theia.GraphEvalResult {
+    guard let g = theia.graph_create() else {
+        h.expect(false, "create failed")
+        return theia.GraphEvalResult()
+    }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, json), "load json: \(graphError(g))")
+    let r = theia.graph_evaluate(g, sink, size, size, nil, nil)
+    h.expect(r.ok, "eval \(sink): \(graphError(g))")
+    return r
+}
+
+func p4JSON(type: String, params: String = "{}", inputCount: Int = 1) -> String {
+    var nodes = """
+        { "id": "p", "type": "perlin", "params": { "seed": 11, "frequency": 5.0 } },
+        { "id": "n", "type": "\(type)", "params": \(params) }
+    """
+    var connections = """
+        { "from": "p", "to": "n", "input": 0 }
+    """
+    if inputCount == 0 {
+        nodes = """
+        { "id": "n", "type": "\(type)", "params": \(params) }
+        """
+        connections = ""
+    } else if inputCount == 2 {
+        nodes = """
+        { "id": "a", "type": "perlin", "params": { "seed": 11, "frequency": 5.0 } },
+        { "id": "b", "type": "ridged", "params": { "seed": 21, "frequency": 7.0 } },
+        { "id": "n", "type": "\(type)", "params": \(params) }
+        """
+        connections = """
+        { "from": "a", "to": "n", "input": 0 },
+        { "from": "b", "to": "n", "input": 1 }
+        """
+    }
+    return """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "n",
+      "nodes": [ \(nodes) ],
+      "connections": [ \(connections) ]
+    }
+    """
+}
+
+h.test("Foundation node types are registered and expose defaults") {
+    let types = readCxxString { theia.node_type_list($0, $1) }
+    for type in ["ridged", "invert", "clamp", "remap", "blur", "warp", "blend"] {
+        h.expect(types.contains(type), "\(type) missing from node_type_list: \(types)")
+        h.expect(theia.graph_default_param_count(type) > 0, "\(type) should expose defaults")
+    }
+    h.expect(theia.graph_node_type_input_count("ridged") == 0, "ridged input count")
+    h.expect(theia.graph_node_type_input_count("blend") == 2, "blend input count")
+    h.expect(theia.graph_default_param_value("blend", "opacity", -1) == 1.0,
+             "blend opacity default")
+    h.expect(theia.graph_default_param_value("ridged", "heightScale", -1) == 1.0,
+             "ridged heightScale default")
+}
+
+h.test("Foundation nodes evaluate valid normalized terrain") {
+    let cases: [(String, String, Int)] = [
+        ("ridged", "{ \"seed\": 44, \"heightScale\": 1.0 }", 0),
+        ("invert", "{ \"amount\": 1.0 }", 1),
+        ("clamp", "{ \"min\": 0.2, \"max\": 0.8 }", 1),
+        ("remap", "{ \"inLow\": 0.2, \"inHigh\": 0.8, \"gamma\": 0.8 }", 1),
+        ("blur", "{ \"radius\": 2, \"strength\": 1.0 }", 1),
+        ("warp", "{ \"seed\": 99, \"strength\": 0.08 }", 1),
+        ("blend", "{ \"mode\": 5, \"opacity\": 0.65 }", 2)
+    ]
+    for (type, params, inputs) in cases {
+        let r = evalGraphJSON(p4JSON(type: type, params: params, inputCount: inputs))
+        h.expect(r.minHeight >= -1e-6 && r.maxHeight <= 1.000001,
+                 "\(type) out of range [\(r.minHeight), \(r.maxHeight)]")
+        h.expect(r.variance > 1e-8, "\(type) degenerate")
+    }
+}
+
+h.test("Foundation nodes are deterministic and preserve cache behavior") {
+    let json = p4JSON(type: "warp",
+                     params: "{ \"seed\": 99, \"frequency\": 4.0, \"strength\": 0.08 }")
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, json), "load: \(graphError(g))")
+    let first = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    let second = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    h.expect(first.ok && second.ok, "determinism eval failed")
+    h.expect(first.mean == second.mean && first.variance == second.variance,
+             "warm eval changed stats")
+    h.expect(second.evaluated == 0 && second.reused == 2,
+             "warm cache should reuse p+warp: \(second.evaluated)/\(second.reused)")
+    _ = theia.graph_set_param(g, "n", "strength", 0.12)
+    let changed = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    h.expect(changed.evaluated == 1 && changed.reused == 1,
+             "warp param change cache: \(changed.evaluated)/\(changed.reused)")
+    h.expect(changed.mean != first.mean || changed.variance != first.variance,
+             "warp strength should affect output")
+}
+
+h.test("Blur smooths terrain and clamp respects output band") {
+    let base = evalGraphJSON("""
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 42, "frequency": 9.0 } }
+      ],
+      "connections": []
+    }
+    """)
+    let blurred = evalGraphJSON(p4JSON(type: "blur",
+                                       params: "{ \"radius\": 3, \"strength\": 1.0 }"))
+    h.expect(blurred.variance < base.variance, "blur should reduce variance")
+
+    let clamped = evalGraphJSON(p4JSON(type: "clamp",
+                                       params: "{ \"min\": 0.25, \"max\": 0.75 }"))
+    h.expect(clamped.minHeight >= 0.25 - 1e-5, "clamp min \(clamped.minHeight)")
+    h.expect(clamped.maxHeight <= 0.75 + 1e-5, "clamp max \(clamped.maxHeight)")
+}
+
+h.test("Foundation example graphs load and evaluate") {
+    for path in ["examples/foundation.json", "examples/masks.json"] {
+        guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+        defer { theia.graph_destroy(g) }
+        h.expect(theia.graph_load_json_file(g, path), "load \(path): \(graphError(g))")
+        let r = theia.graph_evaluate(g, "", 128, 128, nil, nil)
+        h.expect(r.ok, "eval \(path): \(graphError(g))")
+        h.expect(r.minHeight >= -1e-6 && r.maxHeight <= 1.000001,
+                 "\(path) out of range")
+        h.expect(r.variance > 1e-8, "\(path) degenerate")
+    }
 }
 
 print("\n\(h.checks) checks, \(h.failures) failure(s)")

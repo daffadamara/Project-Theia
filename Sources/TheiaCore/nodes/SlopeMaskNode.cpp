@@ -15,9 +15,9 @@ bool SlopeMaskNode::evaluate(GPUContext& ctx,
         error = "slopemask '" + id() + "' requires 1 input";
         return false;
     }
-    const float pr[4] = {static_cast<float>(params.get("low", 0.2)),
-                         static_cast<float>(params.get("high", 0.8)),
-                         static_cast<float>(params.get("heightScale", 64.0)),
+    const float pr[4] = {static_cast<float>(params.get("low", 15.0)),
+                         static_cast<float>(params.get("high", 55.0)),
+                         static_cast<float>(params.get("heightScale", 1.0)),
                          static_cast<float>(params.get("cellSize", 1.0))};
     const std::uint32_t dim[2] = {out.width(), out.height()};
     const Heightfield* in = inputs[0];
