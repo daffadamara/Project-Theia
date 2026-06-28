@@ -129,6 +129,20 @@ GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
                                        std::uint32_t width, std::uint32_t height,
                                        float* dst, std::size_t capElems);
 
+// Production export helper. Any path may be nullptr/"" to skip that output.
+// `maskPngPath` writes the selected sink normalized over [0,1], intended for
+// mask nodes. `objPath` writes a one-sided +Y-up terrain mesh.
+GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
+                             std::uint32_t width, std::uint32_t height,
+                             const char* heightPngPath,
+                             const char* pfmPath,
+                             const char* normalPngPath,
+                             const char* slopePngPath,
+                             const char* maskPngPath,
+                             const char* objPath,
+                             float verticalScale,
+                             std::uint32_t meshStride);
+
 // Node/parameter enumeration for the viewer inspector. Strings use the same
 // copy-into-caller-buffer convention as the other Swift-facing accessors.
 std::uint32_t graph_node_count(GraphHandle* g);

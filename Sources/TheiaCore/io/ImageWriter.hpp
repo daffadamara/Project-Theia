@@ -27,4 +27,9 @@ bool writePNG16(const char* path, const float* data,
                 std::uint32_t width, std::uint32_t height,
                 float minV, float maxV, std::string& error);
 
+// Write top-row-first RGB8 PNG data.
+bool writePNG8RGB(const char* path, const unsigned char* rgb,
+                  std::uint32_t width, std::uint32_t height,
+                  std::string& error);
+
 } // namespace theia

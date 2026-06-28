@@ -17,6 +17,21 @@ struct GraphNodeInfo: Identifiable {
     var params: [GraphParameter]
 }
 
+struct ExportSettings: Sendable {
+    var outDir = "/private/tmp/theia-export"
+    var basename = "terrain"
+    var size: UInt32 = 512
+    var verticalScale: Double = 1.0
+    var meshStride: UInt32 = 1
+    var exportHeight = true
+    var exportPFM = true
+    var exportNormal = true
+    var exportSlope = true
+    var exportMask = false
+    var exportOBJ = true
+}
+
+@MainActor
 final class TerrainModel: ObservableObject {
     @Published private(set) var nodes: [GraphNodeInfo] = []
     @Published private(set) var lastStats = ""
@@ -32,6 +47,9 @@ final class TerrainModel: ObservableObject {
     @Published var displayMode: ViewportDisplayMode = .auto
     @Published var materialPreset: MaterialPreset = .natural
     @Published var maskOpacity = 0.65
+    @Published var exportSettings = ExportSettings()
+    @Published private(set) var exportStatus = ""
+    @Published private(set) var isExporting = false
 
     let engine: TerrainEngine
     let renderer: Renderer
@@ -56,9 +74,11 @@ final class TerrainModel: ObservableObject {
             .filter { !$0.isEmpty }
         if let path = engine.graphPath, let loaded = try? GraphDocument.load(path: path) {
             document = loaded
+            exportSettings.basename = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         } else {
             document = GraphDocument.defaultDocument()
         }
+        exportSettings.size = size == 0 ? document.resolution.width : size
         loadPreviewSettingsFromDocument()
         reloadInspector()
         syncPreviewWithDocument(markDirty: false)
@@ -102,6 +122,53 @@ final class TerrainModel: ObservableObject {
 
     func activeDisplayModeLabel() -> String {
         effectiveDisplayMode(for: document.sink).label
+    }
+
+    func runExport() {
+        guard !isExporting else { return }
+        guard !document.sink.isEmpty else {
+            exportStatus = "choose a node to export"
+            return
+        }
+        guard exportSettings.size >= 2 else {
+            exportStatus = "size must be >= 2"
+            return
+        }
+        guard exportSettings.meshStride > 0 else {
+            exportStatus = "mesh stride must be > 0"
+            return
+        }
+        guard exportSettings.verticalScale > 0 else {
+            exportStatus = "vertical scale must be > 0"
+            return
+        }
+        guard exportSettings.exportHeight || exportSettings.exportPFM ||
+            exportSettings.exportNormal || exportSettings.exportSlope ||
+            exportSettings.exportMask || exportSettings.exportOBJ else {
+            exportStatus = "enable at least one output"
+            return
+        }
+
+        let settings = exportSettings
+        let sink = document.sink
+        let text: String
+        do {
+            text = try document.encodedString()
+        } catch {
+            exportStatus = "export failed: \(error.localizedDescription)"
+            return
+        }
+        isExporting = true
+        exportStatus = "exporting..."
+
+        DispatchQueue.global(qos: .userInitiated).async { [text, sink, settings] in
+            let result = Self.performExport(text: text, sink: sink, settings: settings)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isExporting = false
+                self.exportStatus = result
+            }
+        }
     }
 
     func reloadInspector() {
@@ -461,6 +528,9 @@ final class TerrainModel: ObservableObject {
             selectedConnectionId = nil
             graphPath = path
             engine.setGraphPath(path)
+            exportSettings.basename = URL(fileURLWithPath: path)
+                .deletingPathExtension()
+                .lastPathComponent
             isDirty = false
             saveStatus = "loaded"
             reloadInspector()
@@ -624,6 +694,45 @@ final class TerrainModel: ObservableObject {
 
     private func inputNodeId(to nodeId: String, input: UInt32) -> String? {
         document.connections.first { $0.to == nodeId && $0.input == input }?.from
+    }
+
+    private nonisolated static func performExport(text: String, sink: String,
+                                                  settings: ExportSettings) -> String {
+        do {
+            try FileManager.default.createDirectory(atPath: settings.outDir,
+                                                    withIntermediateDirectories: true)
+        } catch {
+            return "export failed: \(error.localizedDescription)"
+        }
+        guard let g = theia.graph_create() else { return "export failed: graph create" }
+        defer { theia.graph_destroy(g) }
+        guard theia.graph_load_json_text(g, text) else {
+            let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+            return "export failed: \(err)"
+        }
+
+        func path(_ suffix: String, enabled: Bool) -> String {
+            guard enabled else { return "" }
+            return URL(fileURLWithPath: settings.outDir)
+                .appendingPathComponent("\(settings.basename)\(suffix)")
+                .path
+        }
+
+        let r = theia.graph_export(
+            g, sink, settings.size, settings.size,
+            path("_height.png", enabled: settings.exportHeight),
+            path(".pfm", enabled: settings.exportPFM),
+            path("_normal.png", enabled: settings.exportNormal),
+            path("_slope.png", enabled: settings.exportSlope),
+            path("_mask.png", enabled: settings.exportMask),
+            path(".obj", enabled: settings.exportOBJ),
+            Float(settings.verticalScale),
+            settings.meshStride)
+        guard r.ok else {
+            let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+            return "export failed: \(err)"
+        }
+        return "exported \(settings.basename) \(r.width)x\(r.height)"
     }
 
     private func markDirty() {

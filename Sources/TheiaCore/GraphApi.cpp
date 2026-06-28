@@ -9,6 +9,7 @@
 #include "Graph.hpp"
 #include "Heightfield.hpp"
 #include "Node.hpp"
+#include "io/ExportWriter.hpp"
 #include "io/ImageWriter.hpp"
 
 namespace theia {
@@ -171,6 +172,87 @@ GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
     if (dst && capElems >= need) {
         std::memcpy(dst, out->data(), need * sizeof(float));
     }
+    r.ok = true;
+    return r;
+}
+
+GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
+                             std::uint32_t width, std::uint32_t height,
+                             const char* heightPngPath,
+                             const char* pfmPath,
+                             const char* normalPngPath,
+                             const char* slopePngPath,
+                             const char* maskPngPath,
+                             const char* objPath,
+                             float verticalScale,
+                             std::uint32_t meshStride) {
+    GraphEvalResult r;
+    if (!g) return r;
+    if (!g->ensureGPU()) return r;
+    if (width == 0 || height == 0) {
+        width = g->graph.defaultWidth();
+        height = g->graph.defaultHeight();
+    }
+    if (width < 2 || height < 2) {
+        g->lastError = "export resolution must be at least 2x2";
+        return r;
+    }
+    if (meshStride == 0) {
+        g->lastError = "mesh stride must be > 0";
+        return r;
+    }
+    if (!(verticalScale > 0.0f)) {
+        g->lastError = "vertical scale must be > 0";
+        return r;
+    }
+
+    const std::string sink = (sinkId && sinkId[0]) ? sinkId : g->graph.defaultSink();
+    if (sink.empty()) {
+        g->lastError = "no sink specified and graph has no default sink";
+        return r;
+    }
+
+    EvalStats stats;
+    const Heightfield* out =
+        g->graph.evaluate(*g->ctx, sink, width, height, stats, g->lastError);
+    if (!out) return r;
+
+    r.width = width;
+    r.height = height;
+    r.evaluated = stats.evaluated;
+    r.reused = stats.reused;
+    float mn, mx;
+    double mean, var;
+    out->stats(mn, mx, mean, var);
+    r.minHeight = mn;
+    r.maxHeight = mx;
+    r.mean = mean;
+    r.variance = var;
+
+    const float* data = out->data();
+    if (heightPngPath && heightPngPath[0]) {
+        if (!writePNG16(heightPngPath, data, width, height, mn, mx, g->lastError)) return r;
+    }
+    if (pfmPath && pfmPath[0]) {
+        if (!writePFM(pfmPath, data, width, height, g->lastError)) return r;
+    }
+    if (normalPngPath && normalPngPath[0]) {
+        if (!writeNormalPNG(normalPngPath, data, width, height, verticalScale,
+                            g->lastError)) return r;
+    }
+    if (slopePngPath && slopePngPath[0]) {
+        if (!writeSlopePNG16(slopePngPath, data, width, height, verticalScale,
+                             g->lastError)) return r;
+    }
+    if (maskPngPath && maskPngPath[0]) {
+        if (!writePNG16(maskPngPath, data, width, height, 0.0f, 1.0f,
+                        g->lastError)) return r;
+    }
+    if (objPath && objPath[0]) {
+        if (!writeOBJ(objPath, data, width, height, verticalScale, meshStride,
+                      g->lastError)) return r;
+    }
+
     r.ok = true;
     return r;
 }

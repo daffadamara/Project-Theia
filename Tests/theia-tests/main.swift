@@ -424,6 +424,96 @@ h.test("16-bit PNG export is well-formed") {
     h.expect(bytes.count > 24 && bytes[24] == 16, "expected 16-bit depth, got \(bytes.count > 24 ? Int(bytes[24]) : -1)")
 }
 
+h.test("Production export writes maps and OBJ with valid topology") {
+    let dir = NSTemporaryDirectory() + "theia_export_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    let height = dir + "/terrain_height.png"
+    let pfm = dir + "/terrain.pfm"
+    let normal = dir + "/terrain_normal.png"
+    let slope = dir + "/terrain_slope.png"
+    let mask = dir + "/terrain_mask.png"
+    let obj = dir + "/terrain.obj"
+    let r = theia.graph_export(g, "p", 8, 8, height, pfm, normal, slope, mask, obj, 1.0, 2)
+    h.expect(r.ok, "export failed: \(graphError(g))")
+    for path in [height, pfm, normal, slope, mask, obj] {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = attrs?[.size] as? NSNumber
+        h.expect((size?.intValue ?? 0) > 16, "export missing/empty \(path)")
+    }
+
+    guard let text = try? String(contentsOfFile: obj) else {
+        h.expect(false, "obj read failed"); return
+    }
+    let lines = text.split(separator: "\n")
+    let vertexLines = lines.filter { $0.hasPrefix("v ") }
+    let vCount = lines.filter { $0.hasPrefix("v ") }.count
+    let vtCount = lines.filter { $0.hasPrefix("vt ") }.count
+    let vnCount = lines.filter { $0.hasPrefix("vn ") }.count
+    let fLines = lines.filter { $0.hasPrefix("f ") }
+    h.expect(vCount == 25, "stride 2 over 8x8 should export 5x5 vertices, got \(vCount)")
+    h.expect(vtCount == vCount && vnCount == vCount, "obj attribute counts mismatch")
+    h.expect(fLines.count == 32, "4x4 quads should export 32 faces, got \(fLines.count)")
+    for line in fLines {
+        let refs = line.split(separator: " ").dropFirst()
+        h.expect(refs.count == 3, "face should be triangular: \(line)")
+        for ref in refs {
+            let parts = ref.split(separator: "/")
+            h.expect(parts.count == 3, "face ref should include v/vt/vn: \(ref)")
+            let idx = Int(parts[0]) ?? 0
+            h.expect(idx >= 1 && idx <= vCount, "obj index out of range: \(idx)")
+        }
+    }
+    if vertexLines.count == vCount, let firstFace = fLines.first {
+        let verts = vertexLines.compactMap { line -> (Double, Double, Double)? in
+            let p = line.split(separator: " ")
+            guard p.count == 4,
+                  let x = Double(p[1]), let y = Double(p[2]), let z = Double(p[3]) else {
+                return nil
+            }
+            return (x, y, z)
+        }
+        let idx = firstFace.split(separator: " ").dropFirst().compactMap {
+            Int($0.split(separator: "/")[0]).map { $0 - 1 }
+        }
+        if verts.count == vCount && idx.count == 3 {
+            let a = verts[idx[0]], b = verts[idx[1]], c = verts[idx[2]]
+            let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2)
+            let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2)
+            let normalY = ab.2 * ac.0 - ab.0 * ac.2
+            h.expect(normalY > 0, "first OBJ face should wind upward for one-sided top faces")
+        }
+    }
+}
+
+h.test("Production export rejects invalid options without writing") {
+    let dir = NSTemporaryDirectory() + "theia_export_bad_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+    let out = dir + "/bad.obj"
+    let badSize = theia.graph_export(g, "p", 1, 1, "", "", "", "", "", out, 1.0, 1)
+    h.expect(!badSize.ok, "export should reject 1x1 resolution")
+    let badStride = theia.graph_export(g, "p", 8, 8, "", "", "", "", "", out, 1.0, 0)
+    h.expect(!badStride.ok, "export should reject stride 0")
+    let badScale = theia.graph_export(g, "p", 8, 8, "", "", "", "", "", out, 0.0, 1)
+    h.expect(!badScale.ok, "export should reject vertical scale 0")
+    let badPath = theia.graph_export(g, "p", 8, 8, dir, "", "", "", "", "", 1.0, 1)
+    h.expect(!badPath.ok, "export should reject unwritable output paths")
+
+    guard let empty = theia.graph_create() else { h.expect(false, "create empty"); return }
+    defer { theia.graph_destroy(empty) }
+    let noSink = theia.graph_export(empty, "", 8, 8, "", "", "", "", "", out, 1.0, 1)
+    h.expect(!noSink.ok, "export should reject empty sink")
+}
+
 h.test("Loads the showcase graph (full pipeline)") {
     guard let g = theia.graph_create() else { h.expect(false, "create"); return }
     defer { theia.graph_destroy(g) }

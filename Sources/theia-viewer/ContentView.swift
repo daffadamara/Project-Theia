@@ -66,6 +66,12 @@ struct InspectorPanel: View {
                     Divider()
                         .padding(.horizontal, 14)
 
+                    ExportControls(model: model)
+                        .padding(.horizontal, 14)
+
+                    Divider()
+                        .padding(.horizontal, 14)
+
                     NodeParameterInspector(model: model, viewport: viewport)
                         .padding(.horizontal, 14)
                 }
@@ -164,6 +170,107 @@ struct GraphActions: View {
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.load(from: url.path)
+    }
+}
+
+struct ExportControls: View {
+    @ObservedObject var model: TerrainModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Export")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Button {
+                    model.runExport()
+                } label: {
+                    Label(model.isExporting ? "Exporting" : "Export",
+                          systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.isExporting)
+            }
+
+            HStack {
+                Text("folder")
+                    .font(.caption)
+                Spacer()
+                Button {
+                    chooseFolder()
+                } label: {
+                    Label("Choose", systemImage: "folder")
+                }
+                .buttonStyle(.borderless)
+            }
+            Text(model.exportSettings.outDir)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            TextField("basename", text: Binding(
+                get: { model.exportSettings.basename },
+                set: { model.exportSettings.basename = $0 }))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+
+            SettingSlider(title: "size",
+                          value: Binding(
+                            get: { Double(model.exportSettings.size) },
+                            set: { model.exportSettings.size = UInt32(max(2, $0.rounded())) }),
+                          range: 64...4096,
+                          step: 64,
+                          precision: 0)
+
+            SettingSlider(title: "vertical scale",
+                          value: Binding(
+                            get: { model.exportSettings.verticalScale },
+                            set: { model.exportSettings.verticalScale = max(0.001, $0) }),
+                          range: 0.05...8,
+                          step: 0.05,
+                          precision: 2)
+
+            SettingSlider(title: "mesh stride",
+                          value: Binding(
+                            get: { Double(model.exportSettings.meshStride) },
+                            set: { model.exportSettings.meshStride = UInt32(max(1, $0.rounded())) }),
+                          range: 1...16,
+                          step: 1,
+                          precision: 0)
+
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())],
+                      alignment: .leading, spacing: 6) {
+                exportToggle("height", \.exportHeight)
+                exportToggle("pfm", \.exportPFM)
+                exportToggle("normal", \.exportNormal)
+                exportToggle("slope", \.exportSlope)
+                exportToggle("mask", \.exportMask)
+                exportToggle("obj", \.exportOBJ)
+            }
+
+            if !model.exportStatus.isEmpty {
+                Text(model.exportStatus)
+                    .font(.caption)
+                    .foregroundStyle(model.exportStatus.hasPrefix("export failed") ? .red : .secondary)
+            }
+        }
+    }
+
+    private func exportToggle(_ title: String,
+                              _ keyPath: WritableKeyPath<ExportSettings, Bool>) -> some View {
+        Toggle(title, isOn: Binding(
+            get: { model.exportSettings[keyPath: keyPath] },
+            set: { model.exportSettings[keyPath: keyPath] = $0 }))
+            .font(.caption)
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.exportSettings.outDir = url.path
     }
 }
 
