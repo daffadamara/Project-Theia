@@ -1,0 +1,63 @@
+{
+  "resolution": { "width": 512, "height": 512 },
+  "sink": "out",
+  "nodes": [
+    {
+      "id": "base",
+      "type": "perlin",
+      "params": {
+        "seed": 4242,
+        "octaves": 7,
+        "frequency": 4.0,
+        "lacunarity": 2.0,
+        "gain": 0.48,
+        "heightScale": 1.0
+      }
+    },
+    {
+      "id": "drops",
+      "type": "dropleterosion",
+      "params": {
+        "seed": 2027,
+        "particles": 40000,
+        "maxAge": 300,
+        "evaporation": 0.010,
+        "deposition": 0.20,
+        "entrainment": 1.0,
+        "gravity": 1.0,
+        "momentumTransfer": 1.0,
+        "settling": 0.50,
+        "maxDiff": 0.100,
+        "heightScale": 100.0
+      }
+    },
+    {
+      "id": "settle",
+      "type": "thermal",
+      "params": {
+        "iterations": 35,
+        "talusAngle": 34.0,
+        "strength": 0.35,
+        "heightScale": 64.0
+      }
+    },
+    {
+      "id": "out",
+      "type": "normalize",
+      "params": {}
+    }
+  ],
+  "connections": [
+    { "from": "base", "to": "drops", "input": 0 },
+    { "from": "drops", "to": "settle", "input": 0 },
+    { "from": "settle", "to": "out", "input": 0 }
+  ],
+  "ui": {
+    "positions": {
+      "base": { "x": 80, "y": 120 },
+      "drops": { "x": 320, "y": 120 },
+      "settle": { "x": 560, "y": 120 },
+      "out": { "x": 800, "y": 120 }
+    }
+  }
+}

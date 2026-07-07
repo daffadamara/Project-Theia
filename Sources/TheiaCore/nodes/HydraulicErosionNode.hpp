@@ -9,16 +9,16 @@ class HydraulicErosionNode : public Node {
 public:
     explicit HydraulicErosionNode(std::string id)
         : Node(std::move(id), "hydraulic") {
-        params.set("iterations", 60);
+        params.set("iterations", 200);
         params.set("rain", 0.012);
         params.set("evaporation", 0.015);
-        params.set("sedimentCapacity", 0.6);
-        params.set("suspension", 0.5);
-        params.set("deposition", 0.5);
+        params.set("sedimentCapacity", 0.35);
+        params.set("suspension", 0.25);
+        params.set("deposition", 0.3);
         params.set("gravity", 9.81);
-        params.set("dt", 0.02);
-        params.set("minTilt", 0.05);
-        params.set("heightScale", 64.0);
+        params.set("dt", 0.015);
+        params.set("minTilt", 0.03);
+        params.set("heightScale", 80.0);
         params.set("pipeArea", 1.0);
         params.set("pipeLength", 1.0);
         params.set("cellSize", 1.0);

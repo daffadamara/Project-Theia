@@ -31,6 +31,14 @@ struct ExportSettings: Sendable {
     var exportOBJ = true
 }
 
+enum ViewportTool: String, CaseIterable, Identifiable {
+    case orbit
+    case pan
+    case zoom
+
+    var id: String { rawValue }
+}
+
 @MainActor
 final class TerrainModel: ObservableObject {
     @Published private(set) var nodes: [GraphNodeInfo] = []
@@ -40,6 +48,7 @@ final class TerrainModel: ObservableObject {
     @Published private(set) var selectedNodeIds: Set<String> = []
     @Published var selectedConnectionId: String?
     @Published private(set) var saveStatus = ""
+    @Published private(set) var lastSavedAt: Date?
     @Published private(set) var isDirty = false
     @Published var lightAzimuthDegrees = 35.0
     @Published var lightElevationDegrees = 58.0
@@ -47,6 +56,13 @@ final class TerrainModel: ObservableObject {
     @Published var displayMode: ViewportDisplayMode = .auto
     @Published var materialPreset: MaterialPreset = .natural
     @Published var maskOpacity = 0.65
+    @Published var gridVisible = true
+    @Published var axisVisible = true
+    @Published var viewportTool: ViewportTool = .orbit
+    @Published var viewportProjection: ViewportProjection = .perspective
+    @Published private(set) var viewportCameraRevision: UInt64 = 0
+    @Published var maskBrushEnabled = false
+    @Published var maskBrushRadius = 0.035
     @Published var exportSettings = ExportSettings()
     @Published private(set) var exportStatus = ""
     @Published private(set) var isExporting = false
@@ -61,7 +77,14 @@ final class TerrainModel: ObservableObject {
     private var redoStack: [GraphDocument] = []
     private var isRestoringHistory = false
     private var isInteractiveMove = false
+    private var isMaskBrushStrokeActive = false
+    private var currentPreviewGeometry: [Float] = []
+    private var currentPreviewData: [Float] = []
+    private var currentPreviewWidth = 0
+    private var currentPreviewHeight = 0
+    private var currentEditableMaskNodeId: String?
     private let maskUtilityTypes: Set<String> = ["invert", "clamp", "remap", "blur"]
+    private let maskSourceTypes: Set<String> = ["slopemask", "river"]
 
     init(engine: TerrainEngine, renderer: Renderer, size: UInt32) {
         self.engine = engine
@@ -95,11 +118,24 @@ final class TerrainModel: ObservableObject {
                                        wireframeEnabled: wireframeEnabled,
                                        displayMode: override ?? effectiveDisplayMode(for: document.sink),
                                        materialPreset: materialPreset,
-                                       maskOpacity: maskOpacity)
+                                       maskOpacity: maskOpacity,
+                                       gridVisible: gridVisible,
+                                       axisVisible: axisVisible,
+                                       projectionMode: viewportProjection)
     }
 
     func resetCamera() {
         renderer.resetCamera()
+        viewportCameraDidChange()
+    }
+
+    func setCameraPreset(_ preset: CameraPreset) {
+        renderer.setCameraPreset(preset)
+        viewportCameraDidChange()
+    }
+
+    func viewportCameraDidChange() {
+        viewportCameraRevision &+= 1
     }
 
     func setDisplayMode(_ mode: ViewportDisplayMode) {
@@ -120,8 +156,68 @@ final class TerrainModel: ObservableObject {
         applyViewportSettings()
     }
 
+    func setGridVisible(_ visible: Bool) {
+        gridVisible = visible
+        applyViewportSettings()
+    }
+
+    func setAxisVisible(_ visible: Bool) {
+        axisVisible = visible
+        applyViewportSettings()
+    }
+
+    func setViewportTool(_ tool: ViewportTool) {
+        viewportTool = tool
+        maskBrushEnabled = false
+    }
+
+    func setViewportProjection(_ projection: ViewportProjection) {
+        viewportProjection = projection
+        applyViewportSettings()
+        viewportCameraDidChange()
+    }
+
     func activeDisplayModeLabel() -> String {
         effectiveDisplayMode(for: document.sink).label
+    }
+
+    var canEditActiveMask: Bool {
+        editableMaskNodeId(for: document.sink) != nil
+    }
+
+    var activeMaskEraseCount: Int {
+        guard let nodeId = editableMaskNodeId(for: document.sink) else { return 0 }
+        return document.maskEraseStrokes(nodeId: nodeId).count
+    }
+
+    func beginMaskBrush(at uv: CGPoint) -> Bool {
+        guard maskBrushEnabled,
+              let nodeId = editableMaskNodeId(for: document.sink) else { return false }
+        pushUndo()
+        isMaskBrushStrokeActive = true
+        addMaskEraseStroke(nodeId: nodeId, uv: uv)
+        return true
+    }
+
+    func continueMaskBrush(at uv: CGPoint) -> Bool {
+        guard maskBrushEnabled,
+              isMaskBrushStrokeActive,
+              let nodeId = editableMaskNodeId(for: document.sink) else { return false }
+        addMaskEraseStroke(nodeId: nodeId, uv: uv)
+        return true
+    }
+
+    func endMaskBrush() {
+        isMaskBrushStrokeActive = false
+    }
+
+    func clearActiveMaskErase() {
+        guard let nodeId = editableMaskNodeId(for: document.sink) else { return }
+        pushUndo()
+        document.clearMaskEraseStrokes(nodeId: nodeId)
+        documentCanSave = true
+        markDirty()
+        _ = refreshTerrain()
     }
 
     func runExport() {
@@ -190,6 +286,9 @@ final class TerrainModel: ObservableObject {
             return
         }
         _ = refreshTerrain()
+        if param == "particles", value >= 20000 {
+            lastStats += " - high particle count may preview slowly"
+        }
         reloadInspector()
     }
 
@@ -201,8 +300,14 @@ final class TerrainModel: ObservableObject {
             return true
         }
 
+        let requestedMode = displayMode
         let mode = effectiveDisplayMode(for: dataSink)
-        let geometrySink = geometrySink(for: dataSink, mode: mode) ?? dataSink
+        if previewRiverCarveWithEditedMask(dataSink: dataSink, mode: mode) {
+            return true
+        }
+        let geometrySink = geometrySink(for: dataSink,
+                                        requestedMode: requestedMode,
+                                        renderMode: mode) ?? dataSink
         guard let geometry = engine.evaluate(size: size, sink: geometrySink) else {
             lastStats = engine.lastError()
             return false
@@ -220,7 +325,12 @@ final class TerrainModel: ObservableObject {
 
         let w = Int(geometry.result.width)
         let h = Int(geometry.result.height)
-        renderer.setPreview(heights: geometry.heights, data: data.heights, width: w, height: h)
+        currentPreviewGeometry = geometry.heights
+        currentPreviewData = data.heights
+        currentPreviewWidth = w
+        currentPreviewHeight = h
+        currentEditableMaskNodeId = editableMaskNodeId(for: dataSink)
+        renderCachedPreview()
         applyViewportSettings(displayMode: mode)
 
         let evaluated = geometry.result.evaluated +
@@ -234,6 +344,11 @@ final class TerrainModel: ObservableObject {
     func setFlatPreview(status: String = "flat preview") {
         let dim = max(2, Int(size == 0 ? document.resolution.width : size))
         let flat = [Float](repeating: 0, count: dim * dim)
+        currentPreviewGeometry = flat
+        currentPreviewData = flat
+        currentPreviewWidth = dim
+        currentPreviewHeight = dim
+        currentEditableMaskNodeId = nil
         renderer.setPreview(heights: flat, data: flat, width: dim, height: dim)
         applyViewportSettings(displayMode: .terrain)
         lastStats = status
@@ -367,13 +482,19 @@ final class TerrainModel: ObservableObject {
         isInteractiveMove = false
     }
 
-    func addNode(type: String) {
+    func addNode(type: String, at position: GraphNodePosition? = nil) {
         pushUndo()
         let previous = selectedNodeId ?? (document.sink.isEmpty ? nil : document.sink)
-        let id = document.addNode(type: type, after: previous)
-        if let previous,
-           document.node(id: previous) != nil,
-           document.inputCount(for: type) > 0 {
+        let id = document.addNode(type: type, after: previous, at: position)
+        if type == "rivercarve",
+           let previous,
+           document.node(id: previous)?.type == "river",
+           let terrain = document.upstreamNodeId(to: previous, input: 0) {
+            document.connect(from: terrain, to: id, input: 0)
+            document.connect(from: previous, to: id, input: 1)
+        } else if let previous,
+                  document.node(id: previous) != nil,
+                  document.inputCount(for: type) > 0 {
             document.connect(from: previous, to: id, input: 0)
         }
         document.sink = id
@@ -439,7 +560,16 @@ final class TerrainModel: ObservableObject {
               let target = document.node(id: to),
               input < document.inputCount(for: target.type) else { return }
         pushUndo()
-        document.connect(from: from, to: to, input: input)
+        if target.type == "rivercarve",
+           input == 0,
+           document.node(id: from)?.type == "river",
+           let terrain = document.upstreamNodeId(to: from, input: 0) {
+            document.connect(from: terrain, to: to, input: 0)
+            document.connect(from: from, to: to, input: 1)
+        } else {
+            document.connect(from: from, to: to, input: input)
+            document.repairRiverCarveConnections()
+        }
         document.sink = to
         selectedNodeId = to
         selectedNodeIds = [to]
@@ -491,6 +621,7 @@ final class TerrainModel: ObservableObject {
                 try text.write(toFile: graphPath, atomically: true, encoding: .utf8)
                 isDirty = false
                 saveStatus = "saved"
+                lastSavedAt = Date()
                 return true
             }
             guard engine.loadJSONText(text) else {
@@ -508,6 +639,7 @@ final class TerrainModel: ObservableObject {
             try text.write(toFile: graphPath, atomically: true, encoding: .utf8)
             isDirty = false
             saveStatus = "saved"
+            lastSavedAt = Date()
             return true
         } catch {
             saveStatus = "save failed: \(error.localizedDescription)"
@@ -533,6 +665,7 @@ final class TerrainModel: ObservableObject {
                 .lastPathComponent
             isDirty = false
             saveStatus = "loaded"
+            lastSavedAt = Self.fileModifiedDate(path: path)
             reloadInspector()
             syncPreviewWithDocument(markDirty: false)
         } catch {
@@ -547,6 +680,7 @@ final class TerrainModel: ObservableObject {
             try text.write(toFile: graphPath, atomically: true, encoding: .utf8)
             isDirty = false
             saveStatus = "autosaved"
+            lastSavedAt = Date()
         } catch {
             saveStatus = "autosave failed: \(error.localizedDescription)"
         }
@@ -655,22 +789,198 @@ final class TerrainModel: ObservableObject {
         return .mask
     }
 
-    private func geometrySink(for dataSink: String, mode: ViewportDisplayMode) -> String? {
+    private func geometrySink(for dataSink: String,
+                              requestedMode: ViewportDisplayMode,
+                              renderMode: ViewportDisplayMode) -> String? {
         // Terrain tools such as Gaea and World Machine treat masks/coverage maps
         // as data layered over terrain. Keep geometry from the upstream height
-        // source only when the selected node is actually a mask chain. Terrain
-        // nodes in material mode must keep their own output as geometry.
+        // source whenever the selected node is a mask chain. Manual display
+        // modes still apply: height/slope/normal inspect that upstream terrain,
+        // while mask/material use the selected mask as the data layer.
+        _ = requestedMode
+        _ = renderMode
         if let maskGeometry = maskGeometrySink(for: dataSink) {
             return maskGeometry
         }
         return dataSink
     }
 
+    private func editableMaskNodeId(for nodeId: String) -> String? {
+        guard !nodeId.isEmpty, isMaskPreviewNode(nodeId) else { return nil }
+        return nodeId
+    }
+
+    private func addMaskEraseStroke(nodeId: String, uv: CGPoint) {
+        let stroke = GraphMaskEraseStroke(
+            x: min(max(Double(uv.x), 0), 1),
+            y: min(max(Double(uv.y), 0), 1),
+            radius: min(max(maskBrushRadius, 0.003), 0.20),
+            strength: 1.0)
+        document.addMaskEraseStroke(nodeId: nodeId, stroke: stroke)
+        documentCanSave = true
+        markDirty()
+        renderCachedPreview()
+    }
+
+    private func renderCachedPreview() {
+        guard currentPreviewWidth > 1,
+              currentPreviewHeight > 1,
+              !currentPreviewGeometry.isEmpty,
+              !currentPreviewData.isEmpty else { return }
+        var data = currentPreviewData
+        if let nodeId = currentEditableMaskNodeId {
+            applyMaskEraseStrokes(to: &data, nodeId: nodeId,
+                                  width: currentPreviewWidth,
+                                  height: currentPreviewHeight)
+        }
+        renderer.setPreview(heights: currentPreviewGeometry, data: data,
+                            width: currentPreviewWidth, height: currentPreviewHeight)
+    }
+
+    private func applyMaskEraseStrokes(to values: inout [Float], nodeId: String,
+                                       width: Int, height: Int) {
+        let strokes = document.maskEraseStrokes(nodeId: nodeId)
+        guard !strokes.isEmpty, width > 1, height > 1 else { return }
+        for stroke in strokes {
+            let radius = max(0.0001, stroke.radius)
+            let r2 = radius * radius
+            let minX = max(0, Int(floor((stroke.x - radius) * Double(width - 1))))
+            let maxX = min(width - 1, Int(ceil((stroke.x + radius) * Double(width - 1))))
+            let minY = max(0, Int(floor((stroke.y - radius) * Double(height - 1))))
+            let maxY = min(height - 1, Int(ceil((stroke.y + radius) * Double(height - 1))))
+            for y in minY...maxY {
+                let vy = Double(y) / Double(height - 1)
+                for x in minX...maxX {
+                    let ux = Double(x) / Double(width - 1)
+                    let dx = ux - stroke.x
+                    let dy = vy - stroke.y
+                    let d2 = dx * dx + dy * dy
+                    if d2 > r2 { continue }
+                    let t = 1.0 - min(max(sqrt(d2) / radius, 0), 1)
+                    let falloff = t * t * (3.0 - 2.0 * t)
+                    let erase = Float(min(max(stroke.strength * falloff, 0), 1))
+                    let i = y * width + x
+                    values[i] = max(0, values[i] * (1 - erase))
+                }
+            }
+        }
+    }
+
+    private func previewRiverCarveWithEditedMask(dataSink: String,
+                                                 mode: ViewportDisplayMode) -> Bool {
+        guard let node = document.node(id: dataSink),
+              node.type == "rivercarve",
+              let terrainSink = inputNodeId(to: dataSink, input: 0),
+              let maskSink = inputNodeId(to: dataSink, input: 1),
+              !document.maskEraseStrokes(nodeId: maskSink).isEmpty else {
+            return false
+        }
+        guard let terrain = engine.evaluate(size: size, sink: terrainSink),
+              let mask = engine.evaluate(size: size, sink: maskSink) else {
+            lastStats = engine.lastError()
+            return true
+        }
+        let w = Int(terrain.result.width)
+        let h = Int(terrain.result.height)
+        guard mask.heights.count == terrain.heights.count else {
+            lastStats = "rivercarve mask size mismatch"
+            return true
+        }
+        var editedMask = mask.heights
+        applyMaskEraseStrokes(to: &editedMask, nodeId: maskSink, width: w, height: h)
+        let carved = Self.carveRiverPreview(terrain: terrain.heights,
+                                            mask: editedMask,
+                                            width: w,
+                                            height: h,
+                                            depth: node.params["depth"] ?? 0.45,
+                                            downcutting: node.params["downcutting"] ?? 0.55,
+                                            valleyWidth: node.params["riverValleyWidth"] ?? 2.0,
+                                            shorelineWidth: node.params["shorelineWidth"] ?? 2.0,
+                                            shorelineSharpness: node.params["shorelineSharpness"] ?? 0.45)
+        currentPreviewGeometry = carved
+        currentPreviewData = carved
+        currentPreviewWidth = w
+        currentPreviewHeight = h
+        currentEditableMaskNodeId = nil
+        renderer.setPreview(heights: carved, data: carved, width: w, height: h)
+        applyViewportSettings(displayMode: mode == .auto ? .terrain : mode)
+        lastStats = "nodes \(terrain.result.evaluated + mask.result.evaluated), reused \(terrain.result.reused + mask.result.reused)"
+        return true
+    }
+
+    private static func carveRiverPreview(terrain: [Float], mask: [Float],
+                                          width: Int, height: Int,
+                                          depth: Double, downcutting: Double,
+                                          valleyWidth: Double,
+                                          shorelineWidth: Double,
+                                          shorelineSharpness: Double) -> [Float] {
+        let clampedMask = mask.map { min(max($0, 0), 1) }
+        let radius = max(1, Int(ceil(1.0 + min(max(valleyWidth, 0), 12) * 2.0)))
+        let valley = boxBlur(clampedMask, width: width, height: height,
+                             radius: radius, passes: 2)
+        let shoreRadius = max(1, Int(ceil(min(max(shorelineWidth, 0), 12))))
+        let shoreEnvelope = boxBlur(clampedMask, width: width, height: height,
+                                    radius: shoreRadius, passes: 3)
+            .map { min(max($0, 0), 1) }
+        let sharpness = Float(min(max(shorelineSharpness, 0), 1))
+        let d = Float(min(max(depth, 0), 1))
+        let down = Float(min(max(downcutting, 0), 1))
+        let channelCut = d * (0.035 + 0.18 * down)
+        let valleyCut = d * (0.010 + 0.045 * down)
+        let rawChannelMix = shorelineWidth <= 0 ? Float(1.0) : Float(0.08) + sharpness * Float(0.42)
+        let shoreExponent = Float(0.50) + sharpness * Float(1.25)
+        var out = terrain
+        for i in out.indices {
+            let base = min(max(terrain[i], 0), 1)
+            let softenedChannel = Float(pow(Double(shoreEnvelope[i]), Double(shoreExponent)))
+            let carveProfile = min(max(softenedChannel * (1 - rawChannelMix) +
+                                       clampedMask[i] * rawChannelMix, 0), 1)
+            out[i] = min(max(base - channelCut * carveProfile - valleyCut * valley[i], 0), 1)
+        }
+        return out
+    }
+
+    private static func boxBlur(_ input: [Float], width: Int, height: Int,
+                                radius: Int, passes: Int) -> [Float] {
+        if radius <= 0 || passes <= 0 { return input }
+        var a = input
+        var b = input
+        for _ in 0..<passes {
+            for y in 0..<height {
+                for x in 0..<width {
+                    var sum: Float = 0
+                    var count: Float = 0
+                    let x0 = max(0, x - radius)
+                    let x1 = min(width - 1, x + radius)
+                    for nx in x0...x1 {
+                        sum += a[y * width + nx]
+                        count += 1
+                    }
+                    b[y * width + x] = sum / max(1, count)
+                }
+            }
+            for y in 0..<height {
+                let y0 = max(0, y - radius)
+                let y1 = min(height - 1, y + radius)
+                for x in 0..<width {
+                    var sum: Float = 0
+                    var count: Float = 0
+                    for ny in y0...y1 {
+                        sum += b[ny * width + x]
+                        count += 1
+                    }
+                    a[y * width + x] = sum / max(1, count)
+                }
+            }
+        }
+        return a
+    }
+
     private func isMaskPreviewNode(_ nodeId: String,
                                    visited: Set<String> = []) -> Bool {
         guard !visited.contains(nodeId),
               let node = document.node(id: nodeId) else { return false }
-        if node.type == "slopemask" { return true }
+        if maskSourceTypes.contains(node.type) { return true }
         guard maskUtilityTypes.contains(node.type),
               let upstream = inputNodeId(to: nodeId, input: 0) else { return false }
         var nextVisited = visited
@@ -682,14 +992,14 @@ final class TerrainModel: ObservableObject {
                                   visited: Set<String> = []) -> String? {
         guard !visited.contains(nodeId),
               let node = document.node(id: nodeId) else { return nil }
-        if node.type == "slopemask" {
+        if maskSourceTypes.contains(node.type) {
             return inputNodeId(to: nodeId, input: 0)
         }
         guard maskUtilityTypes.contains(node.type),
               let upstream = inputNodeId(to: nodeId, input: 0) else { return nil }
         var nextVisited = visited
         nextVisited.insert(nodeId)
-        return maskGeometrySink(for: upstream, visited: nextVisited) ?? upstream
+        return maskGeometrySink(for: upstream, visited: nextVisited)
     }
 
     private func inputNodeId(to nodeId: String, input: UInt32) -> String? {
@@ -738,5 +1048,9 @@ final class TerrainModel: ObservableObject {
     private func markDirty() {
         isDirty = true
         saveStatus = "unsaved"
+    }
+
+    private static func fileModifiedDate(path: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate]) as? Date
     }
 }

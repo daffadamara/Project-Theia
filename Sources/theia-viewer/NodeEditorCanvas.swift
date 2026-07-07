@@ -71,7 +71,7 @@ struct NodeEditorCanvas: View {
                             .foregroundStyle(.secondary)
                         Text("No nodes")
                             .font(.headline)
-                        Text("Use Add to create a terrain graph.")
+                        Text("Right-click the canvas (or use Add) to create a terrain graph.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -147,8 +147,28 @@ struct NodeEditorCanvas: View {
                     onEnded: {
                         panDragStart = nil
                     },
-                    onScroll: { delta, point in
+                    onZoom: { delta, point in
                         zoomCanvas(delta: delta, anchor: point)
+                    },
+                    onPanBy: { delta in
+                        pan = CGSize(width: pan.width + delta.width,
+                                     height: pan.height + delta.height)
+                    },
+                    nodeTypes: model.availableNodeTypes,
+                    onAddNode: { type, point in
+                        let doc = documentPoint(point)
+                        model.addNode(type: type,
+                                      at: GraphNodePosition(x: doc.x, y: doc.y))
+                        viewport.setNeedsDisplay(viewport.bounds)
+                    },
+                    isOverNode: { point in
+                        model.document.nodes.contains { node in
+                            let origin = screen(nodePosition(node.id))
+                            return CGRect(x: origin.x, y: origin.y,
+                                          width: nodeSize.width * zoom,
+                                          height: nodeSize.height * zoom)
+                                .contains(point)
+                        }
                     })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             )
@@ -168,7 +188,13 @@ struct NodeEditorCanvas: View {
             .onChange(of: geo.size) { _, _ in }
             .overlay(alignment: .topLeading) {
                 CanvasToolbar(model: model, zoom: $zoom, viewport: viewport)
-                    .padding(8)
+                    .padding(.top, 10)
+                    .padding(.leading, 8)
+            }
+            .overlay(alignment: .bottomLeading) {
+                CanvasGraphStatus(model: model)
+                    .padding(.leading, 12)
+                    .padding(.bottom, 12)
             }
         }
         .frame(minHeight: 220)
@@ -272,6 +298,30 @@ struct NodeEditorCanvas: View {
     }
 }
 
+struct CanvasGraphStatus: View {
+    @ObservedObject var model: TerrainModel
+
+    var body: some View {
+        Label(primaryText, systemImage: primaryIcon)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(Color.black.opacity(0.34),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .allowsHitTesting(false)
+    }
+
+    private var primaryIcon: String {
+        model.document.nodes.isEmpty ? "rectangle.connected.to.line.below" : "point.3.connected.trianglepath.dotted"
+    }
+
+    private var primaryText: String {
+        let count = model.document.nodes.count
+        return "\(count) node\(count == 1 ? "" : "s")"
+    }
+}
+
 struct CanvasToolbar: View {
     @ObservedObject var model: TerrainModel
     @Binding var zoom: Double
@@ -287,42 +337,62 @@ struct CanvasToolbar: View {
                     }
                 }
             } label: {
-                Label("Add", systemImage: "plus")
+                toolbarLabel("Add", systemImage: "plus")
             }
+            .buttonStyle(.plain)
 
             Button {
                 model.deleteSelection()
                 viewport.setNeedsDisplay(viewport.bounds)
             } label: {
-                Label("Delete", systemImage: "trash")
+                toolbarLabel("Delete", systemImage: "trash")
             }
+            .buttonStyle(.plain)
             .disabled(model.selectedNodeId == nil && model.selectedConnectionId == nil)
 
             Button {
                 model.resetLayout()
             } label: {
-                Label("Layout", systemImage: "rectangle.connected.to.line.below")
+                toolbarLabel("Layout", systemImage: "rectangle.connected.to.line.below")
             }
+            .buttonStyle(.plain)
 
             Button {
                 model.undo()
                 viewport.setNeedsDisplay(viewport.bounds)
             } label: {
-                Label("Undo", systemImage: "arrow.uturn.backward")
+                toolbarLabel("Undo", systemImage: "arrow.uturn.backward")
             }
+            .buttonStyle(.plain)
 
             Button {
                 model.redo()
                 viewport.setNeedsDisplay(viewport.bounds)
             } label: {
-                Label("Redo", systemImage: "arrow.uturn.forward")
+                toolbarLabel("Redo", systemImage: "arrow.uturn.forward")
             }
+            .buttonStyle(.plain)
 
             Slider(value: $zoom, in: minCanvasZoom...maxCanvasZoom, step: 0.1)
-                .frame(width: 100)
+                .padding(.horizontal, 10)
+                .frame(width: 124, height: 30)
+                .background(toolbarFill,
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
-        .padding(7)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var toolbarFill: Color {
+        Color(red: 0.22, green: 0.22, blue: 0.24)
+    }
+
+    private func toolbarLabel(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.9))
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .background(toolbarFill,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
 
@@ -401,7 +471,7 @@ struct NodeCard: View {
     }
 
     private var isMaskNode: Bool {
-        node.type == "slopemask"
+        node.type == "slopemask" || node.type == "river"
     }
 
     private var borderColor: Color {
@@ -506,58 +576,136 @@ struct CanvasGrid: View {
 struct CanvasMouseEventView: NSViewRepresentable {
     let onChanged: (CGSize) -> Void
     let onEnded: () -> Void
-    let onScroll: (CGFloat, CGPoint) -> Void
+    let onZoom: (CGFloat, CGPoint) -> Void
+    let onPanBy: (CGSize) -> Void
+    let nodeTypes: [String]
+    let onAddNode: (String, CGPoint) -> Void
+    let isOverNode: (CGPoint) -> Bool
 
     func makeNSView(context: Context) -> NSView {
         let view = CanvasMouseEventNSView()
-        view.onChanged = onChanged
-        view.onEnded = onEnded
-        view.onScroll = onScroll
+        apply(to: view)
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         guard let view = nsView as? CanvasMouseEventNSView else { return }
+        apply(to: view)
+    }
+
+    private func apply(to view: CanvasMouseEventNSView) {
         view.onChanged = onChanged
         view.onEnded = onEnded
-        view.onScroll = onScroll
+        view.onZoom = onZoom
+        view.onPanBy = onPanBy
+        view.nodeTypes = nodeTypes
+        view.onAddNode = onAddNode
+        view.isOverNode = isOverNode
     }
 }
 
+// Canvas navigation, following node-editor conventions (Godot GraphEdit /
+// Blender / Figma):
+//   two-finger scroll        pan
+//   pinch or cmd+scroll      zoom about the cursor
+//   right-drag / MMB-drag    pan
+//   right-click empty space  add-node context menu at the cursor
 final class CanvasMouseEventNSView: NSView {
     var onChanged: ((CGSize) -> Void)?
     var onEnded: (() -> Void)?
-    var onScroll: ((CGFloat, CGPoint) -> Void)?
+    var onZoom: ((CGFloat, CGPoint) -> Void)?
+    var onPanBy: ((CGSize) -> Void)?
+    var nodeTypes: [String] = []
+    var onAddNode: ((String, CGPoint) -> Void)?
+    var isOverNode: ((CGPoint) -> Bool)?
     private var start: NSPoint?
+    private var dragDistance: CGFloat = 0
+    private var contextPoint: CGPoint = .zero
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let event = window?.currentEvent else { return nil }
         switch event.type {
-        case .rightMouseDown, .rightMouseDragged, .rightMouseUp, .scrollWheel:
+        case .rightMouseDown, .rightMouseDragged, .rightMouseUp:
+            let local = convert(point, from: superview)
+            let flipped = CGPoint(x: local.x, y: bounds.height - local.y)
+            if event.type == .rightMouseDown, isOverNode?(flipped) == true {
+                return nil
+            }
+            return self
+        case .otherMouseDown, .otherMouseDragged, .otherMouseUp,
+             .scrollWheel, .magnify:
             return self
         default:
             return nil
         }
     }
 
-    override func rightMouseDown(with event: NSEvent) {
+    override func rightMouseDown(with event: NSEvent) { beginDrag(event) }
+    override func rightMouseDragged(with event: NSEvent) { dragged(event) }
+    override func rightMouseUp(with event: NSEvent) {
+        let wasClick = dragDistance < 4
+        endDrag()
+        if wasClick { showAddMenu(with: event) }
+    }
+    override func otherMouseDown(with event: NSEvent) { beginDrag(event) }
+    override func otherMouseDragged(with event: NSEvent) { dragged(event) }
+    override func otherMouseUp(with event: NSEvent) { endDrag() }
+
+    private func beginDrag(_ event: NSEvent) {
         start = event.locationInWindow
+        dragDistance = 0
     }
 
-    override func rightMouseDragged(with event: NSEvent) {
+    private func dragged(_ event: NSEvent) {
         guard let start else { return }
         let p = event.locationInWindow
+        dragDistance = max(dragDistance, abs(p.x - start.x) + abs(p.y - start.y))
         onChanged?(CGSize(width: p.x - start.x, height: p.y - start.y))
     }
 
-    override func rightMouseUp(with event: NSEvent) {
+    private func endDrag() {
         start = nil
         onEnded?()
     }
 
     override func scrollWheel(with event: NSEvent) {
+        let point = localPoint(event)
+        if event.modifierFlags.contains(.command) {
+            onZoom?(event.scrollingDeltaY, point)
+        } else {
+            onPanBy?(CGSize(width: event.scrollingDeltaX,
+                            height: event.scrollingDeltaY))
+        }
+    }
+
+    override func magnify(with event: NSEvent) {
+        onZoom?(event.magnification * 100, localPoint(event))
+    }
+
+    private func localPoint(_ event: NSEvent) -> CGPoint {
         let local = convert(event.locationInWindow, from: nil)
-        let point = CGPoint(x: local.x, y: bounds.height - local.y)
-        onScroll?(event.scrollingDeltaY, point)
+        return CGPoint(x: local.x, y: bounds.height - local.y)
+    }
+
+    private func showAddMenu(with event: NSEvent) {
+        guard !nodeTypes.isEmpty else { return }
+        contextPoint = localPoint(event)
+        let menu = NSMenu()
+        let header = NSMenuItem(title: "Add Node", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(.separator())
+        for type in nodeTypes {
+            let item = NSMenuItem(title: type,
+                                  action: #selector(addNodeItem(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func addNodeItem(_ sender: NSMenuItem) {
+        onAddNode?(sender.title, contextPoint)
     }
 }

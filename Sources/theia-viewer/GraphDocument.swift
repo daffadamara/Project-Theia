@@ -25,6 +25,13 @@ struct GraphNodePosition: Codable, Equatable {
     var y: Double
 }
 
+struct GraphMaskEraseStroke: Codable, Equatable {
+    var x: Double
+    var y: Double
+    var radius: Double
+    var strength: Double
+}
+
 enum ViewportDisplayMode: String, CaseIterable, Identifiable {
     case auto
     case terrain
@@ -135,15 +142,18 @@ struct GraphPreviewSettings: Codable {
 struct GraphDocumentUI: Codable {
     var positions: [String: GraphNodePosition] = [:]
     var preview = GraphPreviewSettings()
+    var maskErases: [String: [GraphMaskEraseStroke]] = [:]
 
     enum CodingKeys: String, CodingKey {
-        case positions, preview
+        case positions, preview, maskErases
     }
 
     init(positions: [String: GraphNodePosition] = [:],
-         preview: GraphPreviewSettings = GraphPreviewSettings()) {
+         preview: GraphPreviewSettings = GraphPreviewSettings(),
+         maskErases: [String: [GraphMaskEraseStroke]] = [:]) {
         self.positions = positions
         self.preview = preview
+        self.maskErases = maskErases
     }
 
     init(from decoder: Decoder) throws {
@@ -152,6 +162,8 @@ struct GraphDocumentUI: Codable {
                                           forKey: .positions) ?? [:]
         preview = try c.decodeIfPresent(GraphPreviewSettings.self,
                                         forKey: .preview) ?? GraphPreviewSettings()
+        maskErases = try c.decodeIfPresent([String: [GraphMaskEraseStroke]].self,
+                                           forKey: .maskErases) ?? [:]
     }
 }
 
@@ -225,6 +237,7 @@ struct GraphDocument: Codable {
 
     mutating func ensureLayout() {
         ensureNodeDefaults()
+        repairRiverCarveConnections()
         if ui == nil { ui = GraphDocumentUI() }
         var positions = ui?.positions ?? [:]
         for (index, node) in nodes.enumerated() where positions[node.id] == nil {
@@ -235,6 +248,11 @@ struct GraphDocument: Codable {
             positions.removeValue(forKey: key)
         }
         ui?.positions = positions
+        if let eraseKeys = ui?.maskErases.keys {
+            for key in Array(eraseKeys) where !nodes.contains(where: { $0.id == key }) {
+                ui?.maskErases.removeValue(forKey: key)
+            }
+        }
     }
 
     mutating func ensureNodeDefaults() {
@@ -242,6 +260,14 @@ struct GraphDocument: Codable {
             let defaults = Self.defaultParams(for: nodes[index].type)
             nodes[index].params = defaults.merging(nodes[index].params) { _, saved in saved }
             migrateLegacySlopeMaskDefaults(index: index)
+            migrateLegacyRiverMaskParams(index: index)
+        }
+    }
+
+    private mutating func migrateLegacyRiverMaskParams(index: Int) {
+        guard nodes[index].type == "river" else { return }
+        for key in ["depth", "downcutting", "renderSurface", "riverValleyWidth"] {
+            nodes[index].params.removeValue(forKey: key)
         }
     }
 
@@ -267,7 +293,8 @@ struct GraphDocument: Codable {
         return String(decoding: data, as: UTF8.self)
     }
 
-    mutating func addNode(type: String, after previousId: String? = nil) -> String {
+    mutating func addNode(type: String, after previousId: String? = nil,
+                          at position: GraphNodePosition? = nil) -> String {
         let base = type
         var id = base
         var suffix = 1
@@ -277,7 +304,9 @@ struct GraphDocument: Codable {
         }
         nodes.append(GraphDocumentNode(id: id, type: type, params: Self.defaultParams(for: type)))
         if ui == nil { ui = GraphDocumentUI() }
-        if let previousId, let previous = ui?.positions[previousId] {
+        if let position {
+            ui?.positions[id] = position
+        } else if let previousId, let previous = ui?.positions[previousId] {
             ui?.positions[id] = GraphNodePosition(x: previous.x + 220, y: previous.y)
         } else if let last = nodes.dropLast().last,
                   let previous = ui?.positions[last.id] {
@@ -303,6 +332,7 @@ struct GraphDocument: Codable {
         connections.removeAll { ids.contains($0.from) || ids.contains($0.to) }
         for id in ids {
             ui?.positions.removeValue(forKey: id)
+            ui?.maskErases.removeValue(forKey: id)
         }
         if ids.contains(sink) {
             sink = nodes.last?.id ?? ""
@@ -324,11 +354,36 @@ struct GraphDocument: Codable {
         ui?.preview = settings
     }
 
+    mutating func addMaskEraseStroke(nodeId: String, stroke: GraphMaskEraseStroke) {
+        if ui == nil { ui = GraphDocumentUI() }
+        ui?.maskErases[nodeId, default: []].append(stroke)
+    }
+
+    mutating func clearMaskEraseStrokes(nodeId: String) {
+        ui?.maskErases.removeValue(forKey: nodeId)
+    }
+
+    func maskEraseStrokes(nodeId: String) -> [GraphMaskEraseStroke] {
+        ui?.maskErases[nodeId] ?? []
+    }
+
     mutating func connect(from: String, to: String, input: UInt32) {
         connections.removeAll { $0.to == to && $0.input == input }
         let edge = GraphDocumentConnection(from: from, to: to, input: input)
         if !connections.contains(edge) {
             connections.append(edge)
+        }
+    }
+
+    mutating func repairRiverCarveConnections() {
+        for carve in nodes where carve.type == "rivercarve" {
+            guard let misplacedMask = connections.first(where: {
+                $0.to == carve.id && $0.input == 0 && node(id: $0.from)?.type == "river"
+            }) else { continue }
+            guard let upstreamTerrain = upstreamNodeId(to: misplacedMask.from, input: 0)
+            else { continue }
+            connect(from: upstreamTerrain, to: carve.id, input: 0)
+            connect(from: misplacedMask.from, to: carve.id, input: 1)
         }
     }
 
@@ -342,6 +397,10 @@ struct GraphDocument: Codable {
 
     func node(id: String) -> GraphDocumentNode? {
         nodes.first { $0.id == id }
+    }
+
+    func upstreamNodeId(to nodeId: String, input: UInt32) -> String? {
+        connections.first { $0.to == nodeId && $0.input == input }?.from
     }
 
     static func defaultParams(for type: String) -> [String: Double] {

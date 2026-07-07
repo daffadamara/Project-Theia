@@ -5,11 +5,15 @@
 #include "nodes/BlurNode.hpp"
 #include "nodes/ClampNode.hpp"
 #include "nodes/CombineNode.hpp"
+#include "nodes/DropletErosionNode.hpp"
+#include "nodes/ExportNode.hpp"
 #include "nodes/HydraulicErosionNode.hpp"
 #include "nodes/InvertNode.hpp"
 #include "nodes/NormalizeNode.hpp"
 #include "nodes/PerlinNode.hpp"
 #include "nodes/RemapNode.hpp"
+#include "nodes/RiverNode.hpp"
+#include "nodes/RiverCarveNode.hpp"
 #include "nodes/RidgedNode.hpp"
 #include "nodes/ScaleBiasNode.hpp"
 #include "nodes/SlopeMaskNode.hpp"
@@ -40,6 +44,10 @@ std::unique_ptr<Node> createNode(const std::string& type, const std::string& id)
     if (type == "remap") return std::make_unique<RemapNode>(id);
     if (type == "blur") return std::make_unique<BlurNode>(id);
     if (type == "warp") return std::make_unique<WarpNode>(id);
+    if (type == "dropleterosion") return std::make_unique<DropletErosionNode>(id);
+    if (type == "river") return std::make_unique<RiverNode>(id);
+    if (type == "rivercarve") return std::make_unique<RiverCarveNode>(id);
+    if (type == "export") return std::make_unique<ExportNode>(id);
     if (type == "hydraulic") return std::make_unique<HydraulicErosionNode>(id);
     if (type == "thermal") return std::make_unique<ThermalErosionNode>(id);
     if (type == "terrace") return std::make_unique<TerraceNode>(id);
@@ -49,9 +57,11 @@ std::unique_ptr<Node> createNode(const std::string& type, const std::string& id)
 }
 
 std::vector<std::string> registeredNodeTypes() {
-    return {"perlin",    "ridged",  "scalebias", "combine",  "blend",
-            "invert",    "clamp",   "remap",     "blur",     "warp",
-            "hydraulic", "thermal", "terrace",   "normalize", "slopemask"};
+    return {"perlin",         "ridged",    "scalebias", "combine",
+            "blend",          "invert",    "clamp",     "remap",
+            "blur",           "warp",      "hydraulic", "dropleterosion",
+            "river",          "rivercarve", "export",    "thermal",   "terrace",   "normalize",
+            "slopemask"};
 }
 
 } // namespace theia

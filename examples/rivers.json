@@ -1,0 +1,42 @@
+{
+  "resolution": { "width": 512, "height": 512 },
+  "sink": "rivers",
+  "nodes": [
+    {
+      "id": "base",
+      "type": "perlin",
+      "params": {
+        "seed": 5109,
+        "octaves": 7,
+        "frequency": 3.5,
+        "lacunarity": 2.0,
+        "gain": 0.5,
+        "heightScale": 1.0
+      }
+    },
+    {
+      "id": "rivers",
+      "type": "river",
+      "params": {
+        "seed": 2027,
+        "water": 0.7,
+        "width": 2.0,
+        "headwaters": 32
+      }
+    }
+  ],
+  "connections": [
+    { "from": "base", "to": "rivers", "input": 0 }
+  ],
+  "ui": {
+    "preview": {
+      "displayMode": "auto",
+      "materialPreset": "natural",
+      "maskOpacity": 0.75
+    },
+    "positions": {
+      "base": { "x": 80, "y": 120 },
+      "rivers": { "x": 320, "y": 120 }
+    }
+  }
+}

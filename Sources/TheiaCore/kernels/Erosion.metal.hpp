@@ -81,6 +81,9 @@ kernel void hydro_flux(device const float* terrain [[buffer(0)]],
     float dT = (y > 0)     ? h - (terrain[i - W] + water[i - W]) : 0.0;
     float dB = (y < H - 1) ? h - (terrain[i + W] + water[i + W]) : 0.0;
 
+    // Mild damping prevents persistent pipe oscillation from turning into
+    // vertical/horizontal striping on high-relief procedural terrain.
+    f *= 0.92;
     f.x = max(0.0, f.x + c * dL);
     f.y = max(0.0, f.y + c * dR);
     f.z = max(0.0, f.z + c * dT);
@@ -125,8 +128,14 @@ kernel void hydro_water(device float*        water [[buffer(2)]],
 
     float dWx = 0.5 * ((inL - fo.x) + (fo.y - inR));
     float dWy = 0.5 * ((inT - fo.z) + (fo.w - inB));
-    float dmean = max(1e-4, 0.5 * (d1 + d2));
-    vel[i] = float2(dWx / (P.cellSize * dmean), dWy / (P.cellSize * dmean));
+    float dmean = 0.5 * (d1 + d2);
+    float2 v = float2(0.0);
+    if (dmean > 1e-3) {
+        v = float2(dWx, dWy) / (P.cellSize * dmean);
+        float speed = length(v);
+        if (speed > 3.0) v *= 3.0 / speed;
+    }
+    vel[i] = v;
     water[i] = d2;
 }
 
@@ -154,16 +163,18 @@ kernel void hydro_erode(device const float* tIn   [[buffer(0)]],
     float sinAlpha = max(P.minTilt, grad / sqrt(1.0 + grad * grad));
 
     float vmag = length(vel[i]);
-    float C = P.sedimentCap * sinAlpha * vmag;
+    float waterFactor = clamp(water[i] * 50.0, 0.0, 1.0);
+    float C = P.sedimentCap * sinAlpha * vmag * waterFactor;
 
     float s = sIn[i];
     float b = tIn[i];
+    float maxTransfer = max(0.02, 0.0025 * P.heightScale);
     if (C > s) {
-        float amt = P.dt * P.suspension * (C - s);
+        float amt = min(maxTransfer, max(0.0, P.dt * P.suspension * (C - s)));
         tOut[i] = b - amt;
         sOut[i] = s + amt;
     } else {
-        float amt = P.dt * P.deposition * (s - C);
+        float amt = min(maxTransfer, min(s, max(0.0, P.dt * P.deposition * (s - C))));
         tOut[i] = b + amt;
         sOut[i] = s - amt;
     }
@@ -209,7 +220,7 @@ kernel void hydro_finish(device const float* terrain [[buffer(0)]],
     uint W = P.width, H = P.height;
     if (gid.x >= W || gid.y >= H) return;
     uint i = idx(gid.x, gid.y, W);
-    output[i] = terrain[i] / P.heightScale;
+    output[i] = clamp(terrain[i] / P.heightScale, 0.0, 1.0);
 }
 )METAL";
 

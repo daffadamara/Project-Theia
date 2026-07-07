@@ -174,6 +174,7 @@ if let initialEval {
 }
 
 mtkView.rendererRef = renderer
+mtkView.modelRef = model
 let viewportDelegate = ViewportDelegate(renderer: renderer)
 mtkView.delegate = viewportDelegate
 

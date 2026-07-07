@@ -82,8 +82,8 @@ std::size_t generate_error(const GenerateResult& r, char* out, std::size_t cap);
 //
 // Node types include generators ("perlin", "ridged"), unary filters/remaps
 // ("scalebias", "invert", "clamp", "remap", "blur", "warp", "hydraulic",
-// "thermal", "terrace", "normalize", "slopemask"), and binary combiners
-// ("combine", "blend").
+// "dropleterosion", "river", "rivercarve", "export", "thermal", "terrace",
+// "normalize", "slopemask"), and binary combiners ("combine", "blend").
 
 struct GraphHandle;  // opaque; defined in the implementation
 

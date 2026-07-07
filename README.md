@@ -45,8 +45,20 @@ heightmap) next to it.
 
 The viewer can display the active node as shaded terrain, height, mask, slope,
 normal, or material preview. In `auto` mode, mask-style nodes such as
-`slopemask` are shown as an overlay on their upstream terrain instead of being
-treated as displaced terrain geometry.
+`slopemask` and `river` are shown as overlays on their upstream terrain instead
+of being treated as displaced terrain geometry.
+When a mask preview is active, the viewport exposes an erase brush for hiding
+unwanted mask strokes; those edits are saved as optional `ui` metadata and are
+ignored by the headless core loader.
+
+Viewport navigation follows common 3D editor conventions: left-drag orbits,
+Shift-left-drag / middle-drag / right-drag pans, wheel or pinch zooms,
+Option-right-drag dollies, and focused viewport keys `F` and `7`
+reset the camera or snap to top view. Keys `O`, `H`, and `Z` select orbit, pan, and
+zoom left-drag tools; `G`, `A`, and `W` toggle grid, axes, and wireframe. The
+viewport has a Godot-style top toolbar with icon-only frame/orbit/pan/zoom
+controls, grid/axis/wireframe toggles, compact projection/display/material
+menus, and a camera-aware axis gizmo for snapping to X/Y/Z views.
 
 ## Node types
 
@@ -55,6 +67,9 @@ treated as displaced terrain geometry.
 | `perlin`    |   0    | fBm Perlin noise (seed, octaves, frequency, lacunarity, gain) |
 | `ridged`    |   0    | ridged multifractal-style fBm generator                       |
 | `hydraulic` |   1    | hydraulic erosion, Mei et al. 2007 virtual-pipes model   |
+| `dropleterosion` | 1 | deterministic particle hydrology with discharge/momentum feedback |
+| `river` | 1 | terrain-traced river mask with seed, headwaters, water, and width controls |
+| `rivercarve` | 2 | carves terrain from an explicit river mask with depth/downcutting controls |
 | `thermal`   |   1    | thermal erosion (talus-angle relaxation)                 |
 | `terrace`   |   1    | quantize heights into stratified terraces                |
 | `normalize` |   1    | stretch the actual range to [0,1]                        |
@@ -84,6 +99,7 @@ See `examples/` for graph files.
 
 ## Roadmap
 
-The core is in place (noise, erosion, filters, graph engine, JSON I/O) and the
-viewer now supports graph authoring plus analysis/material preview. Next:
-export pipeline, richer material workflows, and more natural-process nodes.
+The core is in place (noise, erosion, hydrology, filters, graph engine, JSON I/O)
+and the viewer now supports graph authoring plus analysis/material preview.
+Next: richer material workflows, more export targets, and broader natural-process
+nodes.

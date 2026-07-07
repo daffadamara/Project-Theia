@@ -10,9 +10,9 @@ class ThermalErosionNode : public Node {
 public:
     explicit ThermalErosionNode(std::string id)
         : Node(std::move(id), "thermal") {
-        params.set("iterations", 40);
-        params.set("talusAngle", 33.0);   // degrees (~angle of repose)
-        params.set("strength", 0.5);      // fraction of excess shed per step
+        params.set("iterations", 60);
+        params.set("talusAngle", 24.0);   // degrees (~angle of repose)
+        params.set("strength", 0.6);      // fraction of excess shed per step
         params.set("cellSize", 1.0);
         params.set("heightScale", 64.0);
     }

@@ -7,10 +7,10 @@ namespace theia {
 class SlopeMaskNode : public Node {
 public:
     explicit SlopeMaskNode(std::string id) : Node(std::move(id), "slopemask") {
-        params.set("low", 15.0);
-        params.set("high", 55.0);
-        params.set("heightScale", 1.0);
-        params.set("cellSize", 1.0);
+        params.set("low", 15.0);          // degrees: mask starts ramping here
+        params.set("high", 50.0);         // degrees: fully masked at/above
+        params.set("heightScale", 100.0); // vertical exaggeration for the slope calc
+        params.set("cellSize", 1.0);      // horizontal spacing per cell
     }
     std::size_t inputCount() const override { return 1; }
     bool evaluate(GPUContext& ctx,

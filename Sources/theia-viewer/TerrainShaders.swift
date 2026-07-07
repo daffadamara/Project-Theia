@@ -12,6 +12,7 @@ struct Uniforms {
     float4x4 mvp;
     float4 lightDirection;
     float4 viewportParams; // x=heightScale, y=maskOpacity, z=displayMode, w=materialPreset
+    float4 terrainParams;  // x=base height offset for geometry
     uint4  gridParams;     // x=gridW, y=gridH
 };
 
@@ -20,6 +21,16 @@ struct VOut {
     float3 normal;
     float  height;
     float  data;
+};
+
+struct LineVertexIn {
+    float3 position;
+    float4 color;
+};
+
+struct LineOut {
+    float4 position [[position]];
+    float4 color;
 };
 
 vertex VOut terrain_vertex(uint vid [[vertex_id]],
@@ -37,7 +48,7 @@ vertex VOut terrain_vertex(uint vid [[vertex_id]],
 
     float fx = (float(gx) / float(gridW - 1)) * 2.0 - 1.0;
     float fz = (float(gz) / float(gridH - 1)) * 2.0 - 1.0;
-    float y = h * heightScale;
+    float y = (h - U.terrainParams.x) * heightScale;
 
     uint gxl = gx > 0 ? gx - 1 : gx;
     uint gxr = gx < gridW - 1 ? gx + 1 : gx;
@@ -59,6 +70,20 @@ vertex VOut terrain_vertex(uint vid [[vertex_id]],
     o.height = h;
     o.data = d;
     return o;
+}
+
+vertex LineOut line_vertex(uint vid [[vertex_id]],
+                           const device LineVertexIn* vertices [[buffer(0)]],
+                           constant Uniforms& U [[buffer(1)]]) {
+    LineVertexIn v = vertices[vid];
+    LineOut o;
+    o.position = U.mvp * float4(v.position, 1.0);
+    o.color = v.color;
+    return o;
+}
+
+fragment float4 line_fragment(LineOut in [[stage_in]]) {
+    return in.color;
 }
 
 float3 terrainRamp(float h, float slope) {

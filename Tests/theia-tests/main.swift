@@ -367,11 +367,11 @@ h.test("Legacy slope mask defaults migrate to preview-safe values") {
     }
     """
     h.expect(theia.graph_load_json_text(g, json), "load: \(graphError(g))")
-    h.expect(theia.graph_param_value(g, "mask", "heightScale", -1) == 1.0,
+    h.expect(theia.graph_param_value(g, "mask", "heightScale", -1) == 100.0,
              "legacy slopemask heightScale should migrate")
     h.expect(theia.graph_param_value(g, "mask", "low", -1) == 15.0,
              "legacy slopemask low should migrate")
-    h.expect(theia.graph_param_value(g, "mask", "high", -1) == 55.0,
+    h.expect(theia.graph_param_value(g, "mask", "high", -1) == 50.0,
              "legacy slopemask high should migrate")
     let r = theia.graph_evaluate(g, "", 96, 96, nil, nil)
     h.expect(r.ok, "eval: \(graphError(g))")
@@ -399,7 +399,7 @@ h.test("Invalid slope mask thresholds are migrated before evaluation") {
     h.expect(theia.graph_load_json_text(g, json), "load: \(graphError(g))")
     h.expect(theia.graph_param_value(g, "mask", "low", -1) == 15.0,
              "invalid slopemask low should migrate")
-    h.expect(theia.graph_param_value(g, "mask", "high", -1) == 55.0,
+    h.expect(theia.graph_param_value(g, "mask", "high", -1) == 50.0,
              "invalid slopemask high should migrate")
     let r = theia.graph_evaluate(g, "", 96, 96, nil, nil)
     h.expect(r.ok, "eval: \(graphError(g))")
@@ -866,12 +866,48 @@ h.test("Default node parameter enumeration supports node creation") {
              "scalebias default scale")
     h.expect(theia.graph_default_param_value("combine", "t", -1) == 0.5,
              "combine default t")
-    h.expect(theia.graph_default_param_value("slopemask", "heightScale", -1) == 1.0,
+    h.expect(theia.graph_default_param_value("slopemask", "heightScale", -1) == 100.0,
              "slopemask default heightScale")
     h.expect(theia.graph_default_param_value("slopemask", "low", -1) == 15.0,
              "slopemask default low")
-    h.expect(theia.graph_default_param_value("slopemask", "high", -1) == 55.0,
+    h.expect(theia.graph_default_param_value("slopemask", "high", -1) == 50.0,
              "slopemask default high")
+}
+
+h.test("Export node is a valid passthrough graph terminal") {
+    let types = readCxxString { theia.node_type_list($0, $1) }
+    h.expect(types.contains("export"), "export missing from node_type_list: \(types)")
+    h.expect(theia.graph_node_type_input_count("export") == 1, "export input count")
+    h.expect(theia.graph_default_param_count("export") == 0, "export has no params")
+
+    let source = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 99 } }
+      ],
+      "connections": []
+    }
+    """
+    let terminal = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "out",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": { "seed": 99 } },
+        { "id": "out", "type": "export", "params": {} }
+      ],
+      "connections": [
+        { "from": "p", "to": "out", "input": 0 }
+      ]
+    }
+    """
+    let a = evalGraphHeightsJSON(source, sink: "p", size: 32)
+    let b = evalGraphHeightsJSON(terminal, sink: "out", size: 32)
+    h.expect(a.count == b.count, "export passthrough count")
+    let maxDiff = zip(a, b).map { abs($0 - $1) }.max() ?? 1
+    h.expect(maxDiff < 0.00001, "export should pass through input, diff \(maxDiff)")
 }
 
 // --- P4: foundation node pack ------------------------------------------------
@@ -887,6 +923,77 @@ func evalGraphJSON(_ json: String, sink: String = "", size: UInt32 = 96) -> thei
     let r = theia.graph_evaluate(g, sink, size, size, nil, nil)
     h.expect(r.ok, "eval \(sink): \(graphError(g))")
     return r
+}
+
+@MainActor
+func evalGraphHeightsJSON(_ json: String, sink: String = "",
+                          size: UInt32 = 96) -> [Float] {
+    guard let g = theia.graph_create() else {
+        h.expect(false, "create failed")
+        return []
+    }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, json), "load json: \(graphError(g))")
+    var buf = [Float](repeating: 0, count: Int(size * size))
+    let r = buf.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, sink, size, size, $0.baseAddress, $0.count)
+    }
+    h.expect(r.ok, "eval heights \(sink): \(graphError(g))")
+    return buf
+}
+
+func maxNeighborDelta(_ values: [Float], size: Int) -> Float {
+    var maxDelta: Float = 0
+    for y in 0..<size {
+        for x in 0..<size {
+            let i = y * size + x
+            if x + 1 < size {
+                maxDelta = max(maxDelta, abs(values[i] - values[i + 1]))
+            }
+            if y + 1 < size {
+                maxDelta = max(maxDelta, abs(values[i] - values[i + size]))
+            }
+        }
+    }
+    return maxDelta
+}
+
+func meanAbsoluteDifference(_ a: [Float], _ b: [Float]) -> Float {
+    guard a.count == b.count, !a.isEmpty else { return 0 }
+    var sum: Float = 0
+    for (x, y) in zip(a, b) {
+        sum += abs(x - y)
+    }
+    return sum / Float(a.count)
+}
+
+h.test("Hydraulic erosion default profile avoids spike striping") {
+    let json = """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "h",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 1337, "frequency": 4.0, "octaves": 7,
+          "lacunarity": 2.0, "gain": 0.45, "heightScale": 1.0
+        } },
+        { "id": "h", "type": "hydraulic", "params": {
+          "iterations": 200, "rain": 0.012, "evaporation": 0.015,
+          "sedimentCapacity": 0.35, "suspension": 0.25,
+          "deposition": 0.30, "gravity": 9.81, "dt": 0.015,
+          "minTilt": 0.03, "heightScale": 80.0,
+          "pipeArea": 1.0, "pipeLength": 1.0, "cellSize": 1.0
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "h", "input": 0 }
+      ]
+    }
+    """
+    let values = evalGraphHeightsJSON(json, size: 96)
+    let maxDelta = maxNeighborDelta(values, size: 96)
+    h.expect(maxDelta < 0.20,
+             "hydraulic produced spike-like neighbor delta \(maxDelta)")
 }
 
 func p4JSON(type: String, params: String = "{}", inputCount: Int = 1) -> String {
@@ -999,6 +1106,431 @@ h.test("Blur smooths terrain and clamp respects output band") {
 
 h.test("Foundation example graphs load and evaluate") {
     for path in ["examples/foundation.json", "examples/masks.json"] {
+        guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+        defer { theia.graph_destroy(g) }
+        h.expect(theia.graph_load_json_file(g, path), "load \(path): \(graphError(g))")
+        let r = theia.graph_evaluate(g, "", 128, 128, nil, nil)
+        h.expect(r.ok, "eval \(path): \(graphError(g))")
+        h.expect(r.minHeight >= -1e-6 && r.maxHeight <= 1.000001,
+                 "\(path) out of range")
+        h.expect(r.variance > 1e-8, "\(path) degenerate")
+    }
+}
+
+// --- Phase 7: particle hydrology --------------------------------------------
+
+func hydrologyJSON(type: String, seed: Int = 1337, particles: Int = 900,
+                   maxAge: Int = 45, momentum: Double = 0.8) -> String {
+    """
+    {
+      "resolution": { "width": 72, "height": 72 },
+      "sink": "h",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "h", "type": "\(type)", "params": {
+          "seed": \(seed),
+          "particles": \(particles),
+          "maxAge": \(maxAge),
+          "evaporation": 0.01,
+          "deposition": 0.12,
+          "entrainment": 8.0,
+          "gravity": 1.0,
+          "momentumTransfer": \(momentum),
+          "settling": 0.35,
+          "maxDiff": 0.02,
+          "heightScale": 64.0
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "h", "input": 0 }
+      ]
+    }
+    """
+}
+
+func riverJSON(seed: Int = 1337, water: Double = 0.7, width: Double = 2.0,
+               depth: Double = 0.65, downcutting: Double = 0.55,
+               headwaters: Int = 12, renderSurface: Int = 0) -> String {
+    """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "r",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "r", "type": "river", "params": {
+          "seed": \(seed),
+          "water": \(water),
+          "width": \(width),
+          "depth": \(depth),
+          "downcutting": \(downcutting),
+          "riverValleyWidth": 0.0,
+          "headwaters": \(headwaters),
+          "renderSurface": \(renderSurface)
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "r", "input": 0 }
+      ]
+    }
+    """
+}
+
+h.test("Particle hydrology and river nodes are registered and expose defaults") {
+    let types = readCxxString { theia.node_type_list($0, $1) }
+    h.expect(types.contains("dropleterosion"), "dropleterosion missing from node_type_list: \(types)")
+    h.expect(!types.contains("flowaccum"), "flowaccum should not be registered: \(types)")
+    h.expect(types.contains("river"), "river missing from node_type_list: \(types)")
+    h.expect(types.contains("rivercarve"), "rivercarve missing from node_type_list: \(types)")
+
+    h.expect(theia.graph_node_type_input_count("dropleterosion") == 1,
+             "dropleterosion input count")
+    h.expect(theia.graph_default_param_count("dropleterosion") == 11,
+             "dropleterosion default count")
+    let dropletDefaults: [(String, Double)] = [
+        ("seed", 1337), ("particles", 40000), ("maxAge", 300),
+        ("evaporation", 0.010), ("deposition", 0.20),
+        ("entrainment", 1.0), ("gravity", 1.0),
+        ("momentumTransfer", 1.0), ("settling", 0.50),
+        ("maxDiff", 0.100), ("heightScale", 100.0),
+    ]
+    for (key, expected) in dropletDefaults {
+        h.expect(theia.graph_default_param_value("dropleterosion", key, -1) == expected,
+                 "dropleterosion \(key) default")
+    }
+
+    h.expect(theia.graph_node_type_input_count("river") == 1, "river input count")
+    h.expect(theia.graph_default_param_count("river") == 4, "river default count")
+    h.expect(theia.graph_default_param_value("river", "seed", -1) == 1337,
+             "river seed default")
+    h.expect(theia.graph_default_param_value("river", "water", -1) == 0.65,
+             "river water default")
+    h.expect(theia.graph_default_param_value("river", "width", -1) == 2.0,
+             "river width default")
+    h.expect(theia.graph_default_param_value("river", "headwaters", -1) == 32,
+             "river headwaters default")
+    for removed in ["depth", "downcutting", "renderSurface", "riverValleyWidth"] {
+        h.expect(theia.graph_default_param_value("river", removed, -1) == -1,
+                 "river should not expose \(removed)")
+    }
+
+    h.expect(theia.graph_node_type_input_count("rivercarve") == 2, "rivercarve input count")
+    h.expect(theia.graph_default_param_count("rivercarve") == 5,
+             "rivercarve default count")
+    h.expect(theia.graph_default_param_value("rivercarve", "depth", -1) == 0.45,
+             "rivercarve depth default")
+    h.expect(theia.graph_default_param_value("rivercarve", "shorelineWidth", -1) == 2.0,
+             "rivercarve shorelineWidth default")
+    h.expect(theia.graph_default_param_value("rivercarve", "shorelineSharpness", -1) == 0.45,
+             "rivercarve shorelineSharpness default")
+}
+
+h.test("Droplet erosion is deterministic, finite, and seed-sensitive") {
+    let base = evalGraphJSON("""
+    {
+      "resolution": { "width": 72, "height": 72 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } }
+      ],
+      "connections": []
+    }
+    """, size: 72)
+    let a = evalGraphJSON(hydrologyJSON(type: "dropleterosion", seed: 2027), size: 72)
+    let b = evalGraphJSON(hydrologyJSON(type: "dropleterosion", seed: 2027), size: 72)
+    let c = evalGraphJSON(hydrologyJSON(type: "dropleterosion", seed: 2028), size: 72)
+    h.expect(a.minHeight >= -1e-6 && a.maxHeight <= 1.000001,
+             "dropleterosion out of range [\(a.minHeight), \(a.maxHeight)]")
+    h.expect(a.variance > 1e-8, "dropleterosion degenerate")
+    h.expect(a.mean == b.mean && a.variance == b.variance,
+             "dropleterosion should be deterministic")
+    h.expect(a.mean != base.mean || a.variance != base.variance,
+             "dropleterosion should alter terrain")
+    h.expect(a.mean != c.mean || a.variance != c.variance,
+             "different hydrology seeds should alter terrain")
+}
+
+h.test("Hydrology momentum changes terrain and river is a mask") {
+    let noMomentum = evalGraphJSON(hydrologyJSON(type: "dropleterosion", momentum: 0.0), size: 72)
+    let withMomentum = evalGraphJSON(hydrologyJSON(type: "dropleterosion", momentum: 1.25), size: 72)
+    h.expect(noMomentum.mean != withMomentum.mean ||
+             noMomentum.variance != withMomentum.variance,
+             "momentumTransfer should affect droplet erosion")
+
+    let river = evalGraphJSON(riverJSON(seed: 2027), size: 72)
+    let riverOtherSeed = evalGraphJSON(riverJSON(seed: 2028), size: 72)
+    h.expect(river.minHeight >= -1e-6 && river.maxHeight <= 1.000001,
+             "river out of mask range [\(river.minHeight), \(river.maxHeight)]")
+    h.expect(river.variance > 1e-8, "river mask should be non-degenerate")
+    h.expect(river.mean != riverOtherSeed.mean || river.variance != riverOtherSeed.variance,
+             "river seed should alter the mask network")
+}
+
+h.test("River node traces sparse connected downhill paths") {
+    let size = 96
+    let values = evalGraphHeightsJSON(riverJSON(seed: 2027), size: UInt32(size))
+    let visible = values.map { $0 > 0.25 }
+    let visibleCount = visible.filter { $0 }.count
+    h.expect(visibleCount > size, "river should create visible river pixels")
+    h.expect(visibleCount < values.count / 5,
+             "river should stay sparse, got \(visibleCount)/\(values.count)")
+
+    var visited = [Bool](repeating: false, count: values.count)
+    var largest = 0
+    var largestSpan = 0
+    let neighbors = [(-1, -1), (0, -1), (1, -1), (-1, 0),
+                     (1, 0), (-1, 1), (0, 1), (1, 1)]
+    for i in values.indices where visible[i] && !visited[i] {
+        var queue = [i]
+        visited[i] = true
+        var head = 0
+        var count = 0
+        var minX = size
+        var maxX = 0
+        var minY = size
+        var maxY = 0
+        while head < queue.count {
+            let cur = queue[head]
+            head += 1
+            count += 1
+            let x = cur % size
+            let y = cur / size
+            minX = min(minX, x)
+            maxX = max(maxX, x)
+            minY = min(minY, y)
+            maxY = max(maxY, y)
+            for (dx, dy) in neighbors {
+                let nx = x + dx
+                let ny = y + dy
+                if nx < 0 || ny < 0 || nx >= size || ny >= size { continue }
+                let ni = ny * size + nx
+                if visible[ni] && !visited[ni] {
+                    visited[ni] = true
+                    queue.append(ni)
+                }
+            }
+        }
+        if count > largest {
+            largest = count
+            largestSpan = (maxX - minX) + (maxY - minY)
+        }
+    }
+    h.expect(largest > size / 2, "largest river component too small: \(largest)")
+    h.expect(largestSpan > size / 2, "largest river component too short: \(largestSpan)")
+}
+
+h.test("River node responds to upstream terrain changes") {
+    let perlinOnly = riverJSON(seed: 2027, water: 0.72, width: 2.0,
+                               headwaters: 24)
+    let erodedUpstream = """
+    {
+      "resolution": { "width": 72, "height": 72 },
+      "sink": "r",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "e", "type": "dropleterosion", "params": {
+          "seed": 2027, "particles": 1200, "maxAge": 70,
+          "evaporation": 0.01, "deposition": 0.20, "entrainment": 1.0,
+          "gravity": 1.0, "momentumTransfer": 1.0,
+          "settling": 0.50, "maxDiff": 0.10, "heightScale": 100.0
+        } },
+        { "id": "r", "type": "river", "params": {
+          "seed": 2027, "water": 0.72, "width": 2.0, "headwaters": 24
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "e", "input": 0 },
+        { "from": "e", "to": "r", "input": 0 }
+      ]
+    }
+    """
+    let rawMask = evalGraphHeightsJSON(perlinOnly, sink: "r", size: 72)
+    let erodedMask = evalGraphHeightsJSON(erodedUpstream, sink: "r", size: 72)
+    let diff = meanAbsoluteDifference(rawMask, erodedMask)
+    h.expect(diff > 0.020,
+             "river mask should adapt to eroded upstream terrain, mean diff \(diff)")
+}
+
+h.test("River node responds to combined upstream terrain") {
+    let perlinOnly = riverJSON(seed: 2027, water: 0.72, width: 2.0,
+                               headwaters: 24)
+    let blendedUpstream = """
+    {
+      "resolution": { "width": 72, "height": 72 },
+      "sink": "r",
+      "nodes": [
+        { "id": "a", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "b", "type": "ridged", "params": {
+          "seed": 229, "frequency": 7.0, "octaves": 5, "heightScale": 1.0
+        } },
+        { "id": "blend", "type": "blend", "params": {
+          "mode": 1, "opacity": 0.42
+        } },
+        { "id": "r", "type": "river", "params": {
+          "seed": 2027, "water": 0.72, "width": 2.0, "headwaters": 24
+        } }
+      ],
+      "connections": [
+        { "from": "a", "to": "blend", "input": 0 },
+        { "from": "b", "to": "blend", "input": 1 },
+        { "from": "blend", "to": "r", "input": 0 }
+      ]
+    }
+    """
+    let rawMask = evalGraphHeightsJSON(perlinOnly, sink: "r", size: 72)
+    let blendedMask = evalGraphHeightsJSON(blendedUpstream, sink: "r", size: 72)
+    let diff = meanAbsoluteDifference(rawMask, blendedMask)
+    h.expect(diff > 0.020,
+             "river mask should adapt to blended upstream terrain, mean diff \(diff)")
+}
+
+h.test("River carve consumes a separate river mask") {
+    let carved = evalGraphJSON("""
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "carve",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "r", "type": "river", "params": {
+          "seed": 2027, "water": 0.7, "width": 2.0,
+          "depth": 0.65, "downcutting": 0.55,
+          "riverValleyWidth": 0.0, "headwaters": 32, "renderSurface": 0
+        } },
+        { "id": "carve", "type": "rivercarve", "params": {
+          "depth": 0.45, "downcutting": 0.55, "riverValleyWidth": 2.0
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "r", "input": 0 },
+        { "from": "p", "to": "carve", "input": 0 },
+        { "from": "r", "to": "carve", "input": 1 }
+      ]
+    }
+    """, size: 96)
+    let base = evalGraphJSON("""
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } }
+      ],
+      "connections": []
+    }
+    """, size: 96)
+    h.expect(carved.minHeight >= -1e-6 && carved.maxHeight <= 1.000001,
+             "rivercarve out of range")
+    h.expect(carved.mean < base.mean,
+             "rivercarve should lower terrain mean \(base.mean) -> \(carved.mean)")
+}
+
+h.test("River carve shoreline controls bank falloff") {
+    @MainActor
+    func carved(sharpness: Double) -> [Float] {
+        evalGraphHeightsJSON("""
+        {
+          "resolution": { "width": 72, "height": 72 },
+          "sink": "carve",
+          "nodes": [
+            { "id": "p", "type": "perlin", "params": {
+              "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+            } },
+            { "id": "r", "type": "river", "params": {
+              "seed": 2027, "water": 0.72, "width": 2.0, "headwaters": 24
+            } },
+            { "id": "carve", "type": "rivercarve", "params": {
+              "depth": 0.45,
+              "downcutting": 0.75,
+              "riverValleyWidth": 3.0,
+              "shorelineWidth": 5.0,
+              "shorelineSharpness": \(sharpness)
+            } }
+          ],
+          "connections": [
+            { "from": "p", "to": "r", "input": 0 },
+            { "from": "p", "to": "carve", "input": 0 },
+            { "from": "r", "to": "carve", "input": 1 }
+          ]
+        }
+        """, sink: "carve", size: 72)
+    }
+    let soft = carved(sharpness: 0.05)
+    let sharp = carved(sharpness: 0.95)
+    let diff = meanAbsoluteDifference(soft, sharp)
+    let softDelta = maxNeighborDelta(soft, size: 72)
+    let sharpDelta = maxNeighborDelta(sharp, size: 72)
+    h.expect(diff > 0.003,
+             "shorelineSharpness should alter rivercarve bank falloff, diff \(diff)")
+    h.expect(softDelta < sharpDelta,
+             "soft shoreline should reduce abrupt bank deltas, soft \(softDelta), sharp \(sharpDelta)")
+    h.expect((soft.min() ?? -1) >= -1e-6 && (soft.max() ?? 2) <= 1.000001,
+             "soft shoreline output out of range")
+    h.expect((sharp.min() ?? -1) >= -1e-6 && (sharp.max() ?? 2) <= 1.000001,
+             "sharp shoreline output out of range")
+}
+
+h.test("Particle hydrology remains finite under heavier settings") {
+    let r = evalGraphJSON(hydrologyJSON(type: "dropleterosion", seed: 3031,
+                                        particles: 1800, maxAge: 160,
+                                        momentum: 1.2), size: 72)
+    h.expect(r.minHeight.isFinite && r.maxHeight.isFinite &&
+             r.mean.isFinite && r.variance.isFinite,
+             "heavy hydrology stats should stay finite")
+    h.expect(r.minHeight >= -1e-6 && r.maxHeight <= 1.000001,
+             "heavy hydrology out of range [\(r.minHeight), \(r.maxHeight)]")
+}
+
+h.test("Particle hydrology preserves cache behavior") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    let json = """
+    {
+      "resolution": { "width": 72, "height": 72 },
+      "sink": "out",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "h", "type": "dropleterosion", "params": {
+          "seed": 2027, "particles": 800, "maxAge": 40,
+          "evaporation": 0.01, "deposition": 0.12, "entrainment": 8.0,
+          "gravity": 1.0, "momentumTransfer": 0.8,
+          "settling": 0.35, "maxDiff": 0.02, "heightScale": 64.0
+        } },
+        { "id": "out", "type": "normalize", "params": {} }
+      ],
+      "connections": [
+        { "from": "p", "to": "h", "input": 0 },
+        { "from": "h", "to": "out", "input": 0 }
+      ]
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, json), "load: \(graphError(g))")
+    let first = theia.graph_evaluate(g, "", 72, 72, nil, nil)
+    let warm = theia.graph_evaluate(g, "", 72, 72, nil, nil)
+    h.expect(first.ok && warm.ok, "hydrology cache eval failed: \(graphError(g))")
+    h.expect(warm.evaluated == 0 && warm.reused == 3,
+             "warm cache should reuse p+h+out: \(warm.evaluated)/\(warm.reused)")
+    _ = theia.graph_set_param(g, "h", "momentumTransfer", 1.4)
+    let changed = theia.graph_evaluate(g, "", 72, 72, nil, nil)
+    h.expect(changed.evaluated == 2 && changed.reused == 1,
+             "hydrology param cache: \(changed.evaluated)/\(changed.reused)")
+}
+
+h.test("Particle hydrology examples load and evaluate") {
+    for path in ["examples/hydrology.json", "examples/rivers.json"] {
         guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
         defer { theia.graph_destroy(g) }
         h.expect(theia.graph_load_json_file(g, path), "load \(path): \(graphError(g))")

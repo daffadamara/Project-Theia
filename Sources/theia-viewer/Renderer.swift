@@ -10,7 +10,13 @@ struct Uniforms {
     var mvp: float4x4
     var lightDirection: SIMD4<Float>
     var viewportParams: SIMD4<Float>
+    var terrainParams: SIMD4<Float>
     var gridParams: SIMD4<UInt32>
+}
+
+struct LineVertex {
+    var position: SIMD3<Float>
+    var color: SIMD4<Float>
 }
 
 // Renders a heightfield as a lit, displaced triangle grid. Shared by the live
@@ -22,12 +28,18 @@ final class Renderer {
     let depthFormat: MTLPixelFormat = .depth32Float
 
     private var pipeline: MTLRenderPipelineState
+    private var linePipeline: MTLRenderPipelineState
     private var depthState: MTLDepthStencilState
+    private var lineDepthState: MTLDepthStencilState
 
     private var heightBuffer: MTLBuffer?
     private var dataBuffer: MTLBuffer?
     private var indexBuffer: MTLBuffer?
+    private var gridLineBuffer: MTLBuffer?
+    private var axisLineBuffer: MTLBuffer?
     private var indexCount = 0
+    private var gridLineVertexCount = 0
+    private var axisLineVertexCount = 0
     private(set) var gridW: UInt32 = 0
     private(set) var gridH: UInt32 = 0
     private let maxViewerGrid = 768
@@ -39,7 +51,11 @@ final class Renderer {
     private var displayMode: ViewportDisplayMode = .terrain
     private var materialPreset: MaterialPreset = .natural
     private var maskOpacity: Float = 0.65
+    private var terrainBaseHeight: Float = 0
+    private var projectionMode: ViewportProjection = .perspective
     var wireframeEnabled = false
+    var gridVisible = true
+    var axisVisible = true
     var clear = MTLClearColor(red: 0.09, green: 0.11, blue: 0.14, alpha: 1.0)
 
     init?(device: MTLDevice, colorFormat: MTLPixelFormat) {
@@ -50,13 +66,29 @@ final class Renderer {
         do {
             let lib = try device.makeLibrary(source: terrainShaderSource, options: nil)
             guard let vfn = lib.makeFunction(name: "terrain_vertex"),
-                  let ffn = lib.makeFunction(name: "terrain_fragment") else { return nil }
+                  let ffn = lib.makeFunction(name: "terrain_fragment"),
+                  let lvn = lib.makeFunction(name: "line_vertex"),
+                  let lfn = lib.makeFunction(name: "line_fragment") else { return nil }
             let pd = MTLRenderPipelineDescriptor()
             pd.vertexFunction = vfn
             pd.fragmentFunction = ffn
             pd.colorAttachments[0].pixelFormat = colorFormat
             pd.depthAttachmentPixelFormat = depthFormat
             pipeline = try device.makeRenderPipelineState(descriptor: pd)
+
+            let lpd = MTLRenderPipelineDescriptor()
+            lpd.vertexFunction = lvn
+            lpd.fragmentFunction = lfn
+            lpd.colorAttachments[0].pixelFormat = colorFormat
+            lpd.depthAttachmentPixelFormat = depthFormat
+            lpd.colorAttachments[0].isBlendingEnabled = true
+            lpd.colorAttachments[0].rgbBlendOperation = .add
+            lpd.colorAttachments[0].alphaBlendOperation = .add
+            lpd.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            lpd.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            lpd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            lpd.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            linePipeline = try device.makeRenderPipelineState(descriptor: lpd)
         } catch {
             FileHandle.standardError.write(Data("shader build failed: \(error)\n".utf8))
             return nil
@@ -66,6 +98,13 @@ final class Renderer {
         dd.isDepthWriteEnabled = true
         guard let ds = device.makeDepthStencilState(descriptor: dd) else { return nil }
         depthState = ds
+
+        let ldd = MTLDepthStencilDescriptor()
+        ldd.depthCompareFunction = .lessEqual
+        ldd.isDepthWriteEnabled = false
+        guard let lds = device.makeDepthStencilState(descriptor: ldd) else { return nil }
+        lineDepthState = lds
+        buildViewportGuides()
     }
 
     func setHeights(_ heights: [Float], width: Int, height: Int) {
@@ -79,6 +118,7 @@ final class Renderer {
         let sourceData = data.count >= width * height ? data : heights
         let sampledData = Self.viewerHeights(sourceData, width: width, height: height,
                                             maxGrid: maxViewerGrid)
+        terrainBaseHeight = sampledHeights.values.min() ?? 0
         heightBuffer = device.makeBuffer(bytes: sampledHeights.values,
                                          length: sampledHeights.values.count *
                                             MemoryLayout<Float>.stride,
@@ -135,22 +175,65 @@ final class Renderer {
         indexCount = idx.count
     }
 
+    private func buildViewportGuides() {
+        var grid = [LineVertex]()
+        let extent: Float = 3.0
+        let minorStep: Float = 0.1
+        let majorEvery = 5
+        let count = Int((extent * 2 / minorStep).rounded())
+        for i in 0...count {
+            let v = -extent + Float(i) * minorStep
+            let major = i % majorEvery == 0
+            let alpha: Float = major ? 0.34 : 0.18
+            let c = SIMD4<Float>(0.58, 0.62, 0.66, alpha)
+            let y: Float = 0.0
+            grid.append(LineVertex(position: SIMD3<Float>(-extent, y, v), color: c))
+            grid.append(LineVertex(position: SIMD3<Float>(extent, y, v), color: c))
+            grid.append(LineVertex(position: SIMD3<Float>(v, y, -extent), color: c))
+            grid.append(LineVertex(position: SIMD3<Float>(v, y, extent), color: c))
+        }
+        gridLineBuffer = device.makeBuffer(bytes: grid,
+                                           length: grid.count * MemoryLayout<LineVertex>.stride,
+                                           options: .storageModeShared)
+        gridLineVertexCount = grid.count
+
+        let axisExtent: Float = 3.25
+        let groundY: Float = 0.0
+        let red = SIMD4<Float>(1.0, 0.17, 0.30, 0.92)
+        let green = SIMD4<Float>(0.47, 0.90, 0.12, 0.92)
+        let blue = SIMD4<Float>(0.06, 0.52, 1.0, 0.92)
+        let axis: [LineVertex] = [
+            LineVertex(position: SIMD3<Float>(-axisExtent, groundY, 0), color: red),
+            LineVertex(position: SIMD3<Float>(axisExtent, groundY, 0), color: red),
+            LineVertex(position: SIMD3<Float>(0, groundY, -axisExtent), color: green),
+            LineVertex(position: SIMD3<Float>(0, groundY, axisExtent), color: green),
+            LineVertex(position: SIMD3<Float>(0, 0, 0), color: blue),
+            LineVertex(position: SIMD3<Float>(0, 1.4, 0), color: blue)
+        ]
+        axisLineBuffer = device.makeBuffer(bytes: axis,
+                                           length: axis.count * MemoryLayout<LineVertex>.stride,
+                                           options: .storageModeShared)
+        axisLineVertexCount = axis.count
+    }
+
     func encode(commandBuffer: MTLCommandBuffer, passDescriptor: MTLRenderPassDescriptor,
                 viewportSize: CGSize) {
         guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
             return
         }
+        let aspect = Float(viewportSize.width / max(1, viewportSize.height))
+        var u = Uniforms(mvp: camera.viewProjection(aspect: aspect,
+                                                    projection: projectionMode),
+                         lightDirection: lightDirection(),
+                         viewportParams: SIMD4<Float>(
+                            heightExaggeration,
+                            min(max(maskOpacity, 0), 1),
+                            Float(displayMode.rendererMode),
+                            Float(materialPreset.rendererPreset)),
+                         terrainParams: SIMD4<Float>(terrainBaseHeight, 0, 0, 0),
+                         gridParams: SIMD4<UInt32>(gridW, gridH, 0, 0))
         if let hb = heightBuffer, let db = dataBuffer, let ib = indexBuffer,
            indexCount > 0 {
-            let aspect = Float(viewportSize.width / max(1, viewportSize.height))
-            var u = Uniforms(mvp: camera.viewProjection(aspect: aspect),
-                             lightDirection: lightDirection(),
-                             viewportParams: SIMD4<Float>(
-                                heightExaggeration,
-                                min(max(maskOpacity, 0), 1),
-                                Float(displayMode.rendererMode),
-                                Float(materialPreset.rendererPreset)),
-                             gridParams: SIMD4<UInt32>(gridW, gridH, 0, 0))
             enc.setRenderPipelineState(pipeline)
             enc.setDepthStencilState(depthState)
             enc.setFrontFacing(.counterClockwise)
@@ -164,7 +247,24 @@ final class Renderer {
                                       indexType: .uint32, indexBuffer: ib,
                                       indexBufferOffset: 0)
         }
+        drawViewportGuides(encoder: enc, uniforms: &u)
         enc.endEncoding()
+    }
+
+    private func drawViewportGuides(encoder enc: MTLRenderCommandEncoder,
+                                    uniforms: inout Uniforms) {
+        guard gridVisible || axisVisible else { return }
+        enc.setRenderPipelineState(linePipeline)
+        enc.setDepthStencilState(lineDepthState)
+        enc.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        if gridVisible, let gridLineBuffer, gridLineVertexCount > 0 {
+            enc.setVertexBuffer(gridLineBuffer, offset: 0, index: 0)
+            enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: gridLineVertexCount)
+        }
+        if axisVisible, let axisLineBuffer, axisLineVertexCount > 0 {
+            enc.setVertexBuffer(axisLineBuffer, offset: 0, index: 0)
+            enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: axisLineVertexCount)
+        }
     }
 
     func applyViewportSettings(lightAzimuthDegrees: Double,
@@ -172,17 +272,67 @@ final class Renderer {
                                wireframeEnabled: Bool,
                                displayMode: ViewportDisplayMode,
                                materialPreset: MaterialPreset,
-                               maskOpacity: Double) {
+                               maskOpacity: Double,
+                               gridVisible: Bool,
+                               axisVisible: Bool,
+                               projectionMode: ViewportProjection) {
         self.lightAzimuthDegrees = Float(lightAzimuthDegrees)
         self.lightElevationDegrees = Float(lightElevationDegrees)
         self.wireframeEnabled = wireframeEnabled
         self.displayMode = displayMode == .auto ? .terrain : displayMode
         self.materialPreset = materialPreset
         self.maskOpacity = Float(maskOpacity)
+        self.gridVisible = gridVisible
+        self.axisVisible = axisVisible
+        self.projectionMode = projectionMode
     }
 
     func resetCamera() {
         camera.reset(heightExaggeration: heightExaggeration)
+    }
+
+    func setCameraPreset(_ preset: CameraPreset) {
+        camera.applyPreset(preset, heightExaggeration: heightExaggeration)
+    }
+
+    func orbitCamera(delta: CGSize) {
+        camera.azimuth -= Float(delta.width) * 0.01
+        let el = camera.elevation - Float(delta.height) * 0.01
+        camera.elevation = max(0.05, min(.pi / 2 - 0.02, el))
+    }
+
+    func panCamera(delta: CGSize, viewportSize: CGSize) {
+        camera.pan(deltaX: Float(delta.width),
+                   deltaY: Float(delta.height),
+                   viewportHeight: Float(max(1, viewportSize.height)))
+    }
+
+    func zoomCamera(deltaY: CGFloat) {
+        camera.zoom(deltaY: Float(deltaY))
+    }
+
+    func terrainUV(at point: CGPoint, in viewSize: CGSize) -> CGPoint? {
+        guard viewSize.width > 1, viewSize.height > 1 else { return nil }
+        let aspect = Float(viewSize.width / max(1, viewSize.height))
+        let ndcX = Float((point.x / viewSize.width) * 2.0 - 1.0)
+        let ndcY = Float((point.y / viewSize.height) * 2.0 - 1.0)
+        let inv = camera.viewProjection(aspect: aspect,
+                                        projection: projectionMode).inverse
+        var near = inv * SIMD4<Float>(ndcX, ndcY, 0, 1)
+        var far = inv * SIMD4<Float>(ndcX, ndcY, 1, 1)
+        guard abs(near.w) > 1e-6, abs(far.w) > 1e-6 else { return nil }
+        near /= near.w
+        far /= far.w
+        let origin = SIMD3<Float>(near.x, near.y, near.z)
+        let end = SIMD3<Float>(far.x, far.y, far.z)
+        let dir = normalize(end - origin)
+        guard abs(dir.y) > 1e-5 else { return nil }
+        let t = (0.0 - origin.y) / dir.y
+        guard t.isFinite, t > 0 else { return nil }
+        let hit = origin + dir * t
+        guard hit.x >= -1, hit.x <= 1, hit.z >= -1, hit.z <= 1 else { return nil }
+        return CGPoint(x: CGFloat((hit.x + 1) * 0.5),
+                       y: CGFloat((hit.z + 1) * 0.5))
     }
 
     private func lightDirection() -> SIMD4<Float> {

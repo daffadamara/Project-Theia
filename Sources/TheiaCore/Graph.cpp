@@ -22,14 +22,14 @@ bool nearlyEqual(double a, double b) {
 void migrateLegacySlopeMaskDefaults(Node& n) {
     if (n.type() != "slopemask") return;
     const double low = n.params.get("low", 15.0);
-    const double high = n.params.get("high", 55.0);
-    const double heightScale = n.params.get("heightScale", 1.0);
+    const double high = n.params.get("high", 50.0);
+    const double heightScale = n.params.get("heightScale", 100.0);
     if ((low >= -1.0 && low <= 1.0 && high >= -1.0 && high <= 1.0) ||
         high <= low ||
         nearlyEqual(heightScale, 64.0)) {
         n.params.set("low", 15.0);
-        n.params.set("high", 55.0);
-        n.params.set("heightScale", 1.0);
+        n.params.set("high", 50.0);
+        n.params.set("heightScale", 100.0);
     }
 }
 
