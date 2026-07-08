@@ -110,6 +110,23 @@ final class AutosaveController: NSObject {
     _ = model.save(to: url.path)
 }
 
+@MainActor func firstResponderIsTextInput(in window: NSWindow?) -> Bool {
+    guard let responder = window?.firstResponder else { return false }
+    if responder is NSTextView || responder is NSTextField {
+        return true
+    }
+    if let view = responder as? NSView {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate is NSTextField || candidate is NSSearchField {
+                return true
+            }
+            current = candidate.superview
+        }
+    }
+    return false
+}
+
 let args = parseArgs()
 let viewSize: UInt32 = args.size != 0 ? args.size : 512
 
@@ -188,6 +205,9 @@ let shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { eve
     if event.modifierFlags.contains(.command), chars == "s" {
         saveModelWithPanel(model)
         return nil
+    }
+    if firstResponderIsTextInput(in: event.window) {
+        return event
     }
     if event.modifierFlags.contains(.command), chars == "z" {
         if event.modifierFlags.contains(.shift) {

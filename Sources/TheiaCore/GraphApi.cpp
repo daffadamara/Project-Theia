@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 
 #include "GPUContext.hpp"
@@ -11,6 +15,9 @@
 #include "Node.hpp"
 #include "io/ExportWriter.hpp"
 #include "io/ImageWriter.hpp"
+#include "json.hpp"
+
+using json = nlohmann::json;
 
 namespace theia {
 
@@ -22,6 +29,323 @@ std::size_t copyOutStr(const std::string& s, char* out, std::size_t cap) {
         out[n] = '\0';
     }
     return s.size();
+}
+
+struct DiagnosticIssue {
+    std::string severity;
+    std::string code;
+    std::string message;
+    std::string node;
+    std::string edge;
+    std::uint32_t input = std::numeric_limits<std::uint32_t>::max();
+};
+
+void addIssue(std::vector<DiagnosticIssue>& issues,
+              std::string severity,
+              std::string code,
+              std::string message,
+              std::string node = {},
+              std::uint32_t input = std::numeric_limits<std::uint32_t>::max(),
+              std::string edge = {}) {
+    issues.push_back(DiagnosticIssue{std::move(severity), std::move(code),
+                                     std::move(message), std::move(node),
+                                     std::move(edge), input});
+}
+
+bool readJsonString(const json& obj, const char* key, std::string& out) {
+    if (!obj.contains(key) || !obj[key].is_string()) return false;
+    out = obj[key].get<std::string>();
+    return true;
+}
+
+bool readJsonU32(const json& obj, const char* key, std::uint32_t& out) {
+    if (!obj.contains(key) || !obj[key].is_number_integer()) return false;
+    if (obj[key].is_number_unsigned()) {
+        const auto wide = obj[key].get<std::uint64_t>();
+        if (wide > std::numeric_limits<std::uint32_t>::max()) return false;
+        out = static_cast<std::uint32_t>(wide);
+        return true;
+    }
+    const auto signedValue = obj[key].get<std::int64_t>();
+    if (signedValue < 0 ||
+        static_cast<std::uint64_t>(signedValue) > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    out = static_cast<std::uint32_t>(signedValue);
+    return true;
+}
+
+bool isHeavySimulationNode(const std::string& type) {
+    return type == "dropleterosion" || type == "hydraulic";
+}
+
+double jsonParamValue(const json& params, const char* key, double fallback) {
+    if (!params.is_object() || !params.contains(key) || !params[key].is_number()) {
+        return fallback;
+    }
+    return params[key].get<double>();
+}
+
+std::string makeDiagnosticsJSON(const std::string& text) {
+    json result;
+    std::vector<DiagnosticIssue> issues;
+    std::map<std::string, std::string> nodeTypes;
+    std::map<std::string, std::uint32_t> inputCounts;
+    std::map<std::string, json> nodeParams;
+    std::map<std::string, std::map<std::uint32_t, std::string>> inbound;
+    std::map<std::string, std::vector<std::string>> outgoing;
+    std::string sink;
+
+    json j = json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded()) {
+        addIssue(issues, "error", "invalid_json", "Graph JSON could not be parsed");
+        result["ok"] = false;
+        result["summary"] = {
+            {"nodes", 0}, {"connections", 0}, {"errors", 1},
+            {"warnings", 0}, {"sink", ""}
+        };
+        result["issues"] = json::array();
+        for (const auto& issue : issues) {
+            result["issues"].push_back({
+                {"severity", issue.severity},
+                {"code", issue.code},
+                {"message", issue.message}
+            });
+        }
+        return result.dump(2);
+    }
+    if (!j.is_object()) {
+        addIssue(issues, "error", "invalid_shape", "Graph JSON must be an object");
+    }
+
+    if (j.is_object() && j.contains("sink")) {
+        if (j["sink"].is_string()) {
+            sink = j["sink"].get<std::string>();
+            if (sink.empty()) {
+                addIssue(issues, "warning", "empty_sink", "Graph has no active preview/output sink");
+            }
+        } else {
+            addIssue(issues, "error", "invalid_sink", "Graph sink must be a string");
+        }
+    } else {
+        addIssue(issues, "warning", "empty_sink", "Graph has no active preview/output sink");
+    }
+
+    if (!j.is_object() || !j.contains("nodes")) {
+        addIssue(issues, "warning", "empty_graph", "Graph contains no nodes");
+    } else if (!j["nodes"].is_array()) {
+        addIssue(issues, "error", "invalid_nodes", "Graph nodes must be an array");
+    } else {
+        if (j["nodes"].empty()) {
+            addIssue(issues, "warning", "empty_graph", "Graph contains no nodes");
+        }
+        for (const auto& nodeJson : j["nodes"]) {
+            if (!nodeJson.is_object()) {
+                addIssue(issues, "error", "invalid_node", "Node entries must be objects");
+                continue;
+            }
+            std::string id;
+            std::string type;
+            if (!readJsonString(nodeJson, "id", id) || id.empty()) {
+                addIssue(issues, "error", "invalid_node_id", "Node id must be a non-empty string");
+                continue;
+            }
+            if (!readJsonString(nodeJson, "type", type) || type.empty()) {
+                addIssue(issues, "error", "invalid_node_type",
+                         "Node '" + id + "' type must be a non-empty string", id);
+                continue;
+            }
+            if (nodeTypes.count(id)) {
+                addIssue(issues, "error", "duplicate_node",
+                         "Duplicate node id '" + id + "'", id);
+                continue;
+            }
+            auto defaults = createNode(type, "__diagnostics__");
+            if (!defaults) {
+                addIssue(issues, "error", "unknown_node_type",
+                         "Node '" + id + "' has unknown type '" + type + "'", id);
+                continue;
+            }
+            nodeTypes[id] = type;
+            inputCounts[id] = static_cast<std::uint32_t>(defaults->inputCount());
+            json params = json::object();
+            if (nodeJson.contains("params")) {
+                if (!nodeJson["params"].is_object()) {
+                    addIssue(issues, "error", "invalid_params",
+                             "Node '" + id + "' params must be an object", id);
+                } else {
+                    params = nodeJson["params"];
+                    for (auto it = params.begin(); it != params.end(); ++it) {
+                        if (!it.value().is_number()) {
+                            addIssue(issues, "error", "invalid_param_value",
+                                     "Node '" + id + "' param '" + it.key() +
+                                         "' must be numeric",
+                                     id);
+                        }
+                    }
+                }
+            }
+            nodeParams[id] = params;
+        }
+    }
+
+    int connectionCount = 0;
+    if (j.is_object() && j.contains("connections")) {
+        if (!j["connections"].is_array()) {
+            addIssue(issues, "error", "invalid_connections", "Graph connections must be an array");
+        } else {
+            for (const auto& connJson : j["connections"]) {
+                if (!connJson.is_object()) {
+                    addIssue(issues, "error", "invalid_connection",
+                             "Connection entries must be objects");
+                    continue;
+                }
+                std::string from;
+                std::string to;
+                std::uint32_t input = 0;
+                const bool okFrom = readJsonString(connJson, "from", from) && !from.empty();
+                const bool okTo = readJsonString(connJson, "to", to) && !to.empty();
+                const bool okInput = readJsonU32(connJson, "input", input);
+                const std::string edge = from + "->" + to + "." + std::to_string(input);
+                if (!okFrom || !okTo || !okInput) {
+                    addIssue(issues, "error", "invalid_connection",
+                             "Connection requires string from/to and non-negative integer input",
+                             to, input, edge);
+                    continue;
+                }
+                ++connectionCount;
+                if (!nodeTypes.count(from)) {
+                    addIssue(issues, "error", "missing_source",
+                             "Connection references missing source node '" + from + "'",
+                             to, input, edge);
+                }
+                if (!nodeTypes.count(to)) {
+                    addIssue(issues, "error", "missing_target",
+                             "Connection references missing target node '" + to + "'",
+                             to, input, edge);
+                    continue;
+                }
+                if (input >= inputCounts[to]) {
+                    addIssue(issues, "error", "invalid_input_port",
+                             "Connection targets unavailable input port " +
+                                 std::to_string(input) + " on node '" + to + "'",
+                             to, input, edge);
+                    continue;
+                }
+                if (inbound[to].count(input)) {
+                    addIssue(issues, "warning", "duplicate_input_connection",
+                             "Multiple connections target node '" + to + "' input " +
+                                 std::to_string(input) + "; last connection wins",
+                             to, input, edge);
+                }
+                inbound[to][input] = from;
+                outgoing[from].push_back(to);
+            }
+        }
+    }
+
+    std::set<std::string> reachable;
+    std::map<std::string, int> color;
+    if (!sink.empty()) {
+        if (!nodeTypes.count(sink)) {
+            addIssue(issues, "error", "missing_sink",
+                     "Sink node '" + sink + "' does not exist", sink);
+        } else {
+            std::function<void(const std::string&)> dfs = [&](const std::string& id) {
+                color[id] = 1;
+                reachable.insert(id);
+                for (const auto& kv : inbound[id]) {
+                    const std::string& src = kv.second;
+                    if (!nodeTypes.count(src)) continue;
+                    if (color[src] == 1) {
+                        addIssue(issues, "error", "cycle",
+                                 "Cycle detected while tracing sink dependencies at node '" +
+                                     src + "'",
+                                 src);
+                        continue;
+                    }
+                    if (color[src] == 0) dfs(src);
+                }
+                color[id] = 2;
+            };
+            dfs(sink);
+        }
+    }
+
+    for (const auto& kv : nodeTypes) {
+        const std::string& id = kv.first;
+        const std::string& type = kv.second;
+        const bool sinkReachable = !sink.empty() && reachable.count(id) > 0;
+        for (std::uint32_t input = 0; input < inputCounts[id]; ++input) {
+            if (!inbound[id].count(input)) {
+                addIssue(issues, sinkReachable ? "error" : "warning", "missing_input",
+                         "Node '" + id + "' input " + std::to_string(input) +
+                             " is not connected",
+                         id, input);
+            }
+        }
+        if (!sink.empty() && !sinkReachable) {
+            addIssue(issues, "warning", "orphan_node",
+                     "Node '" + id + "' is not upstream of the active sink", id);
+        }
+        if (type == "export" && !outgoing[id].empty()) {
+            addIssue(issues, "warning", "export_not_terminal",
+                     "Export node '" + id + "' is connected downstream; export nodes should be graph terminals",
+                     id);
+        }
+        if (isHeavySimulationNode(type)) {
+            const json params = nodeParams[id];
+            if (type == "dropleterosion") {
+                const double particles = jsonParamValue(params, "particles", 8000.0);
+                const double maxAge = jsonParamValue(params, "maxAge", 80.0);
+                if (particles >= 20000.0 || maxAge >= 220.0) {
+                    addIssue(issues, "warning", "heavy_simulation",
+                             "Droplet erosion node '" + id +
+                                 "' may slow live preview with current particles/maxAge",
+                             id);
+                }
+            } else if (type == "hydraulic") {
+                const double iterations = jsonParamValue(params, "iterations", 80.0);
+                if (iterations >= 180.0) {
+                    addIssue(issues, "warning", "heavy_simulation",
+                             "Hydraulic node '" + id +
+                                 "' may slow live preview with current iteration count",
+                             id);
+                }
+            }
+        }
+    }
+
+    int errors = 0;
+    int warnings = 0;
+    for (const auto& issue : issues) {
+        if (issue.severity == "error") ++errors;
+        if (issue.severity == "warning") ++warnings;
+    }
+
+    result["ok"] = errors == 0;
+    result["summary"] = {
+        {"nodes", nodeTypes.size()},
+        {"connections", connectionCount},
+        {"errors", errors},
+        {"warnings", warnings},
+        {"sink", sink}
+    };
+    result["issues"] = json::array();
+    for (const auto& issue : issues) {
+        json item = {
+            {"severity", issue.severity},
+            {"code", issue.code},
+            {"message", issue.message}
+        };
+        if (!issue.node.empty()) item["node"] = issue.node;
+        if (!issue.edge.empty()) item["edge"] = issue.edge;
+        if (issue.input != std::numeric_limits<std::uint32_t>::max()) {
+            item["input"] = issue.input;
+        }
+        result["issues"].push_back(std::move(item));
+    }
+    return result.dump(2);
 }
 } // namespace
 
@@ -86,6 +410,12 @@ bool graph_save_json_file(GraphHandle* g, const char* path) {
     }
     f << g->graph.toJSON();
     return static_cast<bool>(f);
+}
+
+std::size_t graph_diagnostics_json_text(const char* text,
+                                        char* out, std::size_t cap) {
+    const std::string diagnostics = makeDiagnosticsJSON(text ? text : "");
+    return copyOutStr(diagnostics, out, cap);
 }
 
 GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,

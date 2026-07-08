@@ -295,13 +295,7 @@ struct GraphDocument: Codable {
 
     mutating func addNode(type: String, after previousId: String? = nil,
                           at position: GraphNodePosition? = nil) -> String {
-        let base = type
-        var id = base
-        var suffix = 1
-        while nodes.contains(where: { $0.id == id }) {
-            id = "\(base)\(suffix)"
-            suffix += 1
-        }
+        let id = uniqueNodeId(base: type)
         nodes.append(GraphDocumentNode(id: id, type: type, params: Self.defaultParams(for: type)))
         if ui == nil { ui = GraphDocumentUI() }
         if let position {
@@ -318,6 +312,33 @@ struct GraphDocument: Codable {
             sink = id
         }
         return id
+    }
+
+    mutating func duplicateNodes(ids: Set<String>) -> [String] {
+        let originals = nodes.filter { ids.contains($0.id) }
+        guard !originals.isEmpty else { return [] }
+        if ui == nil { ui = GraphDocumentUI() }
+        var idMap: [String: String] = [:]
+        var duplicatedIds: [String] = []
+        for original in originals {
+            let newId = uniqueNodeId(base: "\(original.id)Copy")
+            idMap[original.id] = newId
+            duplicatedIds.append(newId)
+            nodes.append(GraphDocumentNode(id: newId,
+                                           type: original.type,
+                                           params: original.params))
+            let p = ui?.positions[original.id] ?? GraphNodePosition(x: 120, y: 120)
+            ui?.positions[newId] = GraphNodePosition(x: p.x + 36, y: p.y + 36)
+        }
+        for edge in connections where ids.contains(edge.from) && ids.contains(edge.to) {
+            guard let from = idMap[edge.from], let to = idMap[edge.to] else { continue }
+            connections.append(GraphDocumentConnection(from: from, to: to, input: edge.input))
+        }
+        if let oldSink = ids.contains(sink) ? sink : originals.last?.id,
+           let newSink = idMap[oldSink] {
+            sink = newSink
+        }
+        return duplicatedIds
     }
 
     mutating func deleteNode(id: String) {
@@ -411,5 +432,15 @@ struct GraphDocument: Codable {
             result[name] = theia.graph_default_param_value(type, name, 0)
         }
         return result
+    }
+
+    private func uniqueNodeId(base: String) -> String {
+        var id = base
+        var suffix = 1
+        while nodes.contains(where: { $0.id == id }) {
+            id = "\(base)\(suffix)"
+            suffix += 1
+        }
+        return id
     }
 }

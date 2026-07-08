@@ -99,6 +99,12 @@ bool graph_load_json_file(GraphHandle* g, const char* path);
 bool graph_load_json_text(GraphHandle* g, const char* text);
 bool graph_save_json_file(GraphHandle* g, const char* path);
 
+// Analyze graph JSON without mutating an existing graph. Returns a diagnostic
+// JSON document with { ok, summary, issues }. This is intended for CLI/viewer
+// authoring feedback, not as a replacement for graph_load_json_text validation.
+std::size_t graph_diagnostics_json_text(const char* text,
+                                        char* out, std::size_t cap);
+
 struct GraphEvalResult {
     bool ok = false;
     std::uint32_t width = 0;

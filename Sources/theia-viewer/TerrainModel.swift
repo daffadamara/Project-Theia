@@ -18,15 +18,51 @@ struct GraphNodeInfo: Identifiable {
 }
 
 struct ExportSettings: Sendable {
+    enum HeightmapFormat: String, CaseIterable, Identifiable, Sendable {
+        case png16
+        case r16
+        case pfm32
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .png16: return "PNG 16-bit"
+            case .r16: return "RAW R16"
+            case .pfm32: return "PFM 32-bit Float"
+            }
+        }
+    }
+
+    enum MeshFormat: String, CaseIterable, Identifiable, Sendable {
+        case obj
+        case fbx
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .obj: return "OBJ"
+            case .fbx: return "FBX"
+            }
+        }
+
+        var isSupported: Bool { self == .obj }
+    }
+
     var outDir = "/private/tmp/theia-export"
     var basename = "terrain"
     var size: UInt32 = 512
     var verticalScale: Double = 1.0
     var meshStride: UInt32 = 1
+    var exportHeightmap = true
+    var heightmapFormat: HeightmapFormat = .png16
+    var exportMesh = true
+    var meshFormat: MeshFormat = .obj
     var exportHeight = true
-    var exportPFM = true
-    var exportNormal = true
-    var exportSlope = true
+    var exportPFM = false
+    var exportNormal = false
+    var exportSlope = false
     var exportMask = false
     var exportOBJ = true
 }
@@ -66,6 +102,8 @@ final class TerrainModel: ObservableObject {
     @Published var exportSettings = ExportSettings()
     @Published private(set) var exportStatus = ""
     @Published private(set) var isExporting = false
+    @Published private(set) var diagnostics = GraphDiagnostics.empty
+    @Published private(set) var recentNodeTypes: [String] = []
 
     let engine: TerrainEngine
     let renderer: Renderer
@@ -238,10 +276,12 @@ final class TerrainModel: ObservableObject {
             exportStatus = "vertical scale must be > 0"
             return
         }
-        guard exportSettings.exportHeight || exportSettings.exportPFM ||
-            exportSettings.exportNormal || exportSettings.exportSlope ||
-            exportSettings.exportMask || exportSettings.exportOBJ else {
+        guard exportSettings.exportHeightmap || exportSettings.exportMesh else {
             exportStatus = "enable at least one output"
+            return
+        }
+        guard !exportSettings.exportMesh || exportSettings.meshFormat.isSupported else {
+            exportStatus = "FBX export is not available yet"
             return
         }
 
@@ -275,6 +315,11 @@ final class TerrainModel: ObservableObject {
             }
             return GraphNodeInfo(id: node.id, type: node.type, params: params)
         }
+        refreshDiagnostics()
+    }
+
+    func refreshDiagnostics() {
+        diagnostics = GraphDiagnostics.analyze(document)
     }
 
     func apply(nodeId: String, param: String, value: Double) {
@@ -289,6 +334,24 @@ final class TerrainModel: ObservableObject {
         if param == "particles", value >= 20000 {
             lastStats += " - high particle count may preview slowly"
         }
+        reloadInspector()
+    }
+
+    func resetParam(nodeId: String, param: String) {
+        guard let node = document.node(id: nodeId),
+              let value = GraphDocument.defaultParams(for: node.type)[param] else { return }
+        apply(nodeId: nodeId, param: param, value: value)
+    }
+
+    func resetAllParams(nodeId: String) {
+        guard let node = document.node(id: nodeId) else { return }
+        pushUndo()
+        let defaults = GraphDocument.defaultParams(for: node.type)
+        for (key, value) in defaults {
+            document.setParam(nodeId: nodeId, key: key, value: value)
+            _ = theia.graph_set_param(engine.handle, nodeId, key, value)
+        }
+        syncPreviewWithDocument(markDirty: true)
         reloadInspector()
     }
 
@@ -484,6 +547,7 @@ final class TerrainModel: ObservableObject {
 
     func addNode(type: String, at position: GraphNodePosition? = nil) {
         pushUndo()
+        recordRecentNodeType(type)
         let previous = selectedNodeId ?? (document.sink.isEmpty ? nil : document.sink)
         let id = document.addNode(type: type, after: previous, at: position)
         if type == "rivercarve",
@@ -503,6 +567,14 @@ final class TerrainModel: ObservableObject {
         selectedConnectionId = nil
         syncPreviewWithDocument(markDirty: true)
         reloadInspector()
+    }
+
+    private func recordRecentNodeType(_ type: String) {
+        recentNodeTypes.removeAll { $0 == type }
+        recentNodeTypes.insert(type, at: 0)
+        if recentNodeTypes.count > 6 {
+            recentNodeTypes.removeLast(recentNodeTypes.count - 6)
+        }
     }
 
     func deleteSelection() {
@@ -526,6 +598,56 @@ final class TerrainModel: ObservableObject {
         document.sink = selectedNodeId ?? ""
         syncPreviewWithDocument(markDirty: true)
         reloadInspector()
+    }
+
+    func duplicateSelection() {
+        let ids = selectedNodeIds.isEmpty
+            ? (selectedNodeId.map { Set([$0]) } ?? [])
+            : selectedNodeIds
+        guard !ids.isEmpty else { return }
+        pushUndo()
+        let duplicated = document.duplicateNodes(ids: ids)
+        guard !duplicated.isEmpty else { return }
+        selectedNodeId = duplicated.last
+        selectedNodeIds = Set(duplicated)
+        selectedConnectionId = nil
+        document.sink = selectedNodeId ?? document.sink
+        syncPreviewWithDocument(markDirty: true)
+        reloadInspector()
+    }
+
+    func selectUpstreamOfSelection() {
+        guard let id = selectedNodeId,
+              let edge = document.connections
+                .filter({ $0.to == id })
+                .sorted(by: { $0.input < $1.input })
+                .first else { return }
+        selectNode(edge.from)
+    }
+
+    func selectDownstreamOfSelection() {
+        guard let id = selectedNodeId,
+              let edge = document.connections
+                .filter({ $0.from == id })
+                .sorted(by: { $0.to < $1.to })
+                .first else { return }
+        selectNode(edge.to)
+    }
+
+    func selectDiagnosticIssue(_ issue: GraphDiagnosticIssue) {
+        if let node = issue.node, document.node(id: node) != nil {
+            selectNode(node)
+        } else if let edgeId = issue.edge {
+            selectConnection(edgeId)
+        }
+    }
+
+    func diagnosticSeverity(for nodeId: String) -> String? {
+        diagnostics.issueSeverity(for: nodeId)
+    }
+
+    func missingDiagnosticInputs(for nodeId: String) -> Set<UInt32> {
+        diagnostics.missingInputs(for: nodeId)
     }
 
     private func fallbackSelectionAfterDeleting(ids: Set<String>) -> String? {
@@ -722,6 +844,7 @@ final class TerrainModel: ObservableObject {
     }
 
     private func syncPreviewWithDocument(markDirty shouldMarkDirty: Bool) {
+        refreshDiagnostics()
         do {
             let text = try document.encodedString()
             if document.sink.isEmpty {
@@ -1028,21 +1151,58 @@ final class TerrainModel: ObservableObject {
                 .path
         }
 
+        let writeHeightPNG = settings.exportHeightmap && settings.heightmapFormat == .png16
+        let writePFM = settings.exportHeightmap && settings.heightmapFormat == .pfm32
+        let writeRawR16 = settings.exportHeightmap && settings.heightmapFormat == .r16
+        let writeOBJ = settings.exportMesh && settings.meshFormat == .obj
+
         let r = theia.graph_export(
             g, sink, settings.size, settings.size,
-            path("_height.png", enabled: settings.exportHeight),
-            path(".pfm", enabled: settings.exportPFM),
-            path("_normal.png", enabled: settings.exportNormal),
-            path("_slope.png", enabled: settings.exportSlope),
-            path("_mask.png", enabled: settings.exportMask),
-            path(".obj", enabled: settings.exportOBJ),
+            path("_height.png", enabled: writeHeightPNG),
+            path(".pfm", enabled: writePFM),
+            "",
+            "",
+            "",
+            path(".obj", enabled: writeOBJ),
             Float(settings.verticalScale),
             settings.meshStride)
         guard r.ok else {
             let err = readCxxString { theia.graph_last_error(g, $0, $1) }
             return "export failed: \(err)"
         }
+        if writeRawR16 {
+            let count = Int(r.width) * Int(r.height)
+            guard count > 0 else { return "export failed: empty heightfield" }
+            var heights = [Float](repeating: 0, count: count)
+            let rawEval = heights.withUnsafeMutableBufferPointer {
+                theia.graph_evaluate_heights(g, sink, r.width, r.height,
+                                             $0.baseAddress, $0.count)
+            }
+            guard rawEval.ok else {
+                let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+                return "export failed: \(err)"
+            }
+            let rawPath = path("_height.r16", enabled: true)
+            do {
+                try writeR16Heightmap(heights, path: rawPath)
+            } catch {
+                return "export failed: \(error.localizedDescription)"
+            }
+        }
         return "exported \(settings.basename) \(r.width)x\(r.height)"
+    }
+
+    private nonisolated static func writeR16Heightmap(_ heights: [Float],
+                                                      path: String) throws {
+        var data = Data()
+        data.reserveCapacity(heights.count * MemoryLayout<UInt16>.size)
+        for height in heights {
+            let normalized = min(1.0, max(0.0, height.isFinite ? height : 0.0))
+            var sample = UInt16((normalized * Float(UInt16.max)).rounded())
+                .littleEndian
+            withUnsafeBytes(of: &sample) { data.append(contentsOf: $0) }
+        }
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 
     private func markDirty() {

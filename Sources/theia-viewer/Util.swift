@@ -8,3 +8,16 @@ func readCxxString(_ accessor: (UnsafeMutablePointer<CChar>?, Int) -> Int) -> St
     let len = min(max(n, 0), buf.count - 1)
     return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
 }
+
+func readCxxLongString(_ accessor: (UnsafeMutablePointer<CChar>?, Int) -> Int) -> String {
+    var cap = 4096
+    while true {
+        var buf = [CChar](repeating: 0, count: cap)
+        let n = buf.withUnsafeMutableBufferPointer { accessor($0.baseAddress, $0.count) }
+        if n < cap {
+            let len = max(n, 0)
+            return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+        cap = max(cap * 2, n + 1)
+    }
+}

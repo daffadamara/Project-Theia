@@ -26,19 +26,132 @@ struct ContentView: View {
                         .frame(minWidth: 560, minHeight: 360, idealHeight: 720)
                         .layoutPriority(3)
 
-                    NodeEditorCanvas(model: model, viewport: viewport)
-                        .frame(minWidth: 560, minHeight: 220, idealHeight: 260)
+                    AuthoringDock(model: model, viewport: viewport)
+                        .frame(minWidth: 560, minHeight: 320, idealHeight: 380)
                         .layoutPriority(1)
                 }
                 .frame(minWidth: 560, minHeight: 680)
 
                 InspectorPanel(model: model, viewport: viewport)
-                    .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
+                    .frame(minWidth: 340, idealWidth: 400, maxWidth: 460)
             }
 
             StatusBadge(model: model)
                 .padding(.trailing, 14)
                 .padding(.bottom, 12)
+        }
+    }
+}
+
+private enum AuthoringDockTab: String, CaseIterable {
+    case graph
+    case output
+
+    var title: String {
+        switch self {
+        case .graph: return "Graph"
+        case .output: return "Output"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .graph: return "rectangle.connected.to.line.below"
+        case .output: return "text.bubble"
+        }
+    }
+}
+
+struct AuthoringDock: View {
+    @ObservedObject var model: TerrainModel
+    let viewport: TerrainMTKView
+    @State private var selectedTab: AuthoringDockTab = .graph
+    private let uiSpring = Animation.spring(response: 0.24, dampingFraction: 0.86)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                switch selectedTab {
+                case .graph:
+                    NodeEditorCanvas(model: model, viewport: viewport)
+                        .transition(.opacity.combined(with: .scale(scale: 0.995, anchor: .bottom)))
+                case .output:
+                    GraphOutputPanel(model: model, viewport: viewport)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+            .animation(uiSpring, value: selectedTab)
+
+            dockTabBar
+        }
+        .background(Color(nsColor: .underPageBackgroundColor))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+        }
+    }
+
+    private var dockTabBar: some View {
+        HStack(spacing: 6) {
+            ForEach(AuthoringDockTab.allCases, id: \.self) { tab in
+                Button {
+                    withAnimation(uiSpring) {
+                        selectedTab = tab
+                    }
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: tab.systemImage)
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(tab.title)
+                            .font(.system(size: 12, weight: .semibold))
+                        if tab == .output {
+                            outputBadge
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 30)
+                    .foregroundStyle(selectedTab == tab ? .primary : .secondary)
+                    .background(selectedTab == tab
+                                ? Color.white.opacity(0.10)
+                                : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .contentShape(Rectangle())
+                    .scaleEffect(selectedTab == tab ? 1.0 : 0.98)
+                    .animation(.easeOut(duration: 0.14), value: selectedTab)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 38)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+        }
+    }
+
+    @ViewBuilder
+    private var outputBadge: some View {
+        let errors = model.diagnostics.authoringErrorCount
+        let warnings = model.diagnostics.authoringWarningCount
+        if errors > 0 || warnings > 0 {
+            Text("\(errors + warnings)")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(errors > 0 ? .red : .orange)
+                .padding(.horizontal, 5)
+                .frame(height: 16)
+                .background((errors > 0 ? Color.red : Color.orange).opacity(0.14),
+                            in: Capsule(style: .continuous))
+                .transition(.scale.combined(with: .opacity))
+                .animation(.spring(response: 0.22, dampingFraction: 0.78),
+                           value: errors + warnings)
         }
     }
 }
@@ -469,41 +582,74 @@ struct AxisGizmo: View {
 
 struct StatusBadge: View {
     @ObservedObject var model: TerrainModel
+    @State private var expanded = false
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { timeline in
-            VStack(alignment: .trailing, spacing: 4) {
-                Label(model.isDirty ? "unsaved" : "saved",
-                      systemImage: model.isDirty
-                        ? "exclamationmark.circle.fill"
-                        : "checkmark.circle.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(model.isDirty ? .red : .green)
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    expanded.toggle()
+                }
+            } label: {
+                Group {
+                    if expanded {
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text(model.isDirty ? "Unsaved" : "Saved")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(model.isDirty ? .orange : .green)
 
-                Text(savedTimestamp(relativeTo: timeline.date))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                            Text(model.isDirty
+                                 ? "Last saved \(savedTimestamp(relativeTo: timeline.date))"
+                                 : savedTimestamp(relativeTo: timeline.date))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .bottomTrailing)))
+                    } else {
+                        Image(systemName: model.isDirty ? "clock.fill" : "checkmark.circle.fill")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(model.isDirty ? .orange : .green)
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                            .transition(.opacity.combined(with: .scale(scale: 0.86)))
+                    }
+                }
+                .padding(.horizontal, expanded ? 10 : 4)
+                .padding(.vertical, expanded ? 8 : 4)
+                .background(Color.black.opacity(0.58),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(Color.black.opacity(0.48),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .allowsHitTesting(false)
+            .buttonStyle(.plain)
+            .help(model.isDirty ? "Unsaved changes" : "Saved")
+            .animation(.spring(response: 0.22, dampingFraction: 0.82),
+                       value: expanded)
+            .animation(.easeOut(duration: 0.18), value: model.isDirty)
         }
     }
 
     private func savedTimestamp(relativeTo now: Date) -> String {
         guard let savedAt = model.lastSavedAt else { return "Not saved yet" }
+        let calendar = Calendar.current
         let seconds = max(0, Int(now.timeIntervalSince(savedAt)))
         if seconds < 60 { return "Just now" }
         let minutes = seconds / 60
-        if minutes <= 15 {
+        if calendar.isDateInToday(savedAt), minutes <= 15 {
             return "\(minutes) minute\(minutes == 1 ? "" : "s") ago"
         }
-        if seconds < 24 * 60 * 60 {
-            return savedAt.formatted(.dateTime.hour().minute())
+        let time = savedAt.formatted(.dateTime.hour().minute())
+        if calendar.isDateInToday(savedAt) {
+            return "Today at \(time)"
         }
-        return savedAt.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+        if calendar.isDateInYesterday(savedAt) {
+            return "Yesterday at \(time)"
+        }
+        if let weekAgo = calendar.date(byAdding: .day, value: -6, to: now),
+           savedAt >= weekAgo {
+            let weekday = savedAt.formatted(.dateTime.weekday(.wide))
+            return "\(weekday) at \(time)"
+        }
+        let day = savedAt.formatted(.dateTime.month(.abbreviated).day())
+        return "\(day) at \(time)"
     }
 }
 
@@ -666,91 +812,228 @@ struct ExportControls: View {
     @ObservedObject var model: TerrainModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Export")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Button {
-                    model.runExport()
-                } label: {
-                    Label(model.isExporting ? "Exporting" : "Export",
-                          systemImage: "square.and.arrow.up")
-                }
-                .buttonStyle(.borderless)
-                .disabled(model.isExporting)
-            }
-
-            HStack {
-                Text("folder")
-                    .font(.caption)
-                Spacer()
-                Button {
-                    chooseFolder()
-                } label: {
-                    Label("Choose", systemImage: "folder")
-                }
-                .buttonStyle(.borderless)
-            }
-            Text(model.exportSettings.outDir)
-                .font(.caption2.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            TextField("basename", text: Binding(
-                get: { model.exportSettings.basename },
-                set: { model.exportSettings.basename = $0 }))
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-
-            SettingSlider(title: "size",
-                          value: Binding(
-                            get: { Double(model.exportSettings.size) },
-                            set: { model.exportSettings.size = UInt32(max(2, $0.rounded())) }),
-                          range: 64...4096,
-                          step: 64,
-                          precision: 0)
-
-            SettingSlider(title: "vertical scale",
-                          value: Binding(
-                            get: { model.exportSettings.verticalScale },
-                            set: { model.exportSettings.verticalScale = max(0.001, $0) }),
-                          range: 0.05...8,
-                          step: 0.05,
-                          precision: 2)
-
-            SettingSlider(title: "mesh stride",
-                          value: Binding(
-                            get: { Double(model.exportSettings.meshStride) },
-                            set: { model.exportSettings.meshStride = UInt32(max(1, $0.rounded())) }),
-                          range: 1...16,
-                          step: 1,
-                          precision: 0)
-
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())],
-                      alignment: .leading, spacing: 6) {
-                exportToggle("height", \.exportHeight)
-                exportToggle("pfm", \.exportPFM)
-                exportToggle("normal", \.exportNormal)
-                exportToggle("slope", \.exportSlope)
-                exportToggle("mask", \.exportMask)
-                exportToggle("obj", \.exportOBJ)
-            }
+        VStack(alignment: .leading, spacing: 12) {
+            exportHeader
+            destinationSection
+            resolutionSection
+            outputsSection
 
             if !model.exportStatus.isEmpty {
-                Text(model.exportStatus)
-                    .font(.caption)
+                Label(model.exportStatus,
+                      systemImage: model.exportStatus.hasPrefix("export failed") ? "xmark.circle.fill" : "info.circle.fill")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(model.exportStatus.hasPrefix("export failed") ? .red : .secondary)
+                    .lineLimit(2)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
+            exportActionBar
+        }
+        .animation(.easeOut(duration: 0.14), value: model.exportStatus)
+    }
+
+    private var exportHeader: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text("Export")
+                .font(.title3.weight(.bold))
+
+            Spacer()
+
+            Menu {
+                Button("Reset Export Settings", action: resetSettings)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 16, weight: .bold))
+                    .frame(width: 30, height: 30)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.top, 2)
+    }
+
+    private var destinationSection: some View {
+        ExportInspectorCard {
+            VStack(alignment: .leading, spacing: 16) {
+                ExportSectionHeader("DESTINATION")
+
+                HStack(alignment: .center, spacing: 12) {
+                    ExportFieldLabel("Folder")
+
+                    Text(model.exportSettings.outDir)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button {
+                        chooseFolder()
+                    } label: {
+                        Text("Choose...")
+                            .font(.callout.weight(.semibold))
+                            .frame(width: 104, height: 34)
+                            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .background(inspectorControlFill,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(inspectorControlStroke())
+                }
+
+                HStack(alignment: .center, spacing: 12) {
+                    ExportFieldLabel("Preset / Name")
+
+                    HStack(spacing: 8) {
+                        TextField("terrain", text: Binding(
+                            get: { model.exportSettings.basename },
+                            set: { model.exportSettings.basename = $0 }))
+                            .textFieldStyle(.plain)
+                            .font(.callout.weight(.semibold))
+
+                        if !model.exportSettings.basename.isEmpty {
+                            Button {
+                                model.exportSettings.basename = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .background(inspectorControlFill,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(inspectorControlStroke())
+                }
             }
         }
     }
 
-    private func exportToggle(_ title: String,
-                              _ keyPath: WritableKeyPath<ExportSettings, Bool>) -> some View {
-        Toggle(title, isOn: Binding(
-            get: { model.exportSettings[keyPath: keyPath] },
-            set: { model.exportSettings[keyPath: keyPath] = $0 }))
-            .font(.caption)
+    private var resolutionSection: some View {
+        ExportInspectorCard {
+            VStack(alignment: .leading, spacing: 16) {
+                ExportSectionHeader("RESOLUTION & SCALE")
+
+                ExportMetricRow(icon: "square.grid.3x3.fill",
+                                title: "Size (Resolution)",
+                                value: Binding(
+                                    get: { Double(model.exportSettings.size) },
+                                    set: { model.exportSettings.size = UInt32(max(2, $0.rounded())) }),
+                                range: 64...4096,
+                                step: 64,
+                                precision: 0)
+
+                ExportMetricRow(icon: "mountain.2.fill",
+                                title: "Vertical Scale",
+                                value: Binding(
+                                    get: { model.exportSettings.verticalScale },
+                                    set: { model.exportSettings.verticalScale = max(0.001, $0) }),
+                                range: 0.05...8,
+                                step: 0.05,
+                                precision: 2)
+
+                ExportMetricRow(icon: "square.grid.3x3",
+                                title: "Mesh Stride",
+                                value: Binding(
+                                    get: { Double(model.exportSettings.meshStride) },
+                                    set: { model.exportSettings.meshStride = UInt32(max(1, $0.rounded())) }),
+                                range: 1...16,
+                                step: 1,
+                                precision: 0)
+            }
+        }
+    }
+
+    private var outputsSection: some View {
+        ExportInspectorCard {
+            VStack(alignment: .leading, spacing: 14) {
+                ExportSectionHeader("EXPORT OUTPUTS")
+
+                ExportFormatRow(icon: "mountain.2.fill",
+                                title: "Heightmap",
+                                enabled: Binding(
+                                    get: { model.exportSettings.exportHeightmap },
+                                    set: { model.exportSettings.exportHeightmap = $0 })) {
+                    Menu {
+                        ForEach(ExportSettings.HeightmapFormat.allCases) { format in
+                            Button(format.label) {
+                                model.exportSettings.heightmapFormat = format
+                            }
+                        }
+                    } label: {
+                        ExportFormatMenuLabel(model.exportSettings.heightmapFormat.label)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                }
+
+                ExportFormatRow(icon: "cube",
+                                title: "Mesh",
+                                enabled: Binding(
+                                    get: { model.exportSettings.exportMesh },
+                                    set: { model.exportSettings.exportMesh = $0 })) {
+                    Menu {
+                        ForEach(ExportSettings.MeshFormat.allCases) { format in
+                            Button(format.isSupported ? format.label : "\(format.label) (later)") {
+                                model.exportSettings.meshFormat = format
+                            }
+                            .disabled(!format.isSupported)
+                        }
+                    } label: {
+                        ExportFormatMenuLabel(model.exportSettings.meshFormat.label)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                }
+            }
+        }
+    }
+
+    private var exportActionBar: some View {
+        HStack(spacing: 10) {
+            Button(action: resetSettings) {
+                Label("Reset", systemImage: "arrow.counterclockwise")
+                    .font(.callout.weight(.semibold))
+                    .frame(minWidth: 84, minHeight: 34)
+            }
+            .buttonStyle(.plain)
+            .background(inspectorControlFill,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(inspectorControlStroke())
+
+            Spacer()
+
+            Button {
+                model.runExport()
+            } label: {
+                Label(model.isExporting ? "Exporting" : "Export",
+                      systemImage: "square.and.arrow.up")
+                    .font(.callout.weight(.semibold))
+                    .frame(minWidth: 92, minHeight: 34)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .background(Color.accentColor,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .disabled(model.isExporting)
+            .opacity(model.isExporting ? 0.65 : 1)
+        }
+        .padding(.top, 4)
+    }
+
+    private func resetSettings() {
+        let outDir = model.exportSettings.outDir
+        var defaults = ExportSettings()
+        defaults.outDir = outDir
+        model.exportSettings = defaults
     }
 
     private func chooseFolder() {
@@ -763,9 +1046,518 @@ struct ExportControls: View {
     }
 }
 
+private struct ExportInspectorCard<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                LinearGradient(colors: [
+                    Color.white.opacity(0.035),
+                    Color.white.opacity(0.015)
+                ], startPoint: .topLeading, endPoint: .bottomTrailing),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
+    }
+}
+
+private struct ExportSectionHeader: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.caption.weight(.heavy))
+            .tracking(1.6)
+            .foregroundStyle(.secondary)
+    }
+}
+
+private struct ExportFieldLabel: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.primary.opacity(0.9))
+            .frame(width: 112, alignment: .leading)
+    }
+}
+
+private struct ExportMetricRow: View {
+    let icon: String
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let precision: Int
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.primary.opacity(0.9))
+                .frame(width: 118, alignment: .leading)
+
+            ExportPlainSlider(value: $value, range: range, step: step)
+                .frame(maxWidth: .infinity)
+                .frame(height: 24)
+
+            InspectorValueBox(text: formattedValue)
+        }
+    }
+
+    private var formattedValue: String {
+        if precision == 0 {
+            return String(Int(round(value)))
+        }
+        return String(format: "%.\(precision)f", value)
+    }
+}
+
+private struct ExportPlainSlider: NSViewRepresentable {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    var isContinuous: Bool = true
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> NSSlider {
+        let slider = NSSlider(value: value,
+                              minValue: range.lowerBound,
+                              maxValue: range.upperBound,
+                              target: context.coordinator,
+                              action: #selector(Coordinator.changed(_:)))
+        slider.isContinuous = isContinuous
+        slider.numberOfTickMarks = 0
+        slider.allowsTickMarkValuesOnly = false
+        slider.controlSize = .small
+        return slider
+    }
+
+    func updateNSView(_ slider: NSSlider, context: Context) {
+        context.coordinator.parent = self
+        slider.minValue = range.lowerBound
+        slider.maxValue = range.upperBound
+        slider.doubleValue = value
+        slider.isContinuous = isContinuous
+        slider.numberOfTickMarks = 0
+        slider.allowsTickMarkValuesOnly = false
+    }
+
+    final class Coordinator: NSObject {
+        var parent: ExportPlainSlider
+
+        init(_ parent: ExportPlainSlider) {
+            self.parent = parent
+        }
+
+        @MainActor @objc func changed(_ sender: NSSlider) {
+            let raw = sender.doubleValue
+            let stepped: Double
+            if parent.step > 0 {
+                stepped = (raw / parent.step).rounded() * parent.step
+            } else {
+                stepped = raw
+            }
+            parent.value = min(parent.range.upperBound,
+                               max(parent.range.lowerBound, stepped))
+        }
+    }
+}
+
+private struct ExportFormatMenuLabel: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+
+            Spacer(minLength: 0)
+
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .frame(width: 154, height: 34)
+        .background(inspectorControlFill,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(inspectorControlStroke())
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct ExportFormatRow<Accessory: View>: View {
+    let icon: String
+    let title: String
+    @Binding var enabled: Bool
+    let accessory: Accessory
+
+    init(icon: String,
+         title: String,
+         enabled: Binding<Bool>,
+         @ViewBuilder accessory: () -> Accessory) {
+        self.icon = icon
+        self.title = title
+        _enabled = enabled
+        self.accessory = accessory()
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Toggle("", isOn: $enabled)
+                .labelsHidden()
+                .toggleStyle(.checkbox)
+
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 8)
+
+            accessory
+                .disabled(!enabled)
+                .opacity(enabled ? 1 : 0.45)
+                .frame(width: 154)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 44)
+        .background(Color.white.opacity(0.018),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1))
+    }
+}
+
+private struct NoNodeParametersCard: View {
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text("No parameters")
+                .font(.callout.weight(.semibold))
+            Text("This node has no editable parameters.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 26)
+        .background(inspectorControlFill,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(inspectorControlStroke())
+    }
+}
+
+private enum GraphOutputSeverity: String, CaseIterable {
+    case all
+    case error
+    case warning
+    case info
+
+    var label: String {
+        switch self {
+        case .all: return "All"
+        case .error: return "Errors"
+        case .warning: return "Warnings"
+        case .info: return "Info"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .all: return "line.3.horizontal.decrease.circle"
+        case .error: return "xmark.octagon.fill"
+        case .warning: return "exclamationmark.circle.fill"
+        case .info: return "info.circle.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .all: return .secondary
+        case .error: return .red
+        case .warning: return .orange
+        case .info: return .blue
+        }
+    }
+}
+
+private struct GraphOutputItem: Identifiable {
+    let severity: GraphOutputSeverity
+    let message: String
+    let detail: String?
+    let issue: GraphDiagnosticIssue?
+
+    var id: String {
+        if let issue { return issue.id }
+        return [severity.rawValue, message, detail ?? ""].joined(separator: "|")
+    }
+}
+
+struct GraphOutputPanel: View {
+    @ObservedObject var model: TerrainModel
+    let viewport: TerrainMTKView
+    @State private var filter: GraphOutputSeverity = .all
+    @State private var searchText = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            outputHeader
+
+            Divider()
+
+            if filteredItems.isEmpty {
+                emptyOutput
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(filteredItems) { item in
+                            Button {
+                                if let issue = item.issue {
+                                    model.selectDiagnosticIssue(issue)
+                                    viewport.setNeedsDisplay(viewport.bounds)
+                                }
+                            } label: {
+                                GraphOutputRow(item: item)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(item.issue == nil)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var outputHeader: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                ForEach(GraphOutputSeverity.allCases, id: \.self) { severity in
+                    Button {
+                        withAnimation(.easeOut(duration: 0.14)) {
+                            filter = severity
+                        }
+                    } label: {
+                        outputFilterSegment(severity)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                TextField("Filter messages", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                if !searchText.isEmpty {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            searchText = ""
+                        }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .padding(.horizontal, 9)
+            .frame(height: 30)
+            .background(Color.black.opacity(0.18),
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .animation(.easeOut(duration: 0.12), value: searchText.isEmpty)
+    }
+
+    private func outputFilterSegment(_ severity: GraphOutputSeverity) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: severity.systemImage)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(severity == .all ? .secondary : severity.color)
+                .frame(width: 14)
+            Text(severity.label)
+                .font(.system(size: 12, weight: .semibold))
+            if severity != .all {
+                Text("\(count(for: severity))")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 10, alignment: .leading)
+            }
+        }
+        .frame(minWidth: severity == .all ? 58 : 112, minHeight: 32)
+        .padding(.horizontal, 4)
+        .background(filter == severity
+                    ? Color.white.opacity(0.12)
+                    : Color.white.opacity(0.001),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .scaleEffect(filter == severity ? 1.0 : 0.98)
+        .animation(.easeOut(duration: 0.14), value: filter)
+    }
+
+    private var emptyOutput: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.green)
+            Text("No messages")
+                .font(.headline)
+            Text("Graph diagnostics will appear here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var outputItems: [GraphOutputItem] {
+        var items: [GraphOutputItem] = model.diagnostics.authoringIssues.map { issue in
+            GraphOutputItem(severity: issue.isError ? .error : .warning,
+                            message: issue.message,
+                            detail: issue.node ?? issue.edge ?? issue.code,
+                            issue: issue)
+        }
+
+        let authoringIds = Set(model.diagnostics.authoringIssues.map(\.id))
+        let advisory = model.diagnostics.issues.filter { !authoringIds.contains($0.id) }
+        items.append(contentsOf: advisory.map { issue in
+            GraphOutputItem(severity: .info,
+                            message: issue.message,
+                            detail: issue.node ?? issue.edge ?? issue.code,
+                            issue: issue)
+        })
+
+        if items.isEmpty {
+            items.append(GraphOutputItem(
+                severity: .info,
+                message: "Graph is healthy",
+                detail: "\(model.document.nodes.count) node\(model.document.nodes.count == 1 ? "" : "s"), \(model.document.connections.count) connection\(model.document.connections.count == 1 ? "" : "s")",
+                issue: nil))
+        }
+
+        return items
+    }
+
+    private var filteredItems: [GraphOutputItem] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return outputItems.filter { item in
+            let matchesFilter = filter == .all || item.severity == filter
+            guard matchesFilter else { return false }
+            guard !query.isEmpty else { return true }
+            return item.message.lowercased().contains(query) ||
+                (item.detail?.lowercased().contains(query) ?? false)
+        }
+    }
+
+    private func count(for severity: GraphOutputSeverity) -> Int {
+        outputItems.filter { $0.severity == severity }.count
+    }
+}
+
+private struct GraphOutputRow: View {
+    let item: GraphOutputItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(item.severity.color)
+                .frame(width: 16, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.message)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = item.detail {
+                    Text(detail)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.0001))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.06))
+                .frame(height: 1)
+                .padding(.leading, 36)
+        }
+    }
+
+    private var icon: String {
+        switch item.severity {
+        case .all:
+            return "circle.fill"
+        case .error:
+            return "xmark.octagon.fill"
+        case .warning:
+            return "exclamationmark.circle.fill"
+        case .info:
+            return "info.circle.fill"
+        }
+    }
+}
+
 struct NodeParameterInspector: View {
     @ObservedObject var model: TerrainModel
     let viewport: TerrainMTKView
+    @State private var advancedExpanded = false
 
     var visibleNodes: [GraphNodeInfo] {
         if let selected = model.selectedNodeId,
@@ -776,46 +1568,147 @@ struct NodeParameterInspector: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text(model.selectedNodeId == nil ? "Parameters" : "Selected Node")
-                    .font(.subheadline.weight(.semibold))
+                Text("Parameters")
+                    .font(.headline.weight(.semibold))
                 Spacer()
+                Image(systemName: "chevron.up")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
             }
 
             if visibleNodes.isEmpty {
                 Text(model.document.nodes.isEmpty ? "No nodes" : "No node selected")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .padding(.top, 2)
             }
 
             ForEach(visibleNodes) { node in
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(node.id)
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                        Text(node.type)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 14) {
+                    InspectorSectionHeader("SELECTED NODE")
+                    NodeIdentityRow(node: node) {
+                        model.resetAllParams(nodeId: node.id)
+                        viewport.setNeedsDisplay(viewport.bounds)
                     }
 
                     if node.params.isEmpty {
-                        Text("No parameters")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        NoNodeParametersCard()
+                    } else {
+                        Divider()
+                            .padding(.vertical, 2)
+                        InspectorSectionHeader("NODE SETTINGS")
                     }
 
-                    ForEach(node.params) { param in
-                        ParameterSlider(param: param) { value in
-                            model.apply(nodeId: param.nodeId,
-                                        param: param.name,
-                                        value: value)
-                            viewport.setNeedsDisplay(viewport.bounds)
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(basicParams(for: node)) { param in
+                            ParameterSlider(param: param) { value in
+                                model.apply(nodeId: param.nodeId,
+                                            param: param.name,
+                                            value: value)
+                                viewport.setNeedsDisplay(viewport.bounds)
+                            } onReset: {
+                                model.resetParam(nodeId: param.nodeId,
+                                                 param: param.name)
+                                viewport.setNeedsDisplay(viewport.bounds)
+                            }
                         }
+                    }
+
+                    let advanced = advancedParams(for: node)
+                    if !advanced.isEmpty {
+                        DisclosureGroup(isExpanded: $advancedExpanded) {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(advanced) { param in
+                                    ParameterSlider(param: param) { value in
+                                        model.apply(nodeId: param.nodeId,
+                                                    param: param.name,
+                                                    value: value)
+                                        viewport.setNeedsDisplay(viewport.bounds)
+                                    } onReset: {
+                                        model.resetParam(nodeId: param.nodeId,
+                                                         param: param.name)
+                                        viewport.setNeedsDisplay(viewport.bounds)
+                                    }
+                                }
+                            }
+                            .padding(.top, 8)
+                        } label: {
+                            HStack {
+                                InspectorSectionHeader("ADVANCED")
+                                Spacer()
+                            }
+                        }
+                        .font(.caption.weight(.semibold))
                     }
                 }
             }
+        }
+    }
+
+    private func basicParams(for node: GraphNodeInfo) -> [GraphParameter] {
+        node.params.filter { ParameterPresentation.for($0).group == .basic }
+    }
+
+    private func advancedParams(for node: GraphNodeInfo) -> [GraphParameter] {
+        node.params.filter { ParameterPresentation.for($0).group == .advanced }
+    }
+}
+
+private struct InspectorSectionHeader: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.caption.weight(.bold))
+            .tracking(0.7)
+            .foregroundStyle(.secondary)
+    }
+}
+
+private struct NodeIdentityRow: View {
+    let node: GraphNodeInfo
+    let onResetAll: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(node.id)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(1)
+                Text(NodeTypeName.display(node.type))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(node.type)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .background(Color.black.opacity(0.16),
+                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1))
+            Button(action: onResetAll) {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 12, weight: .bold))
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .background(Color.black.opacity(0.16),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1))
+            .help("Reset all parameters")
         }
     }
 }
@@ -1090,57 +1983,104 @@ struct SettingSlider: View {
 struct ParameterSlider: View {
     let param: GraphParameter
     let onChange: (Double) -> Void
+    let onReset: () -> Void
 
     @State private var value: Double
     private let config: SliderConfig
+    private let presentation: ParameterPresentation
 
-    init(param: GraphParameter, onChange: @escaping (Double) -> Void) {
+    init(param: GraphParameter,
+         onChange: @escaping (Double) -> Void,
+         onReset: @escaping () -> Void) {
         self.param = param
         self.onChange = onChange
+        self.onReset = onReset
         _value = State(initialValue: param.value)
         config = SliderConfig.forParam(param)
+        presentation = ParameterPresentation.for(param)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(param.name)
-                    .font(.caption)
-                Spacer()
-                if param.nodeType == "blend", param.name == "mode" {
-                    Text(blendModeName(Int(round(value))))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(config.format(value))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
+        VStack(spacing: 0) {
             if param.nodeType == "blend", param.name == "mode" {
-                Picker("", selection: Binding(
-                    get: { Int(round(value)) },
-                    set: { mode in
-                        value = Double(mode)
-                        onChange(value)
-                    })) {
+                row {
+                    Menu {
                         ForEach(0..<blendModeNames.count, id: \.self) { mode in
-                            Text(blendModeNames[mode]).tag(mode)
+                            Button(blendModeNames[mode]) {
+                                value = Double(mode)
+                                onChange(value)
+                            }
                         }
+                    } label: {
+                        ParameterMenuLabel(title: blendModeName(Int(round(value))))
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                }
             } else {
-                Slider(value: $value, in: config.range, step: config.step) { editing in
-                    if !editing {
-                        onChange(value)
-                    }
+                row {
+                    ExportPlainSlider(value: Binding(
+                        get: { value },
+                        set: { newValue in
+                            value = newValue
+                            onChange(newValue)
+                        }),
+                                      range: config.range,
+                                      step: config.step,
+                                      isContinuous: true)
+                        .frame(minWidth: 96)
                 }
             }
+
+            Divider()
+                .opacity(0.45)
+                .padding(.top, 12)
         }
+        .padding(.vertical, 8)
         .onChange(of: param.value) { _, newValue in
             value = newValue
         }
+    }
+
+    private func row<Control: View>(@ViewBuilder control: () -> Control) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            ParameterIconBox(systemName: presentation.icon)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(presentation.label)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+
+                if let detail = presentation.detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(width: 132, alignment: .leading)
+
+            control()
+                .frame(maxWidth: .infinity)
+
+            Button(action: onReset) {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 13, weight: .bold))
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .background(inspectorControlFill,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(inspectorControlStroke())
+            .help("Reset \(presentation.label)")
+
+            InspectorValueBox(text: presentation.format(value, config: config))
+        }
+        .frame(minHeight: 66)
     }
 
     private var blendModeNames: [String] {
@@ -1151,6 +2091,277 @@ struct ParameterSlider: View {
         guard blendModeNames.indices.contains(mode) else { return "mix" }
         return blendModeNames[mode]
     }
+}
+
+private struct ParameterMenuLabel: View {
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .background(inspectorControlFill,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(inspectorControlStroke())
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct ParameterIconBox: View {
+    let systemName: String
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 34, height: 34)
+            .background(inspectorControlFill,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(inspectorControlStroke())
+    }
+}
+
+private enum ParameterGroup {
+    case basic
+    case advanced
+}
+
+private struct ParameterPresentation {
+    let label: String
+    let detail: String?
+    let unit: String?
+    let icon: String
+    let group: ParameterGroup
+
+    func format(_ value: Double, config: SliderConfig) -> String {
+        let base: String
+        if unit == nil && config.precision == 0 {
+            base = String(Int(round(value)))
+        } else {
+            base = config.format(value)
+        }
+        guard let unit else { return base }
+        return "\(base)\(unit)"
+    }
+
+    static func `for`(_ param: GraphParameter) -> ParameterPresentation {
+        ParameterPresentation(label: label(for: param.name),
+                              detail: detail(for: param),
+                              unit: unit(for: param),
+                              icon: icon(for: param),
+                              group: group(for: param))
+    }
+
+    private static func label(for name: String) -> String {
+        switch name {
+        case "dt": return "Delta Time"
+        case "t": return "Mix"
+        case "inLow": return "Input Low"
+        case "inHigh": return "Input High"
+        case "outLow": return "Output Low"
+        case "outHigh": return "Output High"
+        case "riverValleyWidth": return "Valley Width"
+        case "shorelineWidth": return "Shoreline Width"
+        case "shorelineSharpness": return "Shore Sharpness"
+        case "heightScale": return "Height Scale"
+        case "ridgeSharpness": return "Ridge Sharpness"
+        case "maxAge": return "Max Age"
+        case "maxDiff": return "Max Diff"
+        case "momentumTransfer": return "Momentum"
+        case "pipeArea": return "Pipe Area"
+        case "pipeLength": return "Pipe Length"
+        case "cellSize": return "Cell Size"
+        case "renderSurface": return "Render Surface"
+        default:
+            return ParameterName.display(name)
+        }
+    }
+
+    private static func detail(for param: GraphParameter) -> String? {
+        switch param.name {
+        case "frequency": return "Controls the overall scale."
+        case "gain": return "Controls the amplitude."
+        case "heightScale": return "Scales the output height."
+        case "lacunarity": return "Gap between successive frequencies."
+        case "octaves": return "Number of noise layers."
+        case "particles": return "Simulation budget."
+        case "iterations": return "Simulation pass count."
+        case "maxAge": return "Particle lifetime."
+        case "seed": return "Deterministic variation."
+        case "mode" where param.nodeType == "blend": return "Blend formula."
+        case "t": return "Mixes the first and second input."
+        case "opacity": return "Controls blend contribution."
+        case "scale": return "Multiplies incoming values."
+        case "bias": return "Offsets incoming values."
+        case "amount": return "Interpolates toward the effect."
+        case "min": return "Lower clamp boundary."
+        case "max": return "Upper clamp boundary."
+        case "inLow": return "Input range start."
+        case "inHigh": return "Input range end."
+        case "outLow": return "Output range start."
+        case "outHigh": return "Output range end."
+        case "gamma": return "Shapes the remap curve."
+        case "clamp": return "Limits values to the output range."
+        case "radius": return "Filter sample radius."
+        case "strength": return "Controls effect intensity."
+        case "sharpness": return "Controls transition hardness."
+        case "ridgeSharpness": return "Controls ridge contrast."
+        case "steps": return "Number of terrace levels."
+        case "low": return param.nodeType == "slopemask" ? "Minimum slope angle." : "Lower threshold."
+        case "high": return param.nodeType == "slopemask" ? "Maximum slope angle." : "Upper threshold."
+        case "depth": return "Controls carving depth."
+        case "downcutting": return "Cuts channels into terrain."
+        case "riverValleyWidth": return "Widens the carved valley."
+        case "shorelineWidth": return "Softens riverbank width."
+        case "shorelineSharpness": return "Controls bank edge hardness."
+        case "headwaters": return "Number of river sources."
+        case "water": return "Controls mask fill strength."
+        case "deposition": return "Deposits carried sediment."
+        case "entrainment": return "Picks up terrain sediment."
+        case "evaporation": return "Reduces water over time."
+        case "gravity": return "Controls downhill force."
+        case "momentumTransfer": return "Carries flow direction forward."
+        case "settling": return "Smooths unstable slopes."
+        case "maxDiff": return "Limits local height changes."
+        case "dt": return "Simulation timestep."
+        case "minTilt": return "Minimum flow slope."
+        case "rain": return "Adds water each iteration."
+        case "sedimentCapacity": return "Maximum carried sediment."
+        case "suspension": return "Keeps sediment in flow."
+        case "pipeArea": return "Virtual pipe cross-section."
+        case "pipeLength": return "Virtual pipe length."
+        case "cellSize": return "Terrain sampling size."
+        case "talusAngle": return "Slope stability threshold."
+        case "renderSurface": return "Switches preview surface mode."
+        default: return nil
+        }
+    }
+
+    private static func icon(for param: GraphParameter) -> String {
+        switch param.name {
+        case "frequency": return "waveform.path.ecg"
+        case "gain": return "chart.line.uptrend.xyaxis"
+        case "heightScale": return "mountain.2.fill"
+        case "lacunarity": return "circle.dotted"
+        case "octaves": return "square.3.layers.3d.down.right"
+        case "seed": return "number"
+        case "strength": return "dial.medium"
+        case "radius": return "circle"
+        case "width", "riverValleyWidth", "shorelineWidth": return "arrow.left.and.right"
+        case "depth", "downcutting": return "arrow.down"
+        case "water": return "drop.fill"
+        case "particles", "iterations", "maxAge": return "timer"
+        case "evaporation": return "cloud"
+        case "deposition", "settling": return "tray.and.arrow.down"
+        case "entrainment": return "wind"
+        case "gravity": return "arrow.down.to.line"
+        case "momentumTransfer": return "forward.frame"
+        case "mode": return "square.stack.3d.up"
+        default: return "slider.horizontal.3"
+        }
+    }
+
+    private static func unit(for param: GraphParameter) -> String? {
+        switch param.name {
+        case "low" where param.nodeType == "slopemask",
+             "high" where param.nodeType == "slopemask":
+            return "°"
+        default:
+            return nil
+        }
+    }
+
+    private static func group(for param: GraphParameter) -> ParameterGroup {
+        let advancedNames: Set<String> = [
+            "particles", "maxAge", "iterations", "dt", "pipeArea",
+            "pipeLength", "rain", "sedimentCapacity", "suspension",
+            "cellSize", "evaporation", "deposition", "entrainment",
+            "gravity", "momentumTransfer", "settling", "maxDiff"
+        ]
+        if advancedNames.contains(param.name) {
+            return .advanced
+        }
+        if param.nodeType == "hydraulic" || param.nodeType == "dropleterosion" {
+            switch param.name {
+            case "heightScale", "depth", "downcutting", "riverValleyWidth":
+                return .basic
+            default:
+                return advancedNames.contains(param.name) ? .advanced : .basic
+            }
+        }
+        return .basic
+    }
+}
+
+private let inspectorControlFill = Color.black.opacity(0.18)
+
+private func inspectorControlStroke() -> some View {
+    RoundedRectangle(cornerRadius: 8, style: .continuous)
+        .stroke(Color.white.opacity(0.10), lineWidth: 1)
+}
+
+private struct InspectorValueBox: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.callout.monospacedDigit().weight(.semibold))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .frame(width: 76, height: 34)
+            .background(inspectorControlFill,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(inspectorControlStroke())
+    }
+}
+
+private enum NodeTypeName {
+    static func display(_ type: String) -> String {
+        switch type {
+        case "scalebias": return "Scale Bias"
+        case "dropleterosion": return "Droplet Erosion"
+        case "rivercarve": return "River Carve"
+        case "slopemask": return "Slope Mask"
+        default:
+            return splitCamel(type.prefix(1).uppercased() + type.dropFirst())
+        }
+    }
+}
+
+private enum ParameterName {
+    static func display(_ name: String) -> String {
+        switch name {
+        case "dt": return "Delta Time"
+        case "t": return "Mix"
+        default:
+            return splitCamel(name.prefix(1).uppercased() + name.dropFirst())
+        }
+    }
+}
+
+private func splitCamel<S: StringProtocol>(_ value: S) -> String {
+    var output = ""
+    for scalar in String(value).unicodeScalars {
+        let char = Character(scalar)
+        if CharacterSet.uppercaseLetters.contains(scalar),
+           !output.isEmpty,
+           !output.hasSuffix(" ") {
+            output.append(" ")
+        }
+        output.append(char)
+    }
+    return output
 }
 
 struct SliderConfig {

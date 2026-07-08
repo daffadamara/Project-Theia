@@ -15,6 +15,21 @@ private func readCxxString(
     return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
 }
 
+private func readCxxLongString(
+    _ accessor: (UnsafeMutablePointer<CChar>?, Int) -> Int
+) -> String {
+    var cap = 4096
+    while true {
+        var buf = [CChar](repeating: 0, count: cap)
+        let n = buf.withUnsafeMutableBufferPointer { accessor($0.baseAddress, $0.count) }
+        if n < cap {
+            let len = max(n, 0)
+            return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+        cap = max(cap * 2, n + 1)
+    }
+}
+
 func usage() {
     print("""
     theia — node-based procedural terrain generator (core CLI)
@@ -38,6 +53,10 @@ func usage() {
                        [--maps height,pfm,normal,slope,mask]
                        [--mesh obj] [--vertical-scale V] [--mesh-stride S]
                                         Write production maps and/or OBJ mesh.
+
+      theia-cli diagnose GRAPH.json [--sink ID]
+                                        Analyze graph authoring health and print
+                                        errors/warnings without evaluating.
 
       theia-cli nodes                   List available node types.
 
@@ -187,6 +206,82 @@ func runExport(jsonPath: String, sink: String, size: UInt32, outDir: String,
     return 0
 }
 
+func runDiagnose(jsonPath: String, sink: String) -> Int32 {
+    let sourceText: String
+    do {
+        sourceText = try String(contentsOfFile: jsonPath, encoding: .utf8)
+    } catch {
+        print("❌ cannot read \(jsonPath): \(error.localizedDescription)")
+        return 1
+    }
+
+    let diagnosticText: String
+    if sink.isEmpty {
+        diagnosticText = sourceText
+    } else if let data = sourceText.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              var dict = object as? [String: Any],
+              JSONSerialization.isValidJSONObject(dict) {
+        dict["sink"] = sink
+        if let encoded = try? JSONSerialization.data(withJSONObject: dict, options: []),
+           let text = String(data: encoded, encoding: .utf8) {
+            diagnosticText = text
+        } else {
+            diagnosticText = sourceText
+        }
+    } else {
+        diagnosticText = sourceText
+    }
+
+    let jsonText = readCxxLongString {
+        theia.graph_diagnostics_json_text(diagnosticText, $0, $1)
+    }
+    guard let data = jsonText.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          let root = object as? [String: Any],
+          let summary = root["summary"] as? [String: Any],
+          let issues = root["issues"] as? [[String: Any]] else {
+        print("❌ diagnostics failed to return readable JSON")
+        return 1
+    }
+
+    let errors = summary["errors"] as? Int ?? 0
+    let warnings = summary["warnings"] as? Int ?? 0
+    let nodes = summary["nodes"] as? Int ?? 0
+    let connections = summary["connections"] as? Int ?? 0
+    let activeSink = summary["sink"] as? String ?? ""
+
+    if errors == 0 {
+        print("✅ Graph diagnostics OK")
+    } else {
+        print("❌ Graph diagnostics found \(errors) error\(errors == 1 ? "" : "s")")
+    }
+    print("   graph:       \(jsonPath)")
+    print("   sink:        \(activeSink.isEmpty ? "<none>" : activeSink)")
+    print("   nodes:       \(nodes)")
+    print("   connections: \(connections)")
+    print("   warnings:    \(warnings)")
+
+    for issue in issues {
+        let severity = issue["severity"] as? String ?? "info"
+        let code = issue["code"] as? String ?? "issue"
+        let message = issue["message"] as? String ?? ""
+        let node = issue["node"] as? String
+        let input = issue["input"] as? Int
+        var location = ""
+        if let node {
+            location += " node=\(node)"
+        }
+        if let input {
+            location += " input=\(input)"
+        }
+        let icon = severity == "error" ? "❌" : "⚠️"
+        print("   \(icon) \(severity) \(code)\(location): \(message)")
+    }
+
+    return errors > 0 ? 1 : 0
+}
+
 func runSmoke(count: UInt32, value: Float) -> Int32 {
     let r = theia.gpu_smoke_fill(count, value)
     let device = readCxxString { theia.smoke_device_name(r, $0, $1) }
@@ -297,6 +392,22 @@ case "export":
     exit(runExport(jsonPath: jsonPath, sink: sink, size: size, outDir: outDir,
                    basename: basename, maps: maps, mesh: mesh,
                    verticalScale: verticalScale, meshStride: meshStride))
+case "diagnose":
+    guard args.count > 1, !args[1].hasPrefix("--") else {
+        print("usage: theia-cli diagnose GRAPH.json [--sink ID]")
+        exit(2)
+    }
+    let jsonPath = args[1]
+    var sink = ""
+    var i = 2
+    while i < args.count {
+        switch args[i] {
+        case "--sink": if i + 1 < args.count { sink = args[i + 1]; i += 1 }
+        default: print("ignoring unknown option: \(args[i])")
+        }
+        i += 1
+    }
+    exit(runDiagnose(jsonPath: jsonPath, sink: sink))
 case "nodes":
     let types = readCxxString { theia.node_type_list($0, $1) }
     print("Available node types: \(types)")

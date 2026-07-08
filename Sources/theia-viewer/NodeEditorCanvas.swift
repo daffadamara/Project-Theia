@@ -6,6 +6,68 @@ private let inputGap: CGFloat = 18
 private let minCanvasZoom = 0.35
 private let maxCanvasZoom = 2.5
 
+private struct NodeTypeGroup: Identifiable {
+    let id: String
+    let title: String
+    let systemImage: String
+    let types: [String]
+}
+
+private enum NodeTypeCatalog {
+    private static let groups: [NodeTypeGroup] = [
+        NodeTypeGroup(id: "source", title: "Source", systemImage: "sparkles",
+                      types: ["perlin", "ridged"]),
+        NodeTypeGroup(id: "shape", title: "Shape", systemImage: "slider.horizontal.3",
+                      types: ["scalebias", "normalize", "terrace"]),
+        NodeTypeGroup(id: "combine", title: "Combine", systemImage: "square.stack.3d.up",
+                      types: ["combine", "blend"]),
+        NodeTypeGroup(id: "filter", title: "Filter", systemImage: "camera.filters",
+                      types: ["blur", "warp"]),
+        NodeTypeGroup(id: "mask", title: "Mask", systemImage: "circle.lefthalf.filled",
+                      types: ["slopemask", "invert", "clamp", "remap"]),
+        NodeTypeGroup(id: "erosion", title: "Erosion", systemImage: "drop.triangle",
+                      types: ["hydraulic", "thermal", "dropleterosion"]),
+        NodeTypeGroup(id: "river", title: "River", systemImage: "water.waves",
+                      types: ["river", "rivercarve"]),
+        NodeTypeGroup(id: "output", title: "Output", systemImage: "square.and.arrow.up",
+                      types: ["export"]),
+    ]
+
+    static func grouped(_ availableTypes: [String]) -> [NodeTypeGroup] {
+        let available = Set(availableTypes)
+        var used = Set<String>()
+        var result: [NodeTypeGroup] = []
+        for group in groups {
+            let types = group.types.filter { available.contains($0) }
+            if types.isEmpty { continue }
+            used.formUnion(types)
+            result.append(NodeTypeGroup(id: group.id,
+                                        title: group.title,
+                                        systemImage: group.systemImage,
+                                        types: types))
+        }
+        let uncategorized = availableTypes.filter { !used.contains($0) }
+        if !uncategorized.isEmpty {
+            result.append(NodeTypeGroup(id: "other",
+                                        title: "Other",
+                                        systemImage: "ellipsis.circle",
+                                        types: uncategorized))
+        }
+        return result
+    }
+
+    static func title(for type: String) -> String {
+        switch type {
+        case "scalebias": return "Scale Bias"
+        case "dropleterosion": return "Droplet Erosion"
+        case "rivercarve": return "River Carve"
+        case "slopemask": return "Slope Mask"
+        default:
+            return type.prefix(1).uppercased() + type.dropFirst()
+        }
+    }
+}
+
 struct NodeEditorCanvas: View {
     @ObservedObject var model: TerrainModel
     let viewport: TerrainMTKView
@@ -84,8 +146,13 @@ struct NodeEditorCanvas: View {
                              selected: model.selectedNodeIds.contains(node.id),
                              inputCount: model.document.inputCount(for: node.type),
                              connectedInputs: connectedInputs(for: node.id),
+                             missingInputs: model.missingDiagnosticInputs(for: node.id),
+                             diagnosticSeverity: model.diagnosticSeverity(for: node.id),
                              onSelect: { selectNode(node.id) },
                              onDelete: { model.selectNode(node.id); model.deleteSelection() },
+                             onDuplicate: { model.selectNode(node.id); model.duplicateSelection() },
+                             onSelectUpstream: { model.selectNode(node.id); model.selectUpstreamOfSelection() },
+                             onSelectDownstream: { model.selectNode(node.id); model.selectDownstreamOfSelection() },
                              onInputTap: { input in
                                  if let source = pendingSource {
                                      finishConnection(from: source, to: node.id, input: input)
@@ -197,7 +264,7 @@ struct NodeEditorCanvas: View {
                     .padding(.bottom, 12)
             }
         }
-        .frame(minHeight: 220)
+        .frame(minHeight: 280)
     }
 
     private func nodePosition(_ id: String) -> CGPoint {
@@ -304,7 +371,7 @@ struct CanvasGraphStatus: View {
     var body: some View {
         Label(primaryText, systemImage: primaryIcon)
             .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(statusColor)
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
         .background(Color.black.opacity(0.34),
@@ -313,12 +380,20 @@ struct CanvasGraphStatus: View {
     }
 
     private var primaryIcon: String {
-        model.document.nodes.isEmpty ? "rectangle.connected.to.line.below" : "point.3.connected.trianglepath.dotted"
+        if model.diagnostics.authoringErrorCount > 0 { return "exclamationmark.triangle.fill" }
+        if model.diagnostics.authoringWarningCount > 0 { return "exclamationmark.circle.fill" }
+        return model.document.nodes.isEmpty ? "rectangle.connected.to.line.below" : "point.3.connected.trianglepath.dotted"
     }
 
     private var primaryText: String {
         let count = model.document.nodes.count
         return "\(count) node\(count == 1 ? "" : "s")"
+    }
+
+    private var statusColor: Color {
+        if model.diagnostics.authoringErrorCount > 0 { return .red }
+        if model.diagnostics.authoringWarningCount > 0 { return .orange }
+        return .secondary
     }
 }
 
@@ -326,20 +401,26 @@ struct CanvasToolbar: View {
     @ObservedObject var model: TerrainModel
     @Binding var zoom: Double
     let viewport: TerrainMTKView
+    @State private var addPopoverPresented = false
+    @State private var selectedAddGroupId: String?
 
     var body: some View {
         HStack(spacing: 10) {
-            Menu {
-                ForEach(model.availableNodeTypes, id: \.self) { type in
-                    Button(type) {
-                        model.addNode(type: type)
-                        viewport.setNeedsDisplay(viewport.bounds)
-                    }
-                }
+            Button {
+                addPopoverPresented.toggle()
             } label: {
                 toolbarLabel("Add", systemImage: "plus")
             }
             .buttonStyle(.plain)
+            .popover(isPresented: $addPopoverPresented, arrowEdge: .bottom) {
+                AddNodePalette(groups: NodeTypeCatalog.grouped(model.availableNodeTypes),
+                               recentTypes: model.recentNodeTypes,
+                               selectedGroupId: $selectedAddGroupId) { type in
+                    model.addNode(type: type)
+                    viewport.setNeedsDisplay(viewport.bounds)
+                    addPopoverPresented = false
+                }
+            }
 
             Button {
                 model.deleteSelection()
@@ -349,6 +430,15 @@ struct CanvasToolbar: View {
             }
             .buttonStyle(.plain)
             .disabled(model.selectedNodeId == nil && model.selectedConnectionId == nil)
+
+            Button {
+                model.duplicateSelection()
+                viewport.setNeedsDisplay(viewport.bounds)
+            } label: {
+                toolbarLabel("Duplicate", systemImage: "plus.square.on.square")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.selectedNodeId == nil && model.selectedNodeIds.isEmpty)
 
             Button {
                 model.resetLayout()
@@ -396,14 +486,225 @@ struct CanvasToolbar: View {
     }
 }
 
+private struct AddNodePalette: View {
+    let groups: [NodeTypeGroup]
+    let recentTypes: [String]
+    @Binding var selectedGroupId: String?
+    let onSelect: (String) -> Void
+    @State private var searchText = ""
+    @State private var hoveredType: String?
+
+    private var selectedGroup: NodeTypeGroup? {
+        visibleGroups.first { $0.id == selectedGroupId } ?? visibleGroups.first
+    }
+
+    private var selectedTypes: [String] {
+        selectedGroup?.types ?? []
+    }
+
+    private var visibleGroups: [NodeTypeGroup] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var sourceGroups = groups
+        if query.isEmpty {
+            let available = Set(groups.flatMap(\.types))
+            let recent = recentTypes.filter { available.contains($0) }
+            if !recent.isEmpty {
+                sourceGroups.insert(NodeTypeGroup(id: "recent",
+                                                  title: "Recent",
+                                                  systemImage: "clock",
+                                                  types: recent),
+                                    at: 0)
+            }
+            return sourceGroups
+        }
+        return sourceGroups.compactMap { group in
+            let types = group.types.filter { type in
+                type.lowercased().contains(query) ||
+                    NodeTypeCatalog.title(for: type).lowercased().contains(query) ||
+                    group.title.lowercased().contains(query)
+            }
+            guard !types.isEmpty else { return nil }
+            return NodeTypeGroup(id: group.id,
+                                 title: group.title,
+                                 systemImage: group.systemImage,
+                                 types: types)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                NodeSearchField(text: $searchText,
+                                placeholder: "Search nodes")
+                    .frame(height: 22)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(Color.black.opacity(0.18),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
+
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(visibleGroups) { group in
+                        Button {
+                            withAnimation(.easeOut(duration: 0.14)) {
+                                selectedGroupId = group.id
+                            }
+                        } label: {
+                            HStack(spacing: 9) {
+                                Image(systemName: group.systemImage)
+                                    .frame(width: 17)
+                                Text(group.title)
+                                    .fontWeight(.semibold)
+                                Spacer(minLength: 10)
+                            }
+                            .frame(width: 154, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .contentShape(Rectangle())
+                            .foregroundStyle(selectedGroup?.id == group.id ? .white : .primary)
+                            .background(selectedGroup?.id == group.id ? Color.accentColor : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            .scaleEffect(selectedGroup?.id == group.id ? 1.0 : 0.985)
+                            .animation(.easeOut(duration: 0.14), value: selectedGroup?.id)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(width: 174, height: 340, alignment: .topLeading)
+
+                Divider()
+                    .frame(height: 340)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    if let selectedGroup {
+                        ForEach(selectedGroup.types, id: \.self) { type in
+                            Button {
+                                onSelect(type)
+                            } label: {
+                                HStack {
+                                    Text(NodeTypeCatalog.title(for: type))
+                                        .fontWeight(.semibold)
+                                    Spacer(minLength: 10)
+                                }
+                                    .frame(width: 168, alignment: .leading)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .contentShape(Rectangle())
+                                    .background(hoveredType == type
+                                                ? Color.white.opacity(0.08)
+                                                : Color.clear,
+                                                in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                    .scaleEffect(hoveredType == type ? 1.015 : 1.0)
+                                    .animation(.easeOut(duration: 0.10), value: hoveredType)
+                            }
+                            .buttonStyle(.plain)
+                            .onHover { hovering in
+                                withAnimation(.easeOut(duration: 0.10)) {
+                                    hoveredType = hovering ? type : nil
+                                }
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    } else {
+                        Text("No matches")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 168, alignment: .leading)
+                            .padding(.top, 7)
+                    }
+                }
+                .frame(width: 188, height: 340, alignment: .topLeading)
+            }
+        }
+        .padding(12)
+        .frame(minWidth: 430, minHeight: 398)
+        .onAppear {
+            if selectedGroupId == nil || !visibleGroups.contains(where: { $0.id == selectedGroupId }) {
+                selectedGroupId = visibleGroups.first?.id
+            }
+        }
+        .onChange(of: searchText) { _, _ in
+            if selectedGroupId == nil || !visibleGroups.contains(where: { $0.id == selectedGroupId }) {
+                selectedGroupId = visibleGroups.first?.id
+            }
+        }
+        .onDeleteCommand {
+            guard !searchText.isEmpty else { return }
+            searchText.removeLast()
+        }
+    }
+}
+
+private struct NodeSearchField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeNSView(context: Context) -> NSSearchField {
+        let field = NSSearchField(frame: .zero)
+        field.delegate = context.coordinator
+        field.placeholderString = placeholder
+        field.stringValue = text
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        field.textColor = .labelColor
+        field.sendsSearchStringImmediately = true
+        field.sendsWholeSearchString = false
+        if let cell = field.cell as? NSSearchFieldCell {
+            cell.searchButtonCell = nil
+            cell.cancelButtonCell = nil
+        }
+        DispatchQueue.main.async {
+            field.window?.makeFirstResponder(field)
+        }
+        return field
+    }
+
+    func updateNSView(_ field: NSSearchField, context: Context) {
+        if field.stringValue != text {
+            field.stringValue = text
+        }
+        field.placeholderString = placeholder
+    }
+
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        @Binding var text: String
+
+        init(text: Binding<String>) {
+            _text = text
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSSearchField else { return }
+            text = field.stringValue
+        }
+    }
+}
+
 struct NodeCard: View {
     let node: GraphDocumentNode
     let position: CGPoint
     let selected: Bool
     let inputCount: UInt32
     let connectedInputs: Set<UInt32>
+    let missingInputs: Set<UInt32>
+    let diagnosticSeverity: String?
     let onSelect: () -> Void
     let onDelete: () -> Void
+    let onDuplicate: () -> Void
+    let onSelectUpstream: () -> Void
+    let onSelectDownstream: () -> Void
     let onInputTap: (UInt32) -> Void
     let onInputDisconnect: (UInt32) -> Void
     let onOutputDragChanged: (CGPoint) -> Void
@@ -418,7 +719,9 @@ struct NodeCard: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(borderColor,
                                 lineWidth: selected ? 2 : 1))
-                .shadow(color: .black.opacity(0.22), radius: 4, y: 2)
+                .shadow(color: selected ? .accentColor.opacity(0.22) : .black.opacity(0.22),
+                        radius: selected ? 7 : 4,
+                        y: selected ? 0 : 2)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
@@ -441,8 +744,24 @@ struct NodeCard: View {
                     .position(x: nodeSize.width - 14, y: 14)
             }
 
+            if node.type == "export" {
+                badge(systemImage: "square.and.arrow.up",
+                      color: .purple)
+                    .position(x: nodeSize.width - 14, y: 14)
+            }
+
+            if let diagnosticSeverity {
+                badge(systemImage: diagnosticSeverity == "error"
+                      ? "exclamationmark.triangle.fill"
+                      : "exclamationmark.circle.fill",
+                      color: diagnosticSeverity == "error" ? .red : .orange)
+                    .position(x: nodeSize.width - 14, y: isMaskNode || node.type == "export" ? 32 : 14)
+                    .transition(.scale.combined(with: .opacity))
+            }
+
             ForEach(0..<Int(inputCount), id: \.self) { input in
-                PortView(color: .green)
+                PortView(color: .green,
+                         warning: missingInputs.contains(UInt32(input)))
                     .position(x: 0, y: 34 + CGFloat(input) * inputGap)
                     .onTapGesture { onInputTap(UInt32(input)) }
                     .contextMenu {
@@ -465,9 +784,24 @@ struct NodeCard: View {
         .position(x: position.x + nodeSize.width * CGFloat(zoom) * 0.5,
                   y: position.y + nodeSize.height * CGFloat(zoom) * 0.5)
         .onTapGesture(perform: onSelect)
+        .animation(.easeOut(duration: 0.14), value: selected)
+        .animation(.easeOut(duration: 0.14), value: diagnosticSeverity)
         .contextMenu {
+            Button("Duplicate", action: onDuplicate)
+            Divider()
+            Button("Select Upstream", action: onSelectUpstream)
+            Button("Select Downstream", action: onSelectDownstream)
+            Divider()
             Button("Delete", role: .destructive, action: onDelete)
         }
+    }
+
+    private func badge(systemImage: String, color: Color) -> some View {
+        Image(systemName: systemImage)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(color)
+            .frame(width: 16, height: 16)
+            .background(Color.black.opacity(0.42), in: Circle())
     }
 
     private var isMaskNode: Bool {
@@ -476,6 +810,7 @@ struct NodeCard: View {
 
     private var borderColor: Color {
         if selected { return .accentColor }
+        if diagnosticSeverity == "error" { return Color.red.opacity(0.75) }
         if isMaskNode { return Color.cyan.opacity(0.55) }
         return Color.secondary.opacity(0.35)
     }
@@ -483,6 +818,7 @@ struct NodeCard: View {
 
 struct PortView: View {
     let color: Color
+    var warning = false
 
     var body: some View {
         Circle()
@@ -695,17 +1031,31 @@ final class CanvasMouseEventNSView: NSView {
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
-        for type in nodeTypes {
-            let item = NSMenuItem(title: type,
-                                  action: #selector(addNodeItem(_:)),
-                                  keyEquivalent: "")
-            item.target = self
-            menu.addItem(item)
+        let groups = NodeTypeCatalog.grouped(nodeTypes)
+        for (index, group) in groups.enumerated() {
+            if index > 0 {
+                menu.addItem(.separator())
+            }
+            let groupItem = NSMenuItem(title: group.title, action: nil, keyEquivalent: "")
+            groupItem.image = NSImage(systemSymbolName: group.systemImage,
+                                      accessibilityDescription: group.title)
+            groupItem.isEnabled = false
+            menu.addItem(groupItem)
+            for type in group.types {
+                let item = NSMenuItem(title: NodeTypeCatalog.title(for: type),
+                                      action: #selector(addNodeItem(_:)),
+                                      keyEquivalent: "")
+                item.indentationLevel = 1
+                item.representedObject = type
+                item.target = self
+                menu.addItem(item)
+            }
         }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     @objc private func addNodeItem(_ sender: NSMenuItem) {
-        onAddNode?(sender.title, contextPoint)
+        guard let type = sender.representedObject as? String else { return }
+        onAddNode?(type, contextPoint)
     }
 }

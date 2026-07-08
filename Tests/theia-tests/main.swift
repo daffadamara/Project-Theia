@@ -106,6 +106,27 @@ func graphError(_ g: OpaquePointer) -> String {
     readCxxString { theia.graph_last_error(g, $0, $1) }
 }
 
+func diagnosticsString(_ text: String) -> String {
+    var buf = [CChar](repeating: 0, count: 16384)
+    let n = buf.withUnsafeMutableBufferPointer {
+        theia.graph_diagnostics_json_text(text, $0.baseAddress, $0.count)
+    }
+    let len = min(max(n, 0), buf.count - 1)
+    return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+}
+
+func diagnosticsObject(_ text: String) -> [String: Any] {
+    let str = diagnosticsString(text)
+    let data = Data(str.utf8)
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+}
+
+func diagnosticCodes(_ text: String) -> Set<String> {
+    let obj = diagnosticsObject(text)
+    let issues = obj["issues"] as? [[String: Any]] ?? []
+    return Set(issues.compactMap { $0["code"] as? String })
+}
+
 h.test("Graph evaluates a linear chain (topological order)") {
     guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
     defer { theia.graph_destroy(g) }
@@ -623,6 +644,56 @@ h.test("Graph loads JSON text transactionally and ignores editor UI metadata") {
     let after = theia.graph_evaluate(g, "", 64, 64, nil, nil)
     h.expect(after.ok, "previous graph should survive failed text load: \(graphError(g))")
     h.expect(after.reused == 2, "surviving graph should reuse cache, got \(after.reused)")
+}
+
+h.test("Graph diagnostics JSON reports health and authoring issues") {
+    let valid = """
+    {
+      "resolution": { "width": 64, "height": 64 },
+      "sink": "out",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": {} },
+        { "id": "out", "type": "normalize", "params": {} }
+      ],
+      "connections": [
+        { "from": "base", "to": "out", "input": 0 }
+      ]
+    }
+    """
+    let validObj = diagnosticsObject(valid)
+    let validSummary = validObj["summary"] as? [String: Any]
+    h.expect(validObj["ok"] as? Bool == true, "valid graph should be diagnostic-ok")
+    h.expect((validSummary?["nodes"] as? Int) == 2, "valid node count \(String(describing: validSummary))")
+    h.expect((validObj["issues"] as? [Any] ?? []).isEmpty, "valid graph should have no issues")
+
+    let empty = #"{"nodes":[],"connections":[]}"#
+    let emptyCodes = diagnosticCodes(empty)
+    h.expect(emptyCodes.contains("empty_graph"), "empty graph warning missing")
+    h.expect(emptyCodes.contains("empty_sink"), "empty sink warning missing")
+
+    let broken = """
+    {
+      "sink": "mix",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": {} },
+        { "id": "mix", "type": "combine", "params": {} },
+        { "id": "orphan", "type": "blur", "params": {} },
+        { "id": "slow", "type": "dropleterosion", "params": { "particles": 40000, "maxAge": 300 } }
+      ],
+      "connections": [
+        { "from": "base", "to": "mix", "input": 0 }
+      ]
+    }
+    """
+    let brokenCodes = diagnosticCodes(broken)
+    h.expect(brokenCodes.contains("missing_input"), "missing input not reported")
+    h.expect(brokenCodes.contains("orphan_node"), "orphan node not reported")
+    h.expect(brokenCodes.contains("heavy_simulation"), "heavy simulation not reported")
+
+    let invalid = "{"
+    let invalidObj = diagnosticsObject(invalid)
+    h.expect(invalidObj["ok"] as? Bool == false, "invalid JSON should not be ok")
+    h.expect(diagnosticCodes(invalid).contains("invalid_json"), "invalid JSON code missing")
 }
 
 h.test("Malformed graph JSON shapes fail without aborting or replacing the graph") {
