@@ -10,3 +10,4 @@ Package.resolved
 *.pfm
 *.png
 !docs/**/*.png
+!Sources/theia-viewer/Resources/*.png

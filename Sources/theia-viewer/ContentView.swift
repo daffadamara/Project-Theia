@@ -4,7 +4,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import simd
 
-private let topToolbarHeight: CGFloat = 44
+private let topToolbarHeight: CGFloat = 68
 private let topToolbarDividerColor = Color.white.opacity(0.08)
 
 struct TerrainViewport: NSViewRepresentable {
@@ -173,15 +173,39 @@ struct ViewportSurface: View {
             }
 
             floatingViewportMenus
-                .padding(.top, 54)
+                .padding(.top, topToolbarHeight + 10)
                 .padding(.leading, 12)
 
             AxisGizmo(model: model, viewport: viewport)
                 .frame(width: 76, height: 76)
-                .padding(.top, 52)
+                .padding(.top, topToolbarHeight + 8)
                 .padding(.trailing, 14)
                 .frame(maxWidth: .infinity, maxHeight: .infinity,
                        alignment: .topTrailing)
+
+            toolbarHintOverlay
+        }
+    }
+
+    @ViewBuilder
+    private var toolbarHintOverlay: some View {
+        if let toolbarHint {
+            Text(toolbarHint)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.72))
+                .lineLimit(1)
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                .background(Color.black.opacity(0.48),
+                            in: Capsule(style: .continuous))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1))
+                .padding(.trailing, 12)
+                .padding(.bottom, 10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                       alignment: .bottomTrailing)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
         }
     }
 
@@ -307,78 +331,87 @@ struct ViewportSurface: View {
     }
 
     private var viewportToolbar: some View {
-        HStack(spacing: 5) {
-            viewportButton(systemImage: "folder",
-                           help: "Load graph") {
-                openDocument()
-                redraw()
-            }
-            viewportButton(systemImage: "square.and.arrow.down",
-                           help: "Save graph") {
-                saveDocument()
-                redraw()
-            }
-
-            toolbarDivider
-
-            viewportButton(systemImage: "viewfinder",
-                           help: "Reset camera (F)") {
-                model.resetCamera()
-                redraw()
-            }
-            viewportButton(systemImage: "arrow.triangle.2.circlepath",
-                           help: "Orbit tool (O): left drag orbits the camera.",
-                           active: model.viewportTool == .orbit) {
-                model.setViewportTool(.orbit)
-                redraw()
-            }
-            viewportButton(systemImage: "hand.draw",
-                           help: "Pan tool (H): left drag pans the camera.",
-                           active: model.viewportTool == .pan) {
-                model.setViewportTool(.pan)
-                redraw()
-            }
-            viewportButton(systemImage: "magnifyingglass",
-                           help: "Zoom tool (Z): left drag vertically zooms the camera.",
-                           active: model.viewportTool == .zoom) {
-                model.setViewportTool(.zoom)
-                redraw()
+        HStack(alignment: .top, spacing: 8) {
+            toolbarGroup("File") {
+                viewportButton(systemImage: "folder",
+                               title: "Load",
+                               help: "Load graph") {
+                    openDocument()
+                    redraw()
+                }
+                viewportButton(title: "Save",
+                               help: "Save graph",
+                               action: {
+                    saveDocument()
+                    redraw()
+                }) {
+                    FloppyDiskIcon()
+                }
             }
 
             toolbarDivider
 
-            viewportButton(systemImage: "square.grid.3x3",
-                           help: "Toggle grid",
-                           active: model.gridVisible) {
-                model.setGridVisible(!model.gridVisible)
-                redraw()
-            }
-            viewportButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right",
-                           help: "Toggle axes",
-                           active: model.axisVisible) {
-                model.setAxisVisible(!model.axisVisible)
-                redraw()
-            }
-            viewportButton(systemImage: "cube.transparent",
-                           help: "Toggle wireframe",
-                           active: model.wireframeEnabled) {
-                model.wireframeEnabled.toggle()
-                model.applyViewportSettings()
-                redraw()
+            toolbarGroup("Camera") {
+                viewportButton(systemImage: "viewfinder",
+                               title: "Reset",
+                               help: "Reset camera (F)") {
+                    model.resetCamera()
+                    redraw()
+                }
+                viewportButton(systemImage: "arrow.triangle.2.circlepath",
+                               title: "Orbit",
+                               help: "Orbit tool (O): left drag orbits the camera.",
+                               active: model.viewportTool == .orbit) {
+                    model.setViewportTool(.orbit)
+                    redraw()
+                }
+                viewportButton(systemImage: "hand.draw",
+                               title: "Pan",
+                               help: "Pan tool (H): left drag pans the camera.",
+                               active: model.viewportTool == .pan) {
+                    model.setViewportTool(.pan)
+                    redraw()
+                }
+                viewportButton(systemImage: "magnifyingglass",
+                               title: "Zoom",
+                               help: "Zoom tool (Z): left drag vertically zooms the camera.",
+                               active: model.viewportTool == .zoom) {
+                    model.setViewportTool(.zoom)
+                    redraw()
+                }
             }
 
-            if let toolbarHint {
-                Text(toolbarHint)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.58))
-                    .lineLimit(1)
-                    .padding(.leading, 8)
-                    .transition(.opacity)
+            toolbarDivider
+
+            toolbarGroup("Display") {
+                viewportButton(systemImage: "square.grid.3x3",
+                               title: "Grid",
+                               help: "Toggle grid",
+                               active: model.gridVisible) {
+                    model.setGridVisible(!model.gridVisible)
+                    redraw()
+                }
+                viewportButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right",
+                               title: "Axes",
+                               help: "Toggle axes",
+                               active: model.axisVisible) {
+                    model.setAxisVisible(!model.axisVisible)
+                    redraw()
+                }
+                viewportButton(systemImage: "cube.transparent",
+                               title: "Wire",
+                               help: "Toggle wireframe",
+                               active: model.wireframeEnabled) {
+                    model.wireframeEnabled.toggle()
+                    model.applyViewportSettings()
+                    redraw()
+                }
             }
 
             Spacer()
         }
         .padding(.horizontal, 10)
+        .padding(.top, 6)
         .frame(height: topToolbarHeight)
         .background(Color(red: 0.115, green: 0.12, blue: 0.13).opacity(0.96))
         .overlay(alignment: .bottom) {
@@ -388,16 +421,46 @@ struct ViewportSurface: View {
         }
     }
 
-    private func viewportButton(systemImage: String, help: String,
+    private func toolbarGroup<Content: View>(_ title: String,
+                                             @ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 6) {
+                content()
+            }
+            Text(title)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(.white.opacity(0.38))
+                .textCase(.uppercase)
+                .lineLimit(1)
+        }
+    }
+
+    private func viewportButton(systemImage: String, title: String, help: String,
                                 active: Bool = false,
                                 action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        viewportButton(title: title, help: help, active: active, action: action) {
             Image(systemName: systemImage)
                 .font(.system(size: 14, weight: .semibold))
-                .frame(width: 30, height: 30)
-                .contentShape(Rectangle())
-                .background(active ? Color.accentColor.opacity(0.35) : Color.white.opacity(0.07),
-                            in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
+
+    private func viewportButton<Icon: View>(title: String, help: String,
+                                            active: Bool = false,
+                                            action: @escaping () -> Void,
+                                            @ViewBuilder icon: () -> Icon) -> some View {
+        Button(action: action) {
+            VStack(spacing: 2) {
+                icon()
+                    .frame(height: 18)
+                Text(title)
+                    .font(.system(size: 8, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .frame(width: 43, height: 42)
+            .contentShape(Rectangle())
+            .background(active ? Color.accentColor.opacity(0.35) : Color.white.opacity(0.07),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
         .foregroundStyle(active ? Color.accentColor : Color.white.opacity(0.86))
@@ -442,8 +505,9 @@ struct ViewportSurface: View {
     private var toolbarDivider: some View {
         Rectangle()
             .fill(Color.white.opacity(0.12))
-            .frame(width: 1, height: 26)
-            .padding(.horizontal, 5)
+            .frame(width: 1, height: 48)
+            .padding(.horizontal, 4)
+            .padding(.top, 1)
     }
 
     private func redraw() {
@@ -470,6 +534,31 @@ struct ViewportSurface: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.load(from: url.path)
     }
+}
+
+private struct FloppyDiskIcon: View {
+    var body: some View {
+        if let image = Self.image {
+            Image(nsImage: image)
+                .resizable()
+                .renderingMode(.template)
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 25, height: 25)
+        } else {
+            Image(systemName: "externaldrive")
+                .font(.system(size: 15, weight: .semibold))
+        }
+    }
+
+    private static let image: NSImage? = {
+        guard let url = Bundle.module.url(forResource: "save_icon", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else {
+            return nil
+        }
+        image.isTemplate = true
+        return image
+    }()
 }
 
 struct AxisGizmo: View {
@@ -663,7 +752,6 @@ struct InspectorPanel: View {
                 Text("Inspector")
                     .font(.headline)
                 Spacer()
-                inspectorContext
             }
             .padding(.horizontal, 14)
             .frame(height: topToolbarHeight)
@@ -697,24 +785,6 @@ struct InspectorPanel: View {
         return model.document.node(id: id)?.type
     }
 
-    @ViewBuilder
-    private var inspectorContext: some View {
-        if let id = model.selectedNodeId,
-           let node = model.document.node(id: id) {
-            Text("\(node.id) / \(node.type)")
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        } else if model.selectedConnectionId != nil {
-            Text("edge selected")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } else {
-            Text(model.document.nodes.isEmpty ? "empty graph" : "no selection")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
 }
 
 struct GraphActions: View {
@@ -1674,41 +1744,149 @@ private struct InspectorSectionHeader: View {
 private struct NodeIdentityRow: View {
     let node: GraphNodeInfo
     let onResetAll: () -> Void
+    private var presentation: NodePresentation {
+        NodePresentation.for(node.type)
+    }
 
     var body: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(node.id)
-                    .font(.title3.weight(.semibold))
-                    .lineLimit(1)
-                Text(NodeTypeName.display(node.type))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: presentation.icon)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(presentation.tint)
+                    .frame(width: 42, height: 42)
+                    .background(presentation.tint.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(presentation.tint.opacity(0.26), lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(node.id)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                    Text(presentation.subtitle)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Button(action: onResetAll) {
+                    Label("Reset", systemImage: "arrow.counterclockwise")
+                        .labelStyle(.iconOnly)
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .background(inspectorControlFill,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(inspectorControlStroke())
+                .help("Reset all parameters")
             }
-            Spacer()
-            Text(node.type)
+
+            HStack(spacing: 8) {
+                NodeIdentityChip(text: NodeTypeName.display(node.type),
+                                 systemImage: "cube.transparent")
+                NodeIdentityChip(text: node.type,
+                                 systemImage: "number")
+            }
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.025),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.09), lineWidth: 1))
+    }
+}
+
+private struct NodeIdentityChip: View {
+    let text: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.secondary)
+            Text(text)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 10)
-                .frame(height: 28)
-                .background(Color.black.opacity(0.16),
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1))
-            Button(action: onResetAll) {
-                Image(systemName: "arrow.counterclockwise")
-                    .font(.system(size: 12, weight: .bold))
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .background(Color.black.opacity(0.16),
-                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1))
-            .help("Reset all parameters")
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 24)
+        .background(inspectorControlFill,
+                    in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1))
+    }
+}
+
+private struct NodePresentation {
+    let icon: String
+    let tint: Color
+    let subtitle: String
+
+    static func `for`(_ type: String) -> NodePresentation {
+        switch type {
+        case "perlin":
+            return NodePresentation(icon: "waveform.path.ecg",
+                                    tint: .blue,
+                                    subtitle: "Noise source")
+        case "ridged":
+            return NodePresentation(icon: "mountain.2",
+                                    tint: .blue,
+                                    subtitle: "Ridged noise source")
+        case "scalebias":
+            return NodePresentation(icon: "plus.forwardslash.minus",
+                                    tint: .purple,
+                                    subtitle: "Height remap")
+        case "combine", "blend":
+            return NodePresentation(icon: "square.stack.3d.up",
+                                    tint: .indigo,
+                                    subtitle: "Layer composition")
+        case "invert", "clamp", "remap", "normalize":
+            return NodePresentation(icon: "slider.horizontal.3",
+                                    tint: .purple,
+                                    subtitle: "Value shaping")
+        case "blur", "warp":
+            return NodePresentation(icon: "camera.filters",
+                                    tint: .teal,
+                                    subtitle: "Terrain filter")
+        case "slopemask":
+            return NodePresentation(icon: "circle.lefthalf.filled",
+                                    tint: .green,
+                                    subtitle: "Mask generator")
+        case "hydraulic", "thermal", "dropleterosion":
+            return NodePresentation(icon: "drop.triangle",
+                                    tint: .orange,
+                                    subtitle: "Erosion simulation")
+        case "river":
+            return NodePresentation(icon: "water.waves",
+                                    tint: .cyan,
+                                    subtitle: "River mask")
+        case "rivercarve":
+            return NodePresentation(icon: "water.waves.and.arrow.down",
+                                    tint: .cyan,
+                                    subtitle: "River terrain carve")
+        case "terrace":
+            return NodePresentation(icon: "stairs",
+                                    tint: .brown,
+                                    subtitle: "Stepped terrain")
+        case "export":
+            return NodePresentation(icon: "square.and.arrow.up",
+                                    tint: .blue,
+                                    subtitle: "Output terminal")
+        default:
+            return NodePresentation(icon: "circle.hexagongrid",
+                                    tint: .secondary,
+                                    subtitle: NodeTypeName.display(type))
         }
     }
 }

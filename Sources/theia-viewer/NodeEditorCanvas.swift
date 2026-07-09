@@ -127,15 +127,9 @@ struct NodeEditorCanvas: View {
                 }
 
                 if model.document.nodes.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "rectangle.connected.to.line.below")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.secondary)
-                        Text("No nodes")
-                            .font(.headline)
-                        Text("Right-click the canvas (or use Add) to create a terrain graph.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    EmptyGraphQuickAdd(availableTypes: model.availableNodeTypes) { kind in
+                        model.addQuickStart(kind: kind)
+                        viewport.setNeedsDisplay(viewport.bounds)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -362,6 +356,117 @@ struct NodeEditorCanvas: View {
             pendingSource = nil
             pendingPoint = nil
         }
+    }
+}
+
+private struct EmptyGraphQuickAdd: View {
+    let availableTypes: [String]
+    let onAdd: (String) -> Void
+
+    private var available: Set<String> { Set(availableTypes) }
+
+    private var starters: [QuickAddStarter] {
+        [
+            QuickAddStarter(kind: "perlin",
+                            title: "Perlin",
+                            systemImage: "waveform.path.ecg",
+                            requiredTypes: ["perlin"]),
+            QuickAddStarter(kind: "ridged",
+                            title: "Ridged",
+                            systemImage: "mountain.2",
+                            requiredTypes: ["ridged"]),
+            QuickAddStarter(kind: "terrace",
+                            title: "Terrace",
+                            systemImage: "stairs",
+                            requiredTypes: ["perlin", "terrace"]),
+            QuickAddStarter(kind: "river",
+                            title: "River",
+                            systemImage: "water.waves",
+                            requiredTypes: ["perlin", "river", "rivercarve"]),
+        ].filter { starter in
+            starter.requiredTypes.allSatisfy { available.contains($0) }
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            VStack(spacing: 8) {
+                Image(systemName: "rectangle.connected.to.line.below")
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("No nodes in this graph")
+                    .font(.headline)
+                Text("Right-click the canvas or use Add to create your first node.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !starters.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Quick Add")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 8) {
+                        ForEach(starters) { starter in
+                            QuickAddStarterButton(starter: starter) {
+                                onAdd(starter.kind)
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color.black.opacity(0.22),
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                )
+            }
+        }
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 24)
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+    }
+}
+
+private struct QuickAddStarter: Identifiable {
+    let kind: String
+    let title: String
+    let systemImage: String
+    let requiredTypes: [String]
+
+    var id: String { kind }
+}
+
+private struct QuickAddStarterButton: View {
+    let starter: QuickAddStarter
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: starter.systemImage)
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 18)
+                Text(starter.title)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 11)
+            .frame(height: 32)
+            .frame(minWidth: 86)
+            .contentShape(Rectangle())
+            .background(hovered ? Color.white.opacity(0.12) : Color.white.opacity(0.06),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(Color.white.opacity(hovered ? 0.20 : 0.10), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
     }
 }
 

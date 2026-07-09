@@ -49,6 +49,9 @@ let package = Package(
             name: "theia-viewer",
             dependencies: ["TheiaCore"],
             path: "Sources/theia-viewer",
+            resources: [
+                .process("Resources"),
+            ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
             ],

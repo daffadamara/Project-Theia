@@ -569,6 +569,51 @@ final class TerrainModel: ObservableObject {
         reloadInspector()
     }
 
+    func addQuickStart(kind: String) {
+        pushUndo()
+
+        let selected: String
+        let createdTypes: [String]
+        switch kind {
+        case "ridged":
+            selected = document.addNode(type: "ridged",
+                                        at: GraphNodePosition(x: 120, y: 120))
+            createdTypes = ["ridged"]
+        case "terrace":
+            let perlin = document.addNode(type: "perlin",
+                                          at: GraphNodePosition(x: 80, y: 120))
+            let terrace = document.addNode(type: "terrace",
+                                           at: GraphNodePosition(x: 300, y: 120))
+            document.connect(from: perlin, to: terrace, input: 0)
+            selected = terrace
+            createdTypes = ["perlin", "terrace"]
+        case "river":
+            let perlin = document.addNode(type: "perlin",
+                                          at: GraphNodePosition(x: 80, y: 120))
+            let river = document.addNode(type: "river",
+                                         at: GraphNodePosition(x: 300, y: 168))
+            let carve = document.addNode(type: "rivercarve",
+                                         at: GraphNodePosition(x: 520, y: 120))
+            document.connect(from: perlin, to: river, input: 0)
+            document.connect(from: perlin, to: carve, input: 0)
+            document.connect(from: river, to: carve, input: 1)
+            selected = carve
+            createdTypes = ["perlin", "river", "rivercarve"]
+        default:
+            selected = document.addNode(type: "perlin",
+                                        at: GraphNodePosition(x: 120, y: 120))
+            createdTypes = ["perlin"]
+        }
+
+        createdTypes.forEach(recordRecentNodeType)
+        document.sink = selected
+        selectedNodeId = selected
+        selectedNodeIds = [selected]
+        selectedConnectionId = nil
+        syncPreviewWithDocument(markDirty: true)
+        reloadInspector()
+    }
+
     private func recordRecentNodeType(_ type: String) {
         recentNodeTypes.removeAll { $0 == type }
         recentNodeTypes.insert(type, at: 0)

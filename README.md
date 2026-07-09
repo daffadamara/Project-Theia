@@ -1,5 +1,7 @@
 # Theia
 
+**Current version:** `0.8.0-alpha.1`
+
 A node-based procedural terrain generator for macOS, built on Metal compute —
 a Mac-native take on tools like GAEA and World Machine (which are Windows-only).
 
@@ -103,3 +105,20 @@ The core is in place (noise, erosion, hydrology, filters, graph engine, JSON I/O
 and the viewer now supports graph authoring plus analysis/material preview.
 Next: richer material workflows, more export targets, and broader natural-process
 nodes.
+
+## Versioning
+
+Theia uses Semantic Versioning:
+
+- `0.x` tracks active pre-1.0 development.
+- Minor versions map to larger project phases or milestone groups.
+- Patch versions are for fixes and focused UI/core polish.
+- Pre-release suffixes such as `-alpha.1` indicate builds that are useful for
+  testing but not yet a stable public release.
+
+## License
+
+Theia is licensed under the MIT License. See `LICENSE`.
+
+Third-party libraries vendored under `Sources/TheiaCore/third_party/` keep
+their own license files and notices.
