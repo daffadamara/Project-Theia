@@ -1176,12 +1176,6 @@ final class TerrainModel: ObservableObject {
 
     private nonisolated static func performExport(text: String, sink: String,
                                                   settings: ExportSettings) -> String {
-        do {
-            try FileManager.default.createDirectory(atPath: settings.outDir,
-                                                    withIntermediateDirectories: true)
-        } catch {
-            return "export failed: \(error.localizedDescription)"
-        }
         guard let g = theia.graph_create() else { return "export failed: graph create" }
         defer { theia.graph_destroy(g) }
         guard theia.graph_load_json_text(g, text) else {
@@ -1189,65 +1183,57 @@ final class TerrainModel: ObservableObject {
             return "export failed: \(err)"
         }
 
-        func path(_ suffix: String, enabled: Bool) -> String {
-            guard enabled else { return "" }
-            return URL(fileURLWithPath: settings.outDir)
-                .appendingPathComponent("\(settings.basename)\(suffix)")
-                .path
+        func coreHeightmapFormat(_ format: ExportSettings.HeightmapFormat,
+                                 enabled: Bool) -> theia.HeightmapFormat {
+            guard enabled else { return theia.HeightmapFormat.none }
+            switch format {
+            case .png16: return theia.HeightmapFormat.png16
+            case .r16: return theia.HeightmapFormat.r16
+            case .pfm32: return theia.HeightmapFormat.pfm32
+            }
         }
 
-        let writeHeightPNG = settings.exportHeightmap && settings.heightmapFormat == .png16
-        let writePFM = settings.exportHeightmap && settings.heightmapFormat == .pfm32
-        let writeRawR16 = settings.exportHeightmap && settings.heightmapFormat == .r16
-        let writeOBJ = settings.exportMesh && settings.meshFormat == .obj
-
-        let r = theia.graph_export(
-            g, sink, settings.size, settings.size,
-            path("_height.png", enabled: writeHeightPNG),
-            path(".pfm", enabled: writePFM),
-            "",
-            "",
-            "",
-            path(".obj", enabled: writeOBJ),
-            Float(settings.verticalScale),
-            settings.meshStride)
+        let r = settings.outDir.withCString { outDirPtr in
+            settings.basename.withCString { basenamePtr in
+                if sink.isEmpty {
+                    var opts = theia.GraphExportOptions()
+                    opts.sinkId = nil
+                    opts.width = settings.size
+                    opts.height = settings.size
+                    opts.outDir = outDirPtr
+                    opts.basename = basenamePtr
+                    opts.heightmapFormat = coreHeightmapFormat(settings.heightmapFormat,
+                                                               enabled: settings.exportHeightmap)
+                    opts.meshFormat = settings.exportMesh && settings.meshFormat == .obj
+                        ? theia.MeshFormat.obj
+                        : theia.MeshFormat.none
+                    opts.verticalScale = Float(settings.verticalScale)
+                    opts.meshStride = settings.meshStride
+                    return theia.graph_export2(g, opts)
+                }
+                return sink.withCString { sinkPtr in
+                    var opts = theia.GraphExportOptions()
+                    opts.sinkId = sinkPtr
+                    opts.width = settings.size
+                    opts.height = settings.size
+                    opts.outDir = outDirPtr
+                    opts.basename = basenamePtr
+                    opts.heightmapFormat = coreHeightmapFormat(settings.heightmapFormat,
+                                                               enabled: settings.exportHeightmap)
+                    opts.meshFormat = settings.exportMesh && settings.meshFormat == .obj
+                        ? theia.MeshFormat.obj
+                        : theia.MeshFormat.none
+                    opts.verticalScale = Float(settings.verticalScale)
+                    opts.meshStride = settings.meshStride
+                    return theia.graph_export2(g, opts)
+                }
+            }
+        }
         guard r.ok else {
             let err = readCxxString { theia.graph_last_error(g, $0, $1) }
             return "export failed: \(err)"
         }
-        if writeRawR16 {
-            let count = Int(r.width) * Int(r.height)
-            guard count > 0 else { return "export failed: empty heightfield" }
-            var heights = [Float](repeating: 0, count: count)
-            let rawEval = heights.withUnsafeMutableBufferPointer {
-                theia.graph_evaluate_heights(g, sink, r.width, r.height,
-                                             $0.baseAddress, $0.count)
-            }
-            guard rawEval.ok else {
-                let err = readCxxString { theia.graph_last_error(g, $0, $1) }
-                return "export failed: \(err)"
-            }
-            let rawPath = path("_height.r16", enabled: true)
-            do {
-                try writeR16Heightmap(heights, path: rawPath)
-            } catch {
-                return "export failed: \(error.localizedDescription)"
-            }
-        }
         return "exported \(settings.basename) \(r.width)x\(r.height)"
-    }
-
-    private nonisolated static func writeR16Heightmap(_ heights: [Float],
-                                                      path: String) throws {
-        var data = Data()
-        data.reserveCapacity(heights.count * MemoryLayout<UInt16>.size)
-        for height in heights {
-            let normalized = min(1.0, max(0.0, height.isFinite ? height : 0.0))
-            var sample = UInt16((normalized * Float(UInt16.max)).rounded())
-                .littleEndian
-            withUnsafeBytes(of: &sample) { data.append(contentsOf: $0) }
-        }
-        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 
     private func markDirty() {

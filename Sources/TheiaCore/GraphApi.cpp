@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
+#include <vector>
 
 #include "GPUContext.hpp"
 #include "Graph.hpp"
@@ -22,6 +25,9 @@ using json = nlohmann::json;
 namespace theia {
 
 namespace {
+constexpr const char* kTheiaVersion = "0.9.0-alpha.1";
+constexpr std::uint32_t kTheiaAPIVersion = 2;
+
 std::size_t copyOutStr(const std::string& s, char* out, std::size_t cap) {
     if (out && cap > 0) {
         const std::size_t n = std::min(cap - 1, s.size());
@@ -349,16 +355,50 @@ std::string makeDiagnosticsJSON(const std::string& text) {
 }
 } // namespace
 
+std::size_t theia_version_string(char* out, std::size_t cap) {
+    return copyOutStr(kTheiaVersion, out, cap);
+}
+
+std::uint32_t theia_api_version() {
+    return kTheiaAPIVersion;
+}
+
+std::size_t theia_capabilities_json(char* out, std::size_t cap) {
+    json caps;
+    caps["version"] = kTheiaVersion;
+    caps["apiVersion"] = kTheiaAPIVersion;
+    caps["swiftPM"] = true;
+    caps["stableCABI"] = false;
+    caps["heightmapFormats"] = {"png16", "r16", "pfm32"};
+    caps["meshFormats"] = {"obj"};
+    caps["commands"] = {"smoke", "demo", "run", "export", "diagnose", "nodes", "doctor", "version"};
+    caps["nodes"] = registeredNodeTypes();
+    const std::string text = caps.dump(2);
+    return copyOutStr(text, out, cap);
+}
+
 // Concrete definition of the opaque handle from the public header. Owns the
 // graph and a lazily-created GPU context.
 struct GraphHandle {
     Graph graph;
     std::unique_ptr<GPUContext> ctx;  // created on first evaluate
     std::string lastError;
+    GraphErrorCode lastErrorCode = GraphErrorCode::none;
+
+    void clearError() {
+        lastError.clear();
+        lastErrorCode = GraphErrorCode::none;
+    }
+
+    void setError(GraphErrorCode code, std::string message) {
+        lastErrorCode = code;
+        lastError = std::move(message);
+    }
 
     bool ensureGPU() {
         if (ctx) return true;
         ctx = GPUContext::create(lastError);
+        if (!ctx) lastErrorCode = GraphErrorCode::evaluation;
         return ctx != nullptr;
     }
 };
@@ -369,47 +409,77 @@ void graph_destroy(GraphHandle* g) { delete g; }
 
 bool graph_add_node(GraphHandle* g, const char* id, const char* type) {
     if (!g) return false;
-    return g->graph.addNode(id ? id : "", type ? type : "", g->lastError) != nullptr;
+    g->clearError();
+    if (g->graph.addNode(id ? id : "", type ? type : "", g->lastError) == nullptr) {
+        g->lastErrorCode = GraphErrorCode::validation;
+        return false;
+    }
+    return true;
 }
 
 bool graph_set_param(GraphHandle* g, const char* id, const char* key, double value) {
     if (!g) return false;
-    return g->graph.setParam(id ? id : "", key ? key : "", value, g->lastError);
+    g->clearError();
+    if (!g->graph.setParam(id ? id : "", key ? key : "", value, g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::validation;
+        return false;
+    }
+    return true;
 }
 
 bool graph_connect(GraphHandle* g, const char* fromId, const char* toId,
                    std::uint32_t inputIndex) {
     if (!g) return false;
-    return g->graph.connect(fromId ? fromId : "", toId ? toId : "", inputIndex,
-                            g->lastError);
+    g->clearError();
+    if (!g->graph.connect(fromId ? fromId : "", toId ? toId : "", inputIndex,
+                          g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::validation;
+        return false;
+    }
+    return true;
 }
 
 bool graph_load_json_file(GraphHandle* g, const char* path) {
     if (!g || !path) return false;
+    g->clearError();
     std::ifstream f(path);
     if (!f) {
-        g->lastError = std::string("cannot open ") + path;
+        g->setError(GraphErrorCode::load, std::string("cannot open ") + path);
         return false;
     }
     std::stringstream ss;
     ss << f.rdbuf();
-    return g->graph.fromJSON(ss.str(), g->lastError);
+    if (!g->graph.fromJSON(ss.str(), g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::load;
+        return false;
+    }
+    return true;
 }
 
 bool graph_load_json_text(GraphHandle* g, const char* text) {
     if (!g || !text) return false;
-    return g->graph.fromJSON(text, g->lastError);
+    g->clearError();
+    if (!g->graph.fromJSON(text, g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::load;
+        return false;
+    }
+    return true;
 }
 
 bool graph_save_json_file(GraphHandle* g, const char* path) {
     if (!g || !path) return false;
+    g->clearError();
     std::ofstream f(path);
     if (!f) {
-        g->lastError = std::string("cannot write ") + path;
+        g->setError(GraphErrorCode::exportError, std::string("cannot write ") + path);
         return false;
     }
     f << g->graph.toJSON();
-    return static_cast<bool>(f);
+    if (!f) {
+        g->setError(GraphErrorCode::exportError, std::string("cannot write ") + path);
+        return false;
+    }
+    return true;
 }
 
 std::size_t graph_diagnostics_json_text(const char* text,
@@ -423,6 +493,7 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
                                const char* pngPath, const char* pfmPath) {
     GraphEvalResult r;
     if (!g) return r;
+    g->clearError();
 
     if (!g->ensureGPU()) {
         // lastError already set by ensureGPU.
@@ -431,7 +502,8 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
 
     std::string sink = (sinkId && sinkId[0]) ? sinkId : g->graph.defaultSink();
     if (sink.empty()) {
-        g->lastError = "no sink specified and graph has no default sink";
+        g->setError(GraphErrorCode::validation,
+                    "no sink specified and graph has no default sink");
         return r;
     }
     const std::uint32_t w = width ? width : g->graph.defaultWidth();
@@ -440,7 +512,10 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
     EvalStats stats;
     const Heightfield* out =
         g->graph.evaluate(*g->ctx, sink, w, h, stats, g->lastError);
-    if (!out) return r;
+    if (!out) {
+        g->lastErrorCode = GraphErrorCode::evaluation;
+        return r;
+    }
 
     r.width = w;
     r.height = h;
@@ -456,10 +531,16 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
     r.variance = var;
 
     if (pfmPath && pfmPath[0]) {
-        if (!writePFM(pfmPath, out->data(), w, h, g->lastError)) return r;
+        if (!writePFM(pfmPath, out->data(), w, h, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
     if (pngPath && pngPath[0]) {
-        if (!writePNG16(pngPath, out->data(), w, h, mn, mx, g->lastError)) return r;
+        if (!writePNG16(pngPath, out->data(), w, h, mn, mx, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
 
     r.ok = true;
@@ -471,11 +552,13 @@ GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
                                        float* dst, std::size_t capElems) {
     GraphEvalResult r;
     if (!g) return r;
+    g->clearError();
     if (!g->ensureGPU()) return r;
 
     std::string sink = (sinkId && sinkId[0]) ? sinkId : g->graph.defaultSink();
     if (sink.empty()) {
-        g->lastError = "no sink specified and graph has no default sink";
+        g->setError(GraphErrorCode::validation,
+                    "no sink specified and graph has no default sink");
         return r;
     }
     const std::uint32_t w = width ? width : g->graph.defaultWidth();
@@ -484,7 +567,10 @@ GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
     EvalStats stats;
     const Heightfield* out =
         g->graph.evaluate(*g->ctx, sink, w, h, stats, g->lastError);
-    if (!out) return r;
+    if (!out) {
+        g->lastErrorCode = GraphErrorCode::evaluation;
+        return r;
+    }
 
     r.width = w;
     r.height = h;
@@ -518,34 +604,39 @@ GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
                              std::uint32_t meshStride) {
     GraphEvalResult r;
     if (!g) return r;
+    g->clearError();
     if (!g->ensureGPU()) return r;
     if (width == 0 || height == 0) {
         width = g->graph.defaultWidth();
         height = g->graph.defaultHeight();
     }
     if (width < 2 || height < 2) {
-        g->lastError = "export resolution must be at least 2x2";
+        g->setError(GraphErrorCode::validation, "export resolution must be at least 2x2");
         return r;
     }
     if (meshStride == 0) {
-        g->lastError = "mesh stride must be > 0";
+        g->setError(GraphErrorCode::validation, "mesh stride must be > 0");
         return r;
     }
     if (!(verticalScale > 0.0f)) {
-        g->lastError = "vertical scale must be > 0";
+        g->setError(GraphErrorCode::validation, "vertical scale must be > 0");
         return r;
     }
 
     const std::string sink = (sinkId && sinkId[0]) ? sinkId : g->graph.defaultSink();
     if (sink.empty()) {
-        g->lastError = "no sink specified and graph has no default sink";
+        g->setError(GraphErrorCode::validation,
+                    "no sink specified and graph has no default sink");
         return r;
     }
 
     EvalStats stats;
     const Heightfield* out =
         g->graph.evaluate(*g->ctx, sink, width, height, stats, g->lastError);
-    if (!out) return r;
+    if (!out) {
+        g->lastErrorCode = GraphErrorCode::evaluation;
+        return r;
+    }
 
     r.width = width;
     r.height = height;
@@ -561,29 +652,126 @@ GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
 
     const float* data = out->data();
     if (heightPngPath && heightPngPath[0]) {
-        if (!writePNG16(heightPngPath, data, width, height, mn, mx, g->lastError)) return r;
+        if (!writePNG16(heightPngPath, data, width, height, mn, mx, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
     if (pfmPath && pfmPath[0]) {
-        if (!writePFM(pfmPath, data, width, height, g->lastError)) return r;
+        if (!writePFM(pfmPath, data, width, height, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
     if (normalPngPath && normalPngPath[0]) {
         if (!writeNormalPNG(normalPngPath, data, width, height, verticalScale,
-                            g->lastError)) return r;
+                            g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
     if (slopePngPath && slopePngPath[0]) {
         if (!writeSlopePNG16(slopePngPath, data, width, height, verticalScale,
-                             g->lastError)) return r;
+                             g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
     if (maskPngPath && maskPngPath[0]) {
         if (!writePNG16(maskPngPath, data, width, height, 0.0f, 1.0f,
-                        g->lastError)) return r;
+                        g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
     if (objPath && objPath[0]) {
         if (!writeOBJ(objPath, data, width, height, verticalScale, meshStride,
-                      g->lastError)) return r;
+                      g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            return r;
+        }
     }
 
     r.ok = true;
+    return r;
+}
+
+GraphEvalResult graph_export2(GraphHandle* g, const GraphExportOptions& options) {
+    GraphEvalResult r;
+    if (!g) return r;
+    g->clearError();
+
+    const bool writeHeight = options.heightmapFormat != HeightmapFormat::none;
+    const bool writeMesh = options.meshFormat != MeshFormat::none;
+    if (!writeHeight && !writeMesh) {
+        g->setError(GraphErrorCode::validation, "choose at least one export output");
+        return r;
+    }
+    if (options.heightmapFormat != HeightmapFormat::none &&
+        options.heightmapFormat != HeightmapFormat::png16 &&
+        options.heightmapFormat != HeightmapFormat::r16 &&
+        options.heightmapFormat != HeightmapFormat::pfm32) {
+        g->setError(GraphErrorCode::validation, "unknown heightmap format");
+        return r;
+    }
+    if (options.meshFormat != MeshFormat::none && options.meshFormat != MeshFormat::obj) {
+        g->setError(GraphErrorCode::validation, "unknown mesh format");
+        return r;
+    }
+    if (!options.outDir || !options.outDir[0]) {
+        g->setError(GraphErrorCode::validation, "export outDir is required");
+        return r;
+    }
+    if (!options.basename || !options.basename[0]) {
+        g->setError(GraphErrorCode::validation, "export basename is required");
+        return r;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(options.outDir, ec);
+    if (ec) {
+        g->setError(GraphErrorCode::exportError,
+                    std::string("cannot create ") + options.outDir + ": " + ec.message());
+        return r;
+    }
+
+    const std::filesystem::path dir(options.outDir);
+    const std::string base(options.basename);
+    const std::string pngPath =
+        options.heightmapFormat == HeightmapFormat::png16
+            ? (dir / (base + "_height.png")).string()
+            : "";
+    const std::string pfmPath =
+        options.heightmapFormat == HeightmapFormat::pfm32
+            ? (dir / (base + ".pfm")).string()
+            : "";
+    const std::string objPath =
+        options.meshFormat == MeshFormat::obj
+            ? (dir / (base + ".obj")).string()
+            : "";
+
+    r = graph_export(g, options.sinkId, options.width, options.height,
+                     pngPath.c_str(), pfmPath.c_str(), "", "", "",
+                     objPath.c_str(), options.verticalScale, options.meshStride);
+    if (!r.ok) return r;
+
+    if (options.heightmapFormat == HeightmapFormat::r16) {
+        const std::uint32_t w = r.width;
+        const std::uint32_t h = r.height;
+        const std::size_t n = std::size_t(w) * h;
+        std::vector<float> heights(n);
+        GraphEvalResult rawEval =
+            graph_evaluate_heights(g, options.sinkId, w, h, heights.data(), heights.size());
+        if (!rawEval.ok) return rawEval;
+        const std::string rawPath = (dir / (base + "_height.r16")).string();
+        if (!writeR16(rawPath.c_str(), heights.data(), w, h,
+                      rawEval.minHeight, rawEval.maxHeight, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::exportError;
+            GraphEvalResult failed = rawEval;
+            failed.ok = false;
+            return failed;
+        }
+    }
     return r;
 }
 
@@ -659,6 +847,10 @@ double graph_default_param_value(const char* type, const char* key,
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap) {
     static const std::string empty;
     return copyOutStr(g ? g->lastError : empty, out, cap);
+}
+
+GraphErrorCode graph_last_error_code(GraphHandle* g) {
+    return g ? g->lastErrorCode : GraphErrorCode::none;
 }
 
 std::size_t node_type_list(char* out, std::size_t cap) {

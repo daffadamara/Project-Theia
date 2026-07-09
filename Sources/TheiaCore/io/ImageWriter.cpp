@@ -167,6 +167,35 @@ bool writePNG16(const char* path, const float* data,
     return ok;
 }
 
+bool writeR16(const char* path, const float* data,
+              std::uint32_t width, std::uint32_t height,
+              float minV, float maxV, std::string& error) {
+    if (!data || width == 0 || height == 0) {
+        error = "writeR16: empty image";
+        return false;
+    }
+    FILE* f = std::fopen(path, "wb");
+    if (!f) {
+        error = std::string("writeR16: cannot open ") + path;
+        return false;
+    }
+
+    const float range = (maxV > minV) ? (maxV - minV) : 1.0f;
+    std::vector<unsigned char> bytes(std::size_t(width) * height * 2);
+    for (std::size_t i = 0, j = 0; i < std::size_t(width) * height; ++i, j += 2) {
+        float t = (data[i] - minV) / range;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        const std::uint16_t v = static_cast<std::uint16_t>(t * 65535.0f + 0.5f);
+        bytes[j] = static_cast<unsigned char>(v & 0xFF);
+        bytes[j + 1] = static_cast<unsigned char>((v >> 8) & 0xFF);
+    }
+
+    const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    std::fclose(f);
+    if (!ok) error = "writeR16: short write";
+    return ok;
+}
+
 bool writePNG8RGB(const char* path, const unsigned char* rgb,
                   std::uint32_t width, std::uint32_t height,
                   std::string& error) {

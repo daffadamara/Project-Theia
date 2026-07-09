@@ -14,6 +14,14 @@
 
 namespace theia {
 
+// --- Version / capability surface -------------------------------------------
+
+// Project version and API version for CLI, viewer, and automation callers.
+// The API is stable for SwiftPM/Swift-C++ interop, but is not yet a public C ABI.
+std::size_t theia_version_string(char* out, std::size_t cap);
+std::uint32_t theia_api_version();
+std::size_t theia_capabilities_json(char* out, std::size_t cap);
+
 // Result of the M0 GPU smoke test: compile a tiny kernel at runtime, run it,
 // and read the result back. Proves the metal-cpp + runtime-MSL + Swift/C++
 // interop toolchain works end-to-end without full Xcode.
@@ -117,6 +125,15 @@ struct GraphEvalResult {
     double variance = 0.0;
 };
 
+enum class GraphErrorCode : std::uint32_t {
+    none = 0,
+    usage = 1,
+    load = 2,
+    validation = 3,
+    evaluation = 4,
+    exportError = 5
+};
+
 // Evaluate `sinkId` at `width` x `height`. Pass sinkId == nullptr/"" to use the
 // graph's default sink, and width/height == 0 to use the graph's default
 // resolution (both come from loaded JSON). Optionally writes PNG/PFM (nullptr to
@@ -127,6 +144,7 @@ GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
                                const char* pngPath, const char* pfmPath);
 
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap);
+GraphErrorCode graph_last_error_code(GraphHandle* g);
 
 // Like graph_evaluate, but instead of writing image files it copies the sink's
 // heightfield into `dst` (row-major float, width*height elements) when `dst` is
@@ -148,6 +166,37 @@ GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
                              const char* objPath,
                              float verticalScale,
                              std::uint32_t meshStride);
+
+enum class HeightmapFormat : std::uint32_t {
+    none = 0,
+    png16 = 1,
+    r16 = 2,
+    pfm32 = 3
+};
+
+enum class MeshFormat : std::uint32_t {
+    none = 0,
+    obj = 1
+};
+
+struct GraphExportOptions {
+    const char* sinkId = nullptr;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    const char* outDir = nullptr;
+    const char* basename = nullptr;
+    HeightmapFormat heightmapFormat = HeightmapFormat::png16;
+    MeshFormat meshFormat = MeshFormat::obj;
+    float verticalScale = 1.0f;
+    std::uint32_t meshStride = 1;
+};
+
+// Structured export helper. Writes engine-facing heightmap and mesh outputs:
+//   png16 -> <basename>_height.png
+//   r16   -> <basename>_height.r16 (little-endian unsigned 16-bit)
+//   pfm32 -> <basename>.pfm
+//   obj   -> <basename>.obj
+GraphEvalResult graph_export2(GraphHandle* g, const GraphExportOptions& options);
 
 // Node/parameter enumeration for the viewer inspector. Strings use the same
 // copy-into-caller-buffer convention as the other Swift-facing accessors.

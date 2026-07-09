@@ -1,11 +1,22 @@
-// Theia CLI — the thin Swift "shell" over the C++ core (TheiaCore), called
-// through Swift/C++ interop.
+// Theia CLI: thin Swift shell over the C++ core through Swift/C++ interop.
 
 import Foundation
 import TheiaCore
 
-// std::string does not bridge to Swift.String on this toolchain, so the C++
-// core hands strings back by copying into a caller buffer. This wraps that.
+private struct GlobalOptions {
+    var json = false
+    var quiet = false
+    var noColor = false
+    var verbose = false
+    var help = false
+    var version = false
+}
+
+private enum CLIError: Error {
+    case usage(String)
+    case runtime(String)
+}
+
 private func readCxxString(
     _ accessor: (UnsafeMutablePointer<CChar>?, Int) -> Int
 ) -> String {
@@ -30,238 +41,638 @@ private func readCxxLongString(
     }
 }
 
-func usage() {
-    print("""
-    theia — node-based procedural terrain generator (core CLI)
+private func theiaVersion() -> String {
+    readCxxString { theia.theia_version_string($0, $1) }
+}
+
+private func printErr(_ message: String) {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+}
+
+private func emitJSON(_ object: Any) {
+    guard JSONSerialization.isValidJSONObject(object),
+          let data = try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys]
+          ),
+          let text = String(data: data, encoding: .utf8) else {
+        print("{}")
+        return
+    }
+    print(text)
+}
+
+private func emitJSONText(_ text: String) {
+    if let data = text.data(using: .utf8),
+       (try? JSONSerialization.jsonObject(with: data)) != nil {
+        print(text)
+    } else {
+        emitJSON(["ok": false, "error": ["message": "invalid JSON text"]])
+    }
+}
+
+private func statsObject(_ r: theia.GraphEvalResult) -> [String: Any] {
+    [
+        "ok": r.ok,
+        "width": Int(r.width),
+        "height": Int(r.height),
+        "evaluated": Int(r.evaluated),
+        "reused": Int(r.reused),
+        "minHeight": Double(r.minHeight),
+        "maxHeight": Double(r.maxHeight),
+        "mean": Double(r.mean),
+        "variance": Double(r.variance),
+    ]
+}
+
+private func usage() -> String {
+    """
+    theia-cli 0.9.0-alpha.1
 
     USAGE:
-      theia-cli smoke [count] [value]   Run the GPU compute smoke test.
-                                        Defaults: count=1024, value=42.0
+      theia-cli [--json] [--quiet] [--no-color] [--verbose] COMMAND [ARGS]
 
-      theia-cli demo [--size N] [--out PATH] [--seed S]
-                                        Generate an fBm Perlin heightfield and
-                                        write a PNG preview + PFM float export.
-                                        Defaults: size=1024, out=terrain.png, seed=1337
+    COMMANDS:
+      version                         Print CLI/core version.
+      doctor                          Check core capabilities and Metal smoke test.
+      nodes [--json]                  List registered node types.
+      diagnose GRAPH.json [--sink ID] Analyze graph health.
+      run GRAPH.json [--sink ID] [--size N] [--out PATH]
+                                      Evaluate a graph to PNG16 + PFM.
+      export GRAPH.json [--sink ID] [--size N] [--out-dir DIR]
+             [--basename NAME] [--heightmap png16|r16|pfm32|none]
+             [--mesh obj|none] [--vertical-scale V] [--mesh-stride S]
+                                      Export engine-ready heightmap and mesh.
+      smoke [count] [value]           Run the Metal smoke test.
+      demo [--size N] [--out PATH] [--seed S]
+                                      Generate standalone Perlin terrain.
 
-      theia-cli run GRAPH.json [--sink ID] [--size N] [--out PATH]
-                                        Evaluate a node graph and write outputs.
-                                        sink/size default to values in the JSON.
-                                        Default out=terrain.png
-
-      theia-cli export GRAPH.json [--sink ID] [--size N]
-                       [--out-dir DIR] [--basename NAME]
-                       [--maps height,pfm,normal,slope,mask]
-                       [--mesh obj] [--vertical-scale V] [--mesh-stride S]
-                                        Write production maps and/or OBJ mesh.
-
-      theia-cli diagnose GRAPH.json [--sink ID]
-                                        Analyze graph authoring health and print
-                                        errors/warnings without evaluating.
-
-      theia-cli nodes                   List available node types.
-
-    """)
+    LEGACY:
+      export still accepts --maps height,pfm,normal,slope,mask as a temporary
+      alias for the Phase 6 multi-map exporter.
+    """
 }
 
-func runGraph(jsonPath: String, sink: String, size: UInt32, outPNG: String) -> Int32 {
+private func splitGlobalArgs(_ raw: [String]) -> (GlobalOptions, [String]) {
+    var options = GlobalOptions()
+    var commandArgs: [String] = []
+    for arg in raw {
+        switch arg {
+        case "--json":
+            options.json = true
+        case "--quiet":
+            options.quiet = true
+        case "--no-color":
+            options.noColor = true
+        case "--verbose":
+            options.verbose = true
+        case "-h", "--help":
+            options.help = true
+        case "--version":
+            options.version = true
+        default:
+            commandArgs.append(arg)
+        }
+    }
+    return (options, commandArgs)
+}
+
+private func requireValue(_ args: [String], _ index: Int, _ flag: String) throws -> String {
+    guard index + 1 < args.count else {
+        throw CLIError.usage("\(flag) requires a value")
+    }
+    let value = args[index + 1]
+    guard !value.hasPrefix("--") else {
+        throw CLIError.usage("\(flag) requires a value")
+    }
+    return value
+}
+
+private func parseUInt32(_ text: String, flag: String, min: UInt32 = 0) throws -> UInt32 {
+    guard let value = UInt32(text), value >= min else {
+        throw CLIError.usage("\(flag) must be an integer >= \(min)")
+    }
+    return value
+}
+
+private func parseFloat(_ text: String, flag: String, minExclusive: Float? = nil) throws -> Float {
+    guard let value = Float(text), value.isFinite else {
+        throw CLIError.usage("\(flag) must be a finite number")
+    }
+    if let minExclusive, !(value > minExclusive) {
+        throw CLIError.usage("\(flag) must be > \(minExclusive)")
+    }
+    return value
+}
+
+private func loadGraph(path: String) throws -> OpaquePointer {
     guard let g = theia.graph_create() else {
-        print("❌ failed to create graph")
-        return 1
+        throw CLIError.runtime("failed to create graph")
     }
-    defer { theia.graph_destroy(g) }
-
-    if !theia.graph_load_json_file(g, jsonPath) {
+    guard theia.graph_load_json_file(g, path) else {
         let err = readCxxString { theia.graph_last_error(g, $0, $1) }
-        print("❌ failed to load \(jsonPath): \(err)")
-        return 1
+        theia.graph_destroy(g)
+        throw CLIError.runtime("failed to load \(path): \(err)")
     }
+    return g
+}
 
-    let pfmPath = outPNG.hasSuffix(".png")
-        ? String(outPNG.dropLast(4)) + ".pfm"
-        : outPNG + ".pfm"
+private func capabilitiesObject() -> [String: Any] {
+    let text = readCxxLongString { theia.theia_capabilities_json($0, $1) }
+    guard let data = text.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          let dict = object as? [String: Any] else {
+        return [:]
+    }
+    return dict
+}
 
-    let r = theia.graph_evaluate(g, sink, size, size, outPNG, pfmPath)
-    if r.ok {
-        print("✅ Evaluated graph \(jsonPath)")
-        print("   resolution:   \(r.width)x\(r.height)")
-        print("   nodes run:    \(r.evaluated) (reused \(r.reused) from cache)")
-        print("   height range: [\(r.minHeight), \(r.maxHeight)]")
-        print("   mean / var:   \(r.mean) / \(r.variance)")
-        print("   PNG preview:  \(outPNG)")
-        print("   PFM export:   \(pfmPath)")
-        return 0
-    } else {
-        let err = readCxxString { theia.graph_last_error(g, $0, $1) }
-        print("❌ Evaluation FAILED: \(err)")
-        return 1
+private func nodeCatalog() -> [[String: Any]] {
+    let types = readCxxString { theia.node_type_list($0, $1) }
+        .split(separator: ",")
+        .map(String.init)
+        .filter { !$0.isEmpty }
+
+    return types.map { type in
+        let count = theia.graph_default_param_count(type)
+        let params: [[String: Any]] = (0..<count).map { index in
+            let name = readCxxString {
+                theia.graph_default_param_name(type, index, $0, $1)
+            }
+            let value = theia.graph_default_param_value(type, name, 0.0)
+            return ["name": name, "default": value]
+        }
+        return [
+            "type": type,
+            "inputs": Int(theia.graph_node_type_input_count(type)),
+            "defaultParams": params,
+        ]
     }
 }
 
-func runDemo(size: UInt32, outPNG: String, seed: UInt32) -> Int32 {
+private func printNodeCatalog(json: Bool, quiet: Bool) {
+    let catalog = nodeCatalog()
+    if json {
+        emitJSON(["nodes": catalog])
+        return
+    }
+    guard !quiet else { return }
+    print("Available node types")
+    for item in catalog {
+        let type = item["type"] as? String ?? ""
+        let inputs = item["inputs"] as? Int ?? 0
+        let params = item["defaultParams"] as? [[String: Any]] ?? []
+        let names = params.compactMap { $0["name"] as? String }.joined(separator: ", ")
+        print("  \(type)  inputs=\(inputs)\(names.isEmpty ? "" : "  params=\(names)")")
+    }
+}
+
+private func commandVersion(options: GlobalOptions) -> Int32 {
+    let version = theiaVersion()
+    let apiVersion = Int(theia.theia_api_version())
+    if options.json {
+        emitJSON([
+            "version": version,
+            "apiVersion": apiVersion,
+            "capabilities": capabilitiesObject(),
+        ])
+    } else if !options.quiet {
+        print("Theia \(version)")
+        print("API \(apiVersion)")
+    }
+    return 0
+}
+
+private func commandDoctor(options: GlobalOptions) -> Int32 {
+    let smoke = theia.gpu_smoke_fill(16, 1.0)
+    let device = readCxxString { theia.smoke_device_name(smoke, $0, $1) }
+    let error = readCxxString { theia.smoke_error(smoke, $0, $1) }
+    if options.json {
+        emitJSON([
+            "ok": smoke.ok,
+            "version": theiaVersion(),
+            "apiVersion": Int(theia.theia_api_version()),
+            "device": device,
+            "metalSmoke": [
+                "ok": smoke.ok,
+                "count": Int(smoke.count),
+                "allMatch": smoke.allMatch,
+                "error": error,
+            ],
+            "capabilities": capabilitiesObject(),
+        ])
+    } else if !options.quiet {
+        print("Theia doctor")
+        print("  version: \(theiaVersion())")
+        print("  api:     \(theia.theia_api_version())")
+        print("  device:  \(device.isEmpty ? "<none>" : device)")
+        print("  metal:   \(smoke.ok ? "ok" : "failed")")
+        if !smoke.ok { print("  error:   \(error)") }
+    }
+    return smoke.ok ? 0 : 1
+}
+
+private func commandSmoke(args: [String], options: GlobalOptions) throws -> Int32 {
+    var count: UInt32 = 1024
+    var value: Float = 42.0
+    if args.count > 2 {
+        throw CLIError.usage("usage: theia-cli smoke [count] [value]")
+    }
+    if args.count >= 1 {
+        count = try parseUInt32(args[0], flag: "count")
+    }
+    if args.count == 2 {
+        value = try parseFloat(args[1], flag: "value")
+    }
+    let r = theia.gpu_smoke_fill(count, value)
+    let device = readCxxString { theia.smoke_device_name(r, $0, $1) }
+    let err = readCxxString { theia.smoke_error(r, $0, $1) }
+    if options.json {
+        emitJSON([
+            "ok": r.ok,
+            "device": device,
+            "count": Int(r.count),
+            "value": value,
+            "first": r.first,
+            "last": r.last,
+            "allMatch": r.allMatch,
+            "error": err,
+        ])
+    } else if !options.quiet {
+        print(r.ok ? "GPU smoke test passed" : "GPU smoke test failed")
+        print("  device: \(device.isEmpty ? "<none>" : device)")
+        print("  count:  \(r.count)")
+        print("  value:  \(value)")
+        if !r.ok { print("  error:  \(err)") }
+    }
+    return r.ok ? 0 : 1
+}
+
+private func commandDemo(args: [String], options: GlobalOptions) throws -> Int32 {
+    var size: UInt32 = 1024
+    var out = "terrain.png"
+    var seed: UInt32 = 1337
+    var i = 0
+    while i < args.count {
+        switch args[i] {
+        case "--size":
+            size = try parseUInt32(try requireValue(args, i, "--size"), flag: "--size", min: 2)
+            i += 2
+        case "--out":
+            out = try requireValue(args, i, "--out")
+            i += 2
+        case "--seed":
+            seed = try parseUInt32(try requireValue(args, i, "--seed"), flag: "--seed")
+            i += 2
+        default:
+            throw CLIError.usage("unknown option for demo: \(args[i])")
+        }
+    }
+
     var params = theia.PerlinParams()
     params.width = size
     params.height = size
     params.seed = seed
+    let pfm = out.hasSuffix(".png") ? String(out.dropLast(4)) + ".pfm" : out + ".pfm"
+    let r = theia.generate_perlin(params, out, pfm)
+    let err = readCxxString { theia.generate_error(r, $0, $1) }
+    if options.json {
+        emitJSON([
+            "ok": r.ok,
+            "stats": [
+                "width": Int(r.width),
+                "height": Int(r.height),
+                "minHeight": Double(r.minHeight),
+                "maxHeight": Double(r.maxHeight),
+                "mean": Double(r.mean),
+                "variance": Double(r.variance),
+            ],
+            "paths": ["png": out, "pfm": pfm],
+            "error": err,
+        ])
+    } else if !options.quiet {
+        print(r.ok ? "Generated \(r.width)x\(r.height) Perlin terrain" : "Generation failed")
+        if r.ok {
+            print("  height range: [\(r.minHeight), \(r.maxHeight)]")
+            print("  PNG: \(out)")
+            print("  PFM: \(pfm)")
+        } else {
+            print("  error: \(err)")
+        }
+    }
+    return r.ok ? 0 : 1
+}
 
-    let pfmPath = outPNG.hasSuffix(".png")
-        ? String(outPNG.dropLast(4)) + ".pfm"
-        : outPNG + ".pfm"
+private func commandRun(args: [String], options: GlobalOptions) throws -> Int32 {
+    guard let path = args.first, !path.hasPrefix("--") else {
+        throw CLIError.usage("usage: theia-cli run GRAPH.json [--sink ID] [--size N] [--out PATH]")
+    }
+    var sink = ""
+    var size: UInt32 = 0
+    var out = "terrain.png"
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--sink":
+            sink = try requireValue(args, i, "--sink")
+            i += 2
+        case "--size":
+            size = try parseUInt32(try requireValue(args, i, "--size"), flag: "--size")
+            i += 2
+        case "--out":
+            out = try requireValue(args, i, "--out")
+            i += 2
+        default:
+            throw CLIError.usage("unknown option for run: \(args[i])")
+        }
+    }
 
-    let r = theia.generate_perlin(params, outPNG, pfmPath)
-    if r.ok {
-        print("✅ Generated \(r.width)x\(r.height) Perlin fBm terrain")
-        print("   height range: [\(r.minHeight), \(r.maxHeight)]")
-        print("   mean:         \(r.mean)")
-        print("   variance:     \(r.variance)")
-        print("   PNG preview:  \(outPNG)")
-        print("   PFM export:   \(pfmPath)")
-        return 0
-    } else {
-        let err = readCxxString { theia.generate_error(r, $0, $1) }
-        print("❌ Generation FAILED: \(err)")
-        return 1
+    let pfm = out.hasSuffix(".png") ? String(out.dropLast(4)) + ".pfm" : out + ".pfm"
+    let g = try loadGraph(path: path)
+    defer { theia.graph_destroy(g) }
+    let r = theia.graph_evaluate(g, sink, size, size, out, pfm)
+    let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+    if options.json {
+        emitJSON([
+            "ok": r.ok,
+            "graph": path,
+            "sink": sink.isEmpty ? NSNull() : sink,
+            "stats": statsObject(r),
+            "paths": ["png": out, "pfm": pfm],
+            "error": err,
+        ])
+    } else if !options.quiet {
+        print(r.ok ? "Evaluated graph \(path)" : "Evaluation failed")
+        if r.ok {
+            print("  resolution: \(r.width)x\(r.height)")
+            print("  nodes run:  \(r.evaluated) (reused \(r.reused))")
+            print("  range:      [\(r.minHeight), \(r.maxHeight)]")
+            print("  PNG:        \(out)")
+            print("  PFM:        \(pfm)")
+        } else {
+            print("  error: \(err)")
+        }
+    }
+    return r.ok ? 0 : 1
+}
+
+private func graphExport2(
+    graph: OpaquePointer,
+    sink: String,
+    size: UInt32,
+    outDir: String,
+    basename: String,
+    heightmap: String,
+    mesh: String,
+    verticalScale: Float,
+    meshStride: UInt32
+) -> theia.GraphEvalResult {
+    func heightFormat(_ value: String) -> theia.HeightmapFormat {
+        switch value {
+        case "none": return theia.HeightmapFormat.none
+        case "png16": return theia.HeightmapFormat.png16
+        case "r16": return theia.HeightmapFormat.r16
+        case "pfm32": return theia.HeightmapFormat.pfm32
+        default: return theia.HeightmapFormat.none
+        }
+    }
+    func meshFormat(_ value: String) -> theia.MeshFormat {
+        switch value {
+        case "none": return theia.MeshFormat.none
+        case "obj": return theia.MeshFormat.obj
+        default: return theia.MeshFormat.none
+        }
+    }
+    return outDir.withCString { outPtr in
+        basename.withCString { basePtr in
+            if sink.isEmpty {
+                var opts = theia.GraphExportOptions()
+                opts.sinkId = nil
+                opts.width = size
+                opts.height = size
+                opts.outDir = outPtr
+                opts.basename = basePtr
+                opts.heightmapFormat = heightFormat(heightmap)
+                opts.meshFormat = meshFormat(mesh)
+                opts.verticalScale = verticalScale
+                opts.meshStride = meshStride
+                return theia.graph_export2(graph, opts)
+            }
+            return sink.withCString { sinkPtr in
+                var opts = theia.GraphExportOptions()
+                opts.sinkId = sinkPtr
+                opts.width = size
+                opts.height = size
+                opts.outDir = outPtr
+                opts.basename = basePtr
+                opts.heightmapFormat = heightFormat(heightmap)
+                opts.meshFormat = meshFormat(mesh)
+                opts.verticalScale = verticalScale
+                opts.meshStride = meshStride
+                return theia.graph_export2(graph, opts)
+            }
+        }
     }
 }
 
-func runExport(jsonPath: String, sink: String, size: UInt32, outDir: String,
-               basename: String, maps: Set<String>, mesh: String,
-               verticalScale: Float, meshStride: UInt32) -> Int32 {
-    guard size >= 2 else {
-        print("❌ export size must be >= 2")
-        return 2
+private func commandExport(args: [String], options: GlobalOptions) throws -> Int32 {
+    guard let path = args.first, !path.hasPrefix("--") else {
+        throw CLIError.usage("usage: theia-cli export GRAPH.json [--heightmap png16|r16|pfm32|none] [--mesh obj|none]")
     }
-    guard meshStride > 0 else {
-        print("❌ mesh stride must be > 0")
-        return 2
-    }
-    guard verticalScale > 0 else {
-        print("❌ vertical scale must be > 0")
-        return 2
+    var sink = ""
+    var size: UInt32 = 1024
+    var outDir = "."
+    var basename = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+    var heightmap = "png16"
+    var mesh = "obj"
+    var legacyMaps: Set<String>?
+    var verticalScale: Float = 1.0
+    var meshStride: UInt32 = 1
+
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--sink":
+            sink = try requireValue(args, i, "--sink")
+            i += 2
+        case "--size":
+            size = try parseUInt32(try requireValue(args, i, "--size"), flag: "--size", min: 2)
+            i += 2
+        case "--out-dir":
+            outDir = try requireValue(args, i, "--out-dir")
+            i += 2
+        case "--basename":
+            basename = try requireValue(args, i, "--basename")
+            i += 2
+        case "--heightmap":
+            heightmap = try requireValue(args, i, "--heightmap")
+            guard ["png16", "r16", "pfm32", "none"].contains(heightmap) else {
+                throw CLIError.usage("--heightmap must be png16, r16, pfm32, or none")
+            }
+            i += 2
+        case "--mesh":
+            mesh = try requireValue(args, i, "--mesh")
+            guard ["obj", "none"].contains(mesh) else {
+                throw CLIError.usage("--mesh must be obj or none")
+            }
+            i += 2
+        case "--maps":
+            let value = try requireValue(args, i, "--maps")
+            legacyMaps = Set(value.split(separator: ",").map(String.init))
+            i += 2
+        case "--vertical-scale":
+            verticalScale = try parseFloat(
+                try requireValue(args, i, "--vertical-scale"),
+                flag: "--vertical-scale",
+                minExclusive: 0
+            )
+            i += 2
+        case "--mesh-stride":
+            meshStride = try parseUInt32(
+                try requireValue(args, i, "--mesh-stride"),
+                flag: "--mesh-stride",
+                min: 1
+            )
+            i += 2
+        default:
+            throw CLIError.usage("unknown option for export: \(args[i])")
+        }
     }
 
-    let knownMaps: Set<String> = ["height", "pfm", "normal", "slope", "mask"]
-    let unknownMaps = maps.subtracting(knownMaps)
-    guard unknownMaps.isEmpty else {
-        print("❌ unknown map(s): \(unknownMaps.sorted().joined(separator: ","))")
-        return 2
-    }
-    guard mesh.isEmpty || mesh == "obj" else {
-        print("❌ unknown mesh format: \(mesh)")
-        return 2
-    }
-    guard !maps.isEmpty || mesh == "obj" else {
-        print("❌ choose at least one map or --mesh obj")
-        return 2
+    if heightmap == "none" && mesh == "none" && legacyMaps == nil {
+        throw CLIError.usage("choose at least one export output")
     }
 
-    do {
-        try FileManager.default.createDirectory(atPath: outDir,
-                                                withIntermediateDirectories: true)
-    } catch {
-        print("❌ cannot create \(outDir): \(error.localizedDescription)")
-        return 1
-    }
-
-    guard let g = theia.graph_create() else {
-        print("❌ failed to create graph")
-        return 1
-    }
+    let g = try loadGraph(path: path)
     defer { theia.graph_destroy(g) }
 
-    if !theia.graph_load_json_file(g, jsonPath) {
-        let err = readCxxString { theia.graph_last_error(g, $0, $1) }
-        print("❌ failed to load \(jsonPath): \(err)")
-        return 1
+    let dirURL = URL(fileURLWithPath: outDir)
+    func file(_ suffix: String) -> String {
+        dirURL.appendingPathComponent("\(basename)\(suffix)").path
     }
 
-    func path(_ suffix: String) -> String {
-        URL(fileURLWithPath: outDir).appendingPathComponent("\(basename)\(suffix)").path
-    }
-    let heightPath = maps.contains("height") ? path("_height.png") : ""
-    let pfmPath = maps.contains("pfm") ? path(".pfm") : ""
-    let normalPath = maps.contains("normal") ? path("_normal.png") : ""
-    let slopePath = maps.contains("slope") ? path("_slope.png") : ""
-    let maskPath = maps.contains("mask") ? path("_mask.png") : ""
-    let objPath = mesh == "obj" ? path(".obj") : ""
-
-    let r = theia.graph_export(g, sink, size, size, heightPath, pfmPath,
-                               normalPath, slopePath, maskPath, objPath,
+    let r: theia.GraphEvalResult
+    var paths: [String: String] = [:]
+    if let legacyMaps {
+        let knownMaps: Set<String> = ["height", "pfm", "normal", "slope", "mask"]
+        let unknown = legacyMaps.subtracting(knownMaps)
+        guard unknown.isEmpty else {
+            throw CLIError.usage("unknown map(s): \(unknown.sorted().joined(separator: ","))")
+        }
+        let height = legacyMaps.contains("height") ? file("_height.png") : ""
+        let pfm = legacyMaps.contains("pfm") ? file(".pfm") : ""
+        let normal = legacyMaps.contains("normal") ? file("_normal.png") : ""
+        let slope = legacyMaps.contains("slope") ? file("_slope.png") : ""
+        let mask = legacyMaps.contains("mask") ? file("_mask.png") : ""
+        let obj = mesh == "obj" ? file(".obj") : ""
+        r = theia.graph_export(g, sink, size, size, height, pfm, normal, slope, mask, obj,
                                verticalScale, meshStride)
-    guard r.ok else {
-        let err = readCxxString { theia.graph_last_error(g, $0, $1) }
-        print("❌ Export FAILED: \(err)")
-        return 1
+        if !height.isEmpty { paths["height"] = height }
+        if !pfm.isEmpty { paths["pfm"] = pfm }
+        if !normal.isEmpty { paths["normal"] = normal }
+        if !slope.isEmpty { paths["slope"] = slope }
+        if !mask.isEmpty { paths["mask"] = mask }
+        if !obj.isEmpty { paths["obj"] = obj }
+    } else {
+        r = graphExport2(graph: g, sink: sink, size: size, outDir: outDir,
+                         basename: basename, heightmap: heightmap, mesh: mesh,
+                         verticalScale: verticalScale, meshStride: meshStride)
+        switch heightmap {
+        case "png16": paths["heightmap"] = file("_height.png")
+        case "r16": paths["heightmap"] = file("_height.r16")
+        case "pfm32": paths["heightmap"] = file(".pfm")
+        default: break
+        }
+        if mesh == "obj" { paths["mesh"] = file(".obj") }
     }
 
-    print("✅ Exported graph \(jsonPath)")
-    print("   resolution:   \(r.width)x\(r.height)")
-    print("   sink:         \(sink.isEmpty ? "<default>" : sink)")
-    print("   height range: [\(r.minHeight), \(r.maxHeight)]")
-    if !heightPath.isEmpty { print("   height PNG:   \(heightPath)") }
-    if !pfmPath.isEmpty { print("   PFM:          \(pfmPath)") }
-    if !normalPath.isEmpty { print("   normal PNG:   \(normalPath)") }
-    if !slopePath.isEmpty { print("   slope PNG:    \(slopePath)") }
-    if !maskPath.isEmpty { print("   mask PNG:     \(maskPath)") }
-    if !objPath.isEmpty { print("   OBJ:          \(objPath)") }
-    return 0
+    let err = readCxxString { theia.graph_last_error(g, $0, $1) }
+    if options.json {
+        emitJSON([
+            "ok": r.ok,
+            "graph": path,
+            "sink": sink.isEmpty ? NSNull() : sink,
+            "stats": statsObject(r),
+            "paths": paths,
+            "error": err,
+        ])
+    } else if !options.quiet {
+        print(r.ok ? "Exported graph \(path)" : "Export failed")
+        if r.ok {
+            print("  resolution: \(r.width)x\(r.height)")
+            print("  sink:       \(sink.isEmpty ? "<default>" : sink)")
+            print("  range:      [\(r.minHeight), \(r.maxHeight)]")
+            for key in paths.keys.sorted() {
+                print("  \(key): \(paths[key] ?? "")")
+            }
+        } else {
+            print("  error: \(err)")
+        }
+    }
+    return r.ok ? 0 : 1
 }
 
-func runDiagnose(jsonPath: String, sink: String) -> Int32 {
-    let sourceText: String
-    do {
-        sourceText = try String(contentsOfFile: jsonPath, encoding: .utf8)
-    } catch {
-        print("❌ cannot read \(jsonPath): \(error.localizedDescription)")
-        return 1
+private func diagnosticSource(path: String, sink: String) throws -> String {
+    let text = try String(contentsOfFile: path, encoding: .utf8)
+    guard !sink.isEmpty,
+          let data = text.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          var dict = object as? [String: Any],
+          JSONSerialization.isValidJSONObject(dict) else {
+        return text
     }
+    dict["sink"] = sink
+    guard let encoded = try? JSONSerialization.data(withJSONObject: dict),
+          let updated = String(data: encoded, encoding: .utf8) else {
+        return text
+    }
+    return updated
+}
 
-    let diagnosticText: String
-    if sink.isEmpty {
-        diagnosticText = sourceText
-    } else if let data = sourceText.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              var dict = object as? [String: Any],
-              JSONSerialization.isValidJSONObject(dict) {
-        dict["sink"] = sink
-        if let encoded = try? JSONSerialization.data(withJSONObject: dict, options: []),
-           let text = String(data: encoded, encoding: .utf8) {
-            diagnosticText = text
-        } else {
-            diagnosticText = sourceText
+private func commandDiagnose(args: [String], options: GlobalOptions) throws -> Int32 {
+    guard let path = args.first, !path.hasPrefix("--") else {
+        throw CLIError.usage("usage: theia-cli diagnose GRAPH.json [--sink ID]")
+    }
+    var sink = ""
+    var i = 1
+    while i < args.count {
+        switch args[i] {
+        case "--sink":
+            sink = try requireValue(args, i, "--sink")
+            i += 2
+        default:
+            throw CLIError.usage("unknown option for diagnose: \(args[i])")
         }
-    } else {
-        diagnosticText = sourceText
     }
 
-    let jsonText = readCxxLongString {
-        theia.graph_diagnostics_json_text(diagnosticText, $0, $1)
-    }
+    let source = try diagnosticSource(path: path, sink: sink)
+    let jsonText = readCxxLongString { theia.graph_diagnostics_json_text(source, $0, $1) }
     guard let data = jsonText.data(using: .utf8),
           let object = try? JSONSerialization.jsonObject(with: data),
           let root = object as? [String: Any],
           let summary = root["summary"] as? [String: Any],
           let issues = root["issues"] as? [[String: Any]] else {
-        print("❌ diagnostics failed to return readable JSON")
-        return 1
+        throw CLIError.runtime("diagnostics failed to return readable JSON")
     }
 
+    if options.json {
+        emitJSONText(jsonText)
+        return ((summary["errors"] as? Int) ?? 0) > 0 ? 1 : 0
+    }
+    guard !options.quiet else {
+        return ((summary["errors"] as? Int) ?? 0) > 0 ? 1 : 0
+    }
     let errors = summary["errors"] as? Int ?? 0
     let warnings = summary["warnings"] as? Int ?? 0
     let nodes = summary["nodes"] as? Int ?? 0
     let connections = summary["connections"] as? Int ?? 0
     let activeSink = summary["sink"] as? String ?? ""
-
-    if errors == 0 {
-        print("✅ Graph diagnostics OK")
-    } else {
-        print("❌ Graph diagnostics found \(errors) error\(errors == 1 ? "" : "s")")
-    }
-    print("   graph:       \(jsonPath)")
-    print("   sink:        \(activeSink.isEmpty ? "<none>" : activeSink)")
-    print("   nodes:       \(nodes)")
-    print("   connections: \(connections)")
-    print("   warnings:    \(warnings)")
-
+    print(errors == 0 ? "Graph diagnostics OK" : "Graph diagnostics found \(errors) error\(errors == 1 ? "" : "s")")
+    print("  graph:       \(path)")
+    print("  sink:        \(activeSink.isEmpty ? "<none>" : activeSink)")
+    print("  nodes:       \(nodes)")
+    print("  connections: \(connections)")
+    print("  warnings:    \(warnings)")
     for issue in issues {
         let severity = issue["severity"] as? String ?? "info"
         let code = issue["code"] as? String ?? "issue"
@@ -269,154 +680,85 @@ func runDiagnose(jsonPath: String, sink: String) -> Int32 {
         let node = issue["node"] as? String
         let input = issue["input"] as? Int
         var location = ""
-        if let node {
-            location += " node=\(node)"
-        }
-        if let input {
-            location += " input=\(input)"
-        }
-        let icon = severity == "error" ? "❌" : "⚠️"
-        print("   \(icon) \(severity) \(code)\(location): \(message)")
+        if let node { location += " node=\(node)" }
+        if let input { location += " input=\(input)" }
+        print("  \(severity) \(code)\(location): \(message)")
     }
-
     return errors > 0 ? 1 : 0
 }
 
-func runSmoke(count: UInt32, value: Float) -> Int32 {
-    let r = theia.gpu_smoke_fill(count, value)
-    let device = readCxxString { theia.smoke_device_name(r, $0, $1) }
+private func runMain() -> Int32 {
+    let (options, args) = splitGlobalArgs(Array(CommandLine.arguments.dropFirst()))
+    if options.version && args.isEmpty {
+        return commandVersion(options: options)
+    }
+    if options.help || args.isEmpty {
+        if options.json {
+            emitJSON(["usage": usage()])
+        } else {
+            print(usage())
+        }
+        return options.help ? 0 : 2
+    }
 
-    if r.ok {
-        print("✅ GPU smoke test passed")
-        print("   device:     \(device)")
-        print("   count:      \(r.count)")
-        print("   value:      \(value)")
-        print("   out[0]:     \(r.first)")
-        print("   out[last]:  \(r.last)")
-        print("   all match:  \(r.allMatch)")
-        return 0
-    } else {
-        let err = readCxxString { theia.smoke_error(r, $0, $1) }
-        print("❌ GPU smoke test FAILED")
-        print("   device: \(device.isEmpty ? "<none>" : device)")
-        print("   error:  \(err)")
+    let command = args[0]
+    let commandArgs = Array(args.dropFirst())
+    do {
+        switch command {
+        case "version":
+            if !commandArgs.isEmpty {
+                throw CLIError.usage("usage: theia-cli version")
+            }
+            return commandVersion(options: options)
+        case "doctor":
+            if !commandArgs.isEmpty {
+                throw CLIError.usage("usage: theia-cli doctor")
+            }
+            return commandDoctor(options: options)
+        case "nodes":
+            if !commandArgs.isEmpty {
+                throw CLIError.usage("usage: theia-cli nodes [--json]")
+            }
+            printNodeCatalog(json: options.json, quiet: options.quiet)
+            return 0
+        case "smoke":
+            return try commandSmoke(args: commandArgs, options: options)
+        case "demo":
+            return try commandDemo(args: commandArgs, options: options)
+        case "run":
+            return try commandRun(args: commandArgs, options: options)
+        case "export":
+            return try commandExport(args: commandArgs, options: options)
+        case "diagnose":
+            return try commandDiagnose(args: commandArgs, options: options)
+        case "help":
+            print(usage())
+            return 0
+        default:
+            throw CLIError.usage("unknown command: \(command)")
+        }
+    } catch CLIError.usage(let message) {
+        if options.json {
+            emitJSON(["ok": false, "error": ["kind": "usage", "message": message]])
+        } else {
+            printErr(message)
+        }
+        return 2
+    } catch CLIError.runtime(let message) {
+        if options.json {
+            emitJSON(["ok": false, "error": ["kind": "runtime", "message": message]])
+        } else {
+            printErr(message)
+        }
+        return 1
+    } catch {
+        if options.json {
+            emitJSON(["ok": false, "error": ["kind": "runtime", "message": error.localizedDescription]])
+        } else {
+            printErr(error.localizedDescription)
+        }
         return 1
     }
 }
 
-// --- argument parsing --------------------------------------------------------
-let args = Array(CommandLine.arguments.dropFirst())
-
-guard let command = args.first else {
-    usage()
-    exit(2)
-}
-
-switch command {
-case "smoke":
-    let count = args.count > 1 ? (UInt32(args[1]) ?? 1024) : 1024
-    let value = args.count > 2 ? (Float(args[2]) ?? 42.0) : 42.0
-    exit(runSmoke(count: count, value: value))
-case "demo":
-    var size: UInt32 = 1024
-    var out = "terrain.png"
-    var seed: UInt32 = 1337
-    var i = 1
-    while i < args.count {
-        switch args[i] {
-        case "--size": if i + 1 < args.count { size = UInt32(args[i + 1]) ?? size; i += 1 }
-        case "--out": if i + 1 < args.count { out = args[i + 1]; i += 1 }
-        case "--seed": if i + 1 < args.count { seed = UInt32(args[i + 1]) ?? seed; i += 1 }
-        default: print("ignoring unknown option: \(args[i])")
-        }
-        i += 1
-    }
-    exit(runDemo(size: size, outPNG: out, seed: seed))
-case "run":
-    guard args.count > 1, !args[1].hasPrefix("--") else {
-        print("usage: theia-cli run GRAPH.json [--sink ID] [--size N] [--out PATH]")
-        exit(2)
-    }
-    let jsonPath = args[1]
-    var sink = ""
-    var size: UInt32 = 0  // 0 => use graph default resolution
-    var out = "terrain.png"
-    var i = 2
-    while i < args.count {
-        switch args[i] {
-        case "--sink": if i + 1 < args.count { sink = args[i + 1]; i += 1 }
-        case "--size": if i + 1 < args.count { size = UInt32(args[i + 1]) ?? size; i += 1 }
-        case "--out": if i + 1 < args.count { out = args[i + 1]; i += 1 }
-        default: print("ignoring unknown option: \(args[i])")
-        }
-        i += 1
-    }
-    exit(runGraph(jsonPath: jsonPath, sink: sink, size: size, outPNG: out))
-case "export":
-    guard args.count > 1, !args[1].hasPrefix("--") else {
-        print("usage: theia-cli export GRAPH.json [--sink ID] [--size N] [--out-dir DIR] [--basename NAME] [--maps height,pfm,normal,slope,mask] [--mesh obj] [--vertical-scale V] [--mesh-stride S]")
-        exit(2)
-    }
-    let jsonPath = args[1]
-    var sink = ""
-    var size: UInt32 = 1024
-    var outDir = "."
-    var basename = URL(fileURLWithPath: jsonPath)
-        .deletingPathExtension()
-        .lastPathComponent
-    var maps: Set<String> = ["height", "pfm"]
-    var mesh = ""
-    var verticalScale: Float = 1.0
-    var meshStride: UInt32 = 1
-    var i = 2
-    while i < args.count {
-        switch args[i] {
-        case "--sink": if i + 1 < args.count { sink = args[i + 1]; i += 1 }
-        case "--size": if i + 1 < args.count { size = UInt32(args[i + 1]) ?? size; i += 1 }
-        case "--out-dir": if i + 1 < args.count { outDir = args[i + 1]; i += 1 }
-        case "--basename": if i + 1 < args.count { basename = args[i + 1]; i += 1 }
-        case "--maps":
-            if i + 1 < args.count {
-                maps = Set(args[i + 1].split(separator: ",").map { String($0) })
-                i += 1
-            }
-        case "--mesh": if i + 1 < args.count { mesh = args[i + 1]; i += 1 }
-        case "--vertical-scale":
-            if i + 1 < args.count { verticalScale = Float(args[i + 1]) ?? verticalScale; i += 1 }
-        case "--mesh-stride":
-            if i + 1 < args.count { meshStride = UInt32(args[i + 1]) ?? meshStride; i += 1 }
-        default: print("ignoring unknown option: \(args[i])")
-        }
-        i += 1
-    }
-    exit(runExport(jsonPath: jsonPath, sink: sink, size: size, outDir: outDir,
-                   basename: basename, maps: maps, mesh: mesh,
-                   verticalScale: verticalScale, meshStride: meshStride))
-case "diagnose":
-    guard args.count > 1, !args[1].hasPrefix("--") else {
-        print("usage: theia-cli diagnose GRAPH.json [--sink ID]")
-        exit(2)
-    }
-    let jsonPath = args[1]
-    var sink = ""
-    var i = 2
-    while i < args.count {
-        switch args[i] {
-        case "--sink": if i + 1 < args.count { sink = args[i + 1]; i += 1 }
-        default: print("ignoring unknown option: \(args[i])")
-        }
-        i += 1
-    }
-    exit(runDiagnose(jsonPath: jsonPath, sink: sink))
-case "nodes":
-    let types = readCxxString { theia.node_type_list($0, $1) }
-    print("Available node types: \(types)")
-    exit(0)
-case "-h", "--help", "help":
-    usage()
-    exit(0)
-default:
-    print("unknown command: \(command)\n")
-    usage()
-    exit(2)
-}
+exit(runMain())

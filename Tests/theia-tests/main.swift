@@ -39,7 +39,40 @@ private func readCxxString(
     return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
 }
 
+private func readCxxLongString(
+    _ accessor: (UnsafeMutablePointer<CChar>?, Int) -> Int
+) -> String {
+    var cap = 4096
+    while true {
+        var buf = [CChar](repeating: 0, count: cap)
+        let n = buf.withUnsafeMutableBufferPointer { accessor($0.baseAddress, $0.count) }
+        if n < cap {
+            let len = max(n, 0)
+            return String(decoding: buf[0..<len].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+        cap = max(cap * 2, n + 1)
+    }
+}
+
 let h = Harness()
+
+h.test("Version and capabilities API are parseable") {
+    let version = readCxxString { theia.theia_version_string($0, $1) }
+    h.expect(version == "0.9.0-alpha.1", "unexpected version: \(version)")
+    h.expect(theia.theia_api_version() >= 2, "api version should be >= 2")
+    let capsText = readCxxLongString { theia.theia_capabilities_json($0, $1) }
+    guard let data = capsText.data(using: .utf8),
+          let caps = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        h.expect(false, "capabilities JSON did not parse")
+        return
+    }
+    let heightmapFormats = caps["heightmapFormats"] as? [String] ?? []
+    let meshFormats = caps["meshFormats"] as? [String] ?? []
+    h.expect(heightmapFormats.contains("png16"), "missing png16 capability")
+    h.expect(heightmapFormats.contains("r16"), "missing r16 capability")
+    h.expect(heightmapFormats.contains("pfm32"), "missing pfm32 capability")
+    h.expect(meshFormats.contains("obj"), "missing obj capability")
+}
 
 h.test("GPU fill produces a uniform buffer") {
     let value: Float = 3.5
@@ -511,6 +544,59 @@ h.test("Production export writes maps and OBJ with valid topology") {
     }
 }
 
+h.test("Structured graph_export2 writes PNG16, R16, PFM32, and OBJ") {
+    let dir = NSTemporaryDirectory() + "theia_export2_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+
+    func callExport2(_ base: String,
+                     _ heightmap: theia.HeightmapFormat,
+                     _ mesh: theia.MeshFormat) -> theia.GraphEvalResult {
+        dir.withCString { dirPtr in
+            base.withCString { basePtr in
+                "p".withCString { sinkPtr in
+                    var opts = theia.GraphExportOptions()
+                    opts.sinkId = sinkPtr
+                    opts.width = 8
+                    opts.height = 8
+                    opts.outDir = dirPtr
+                    opts.basename = basePtr
+                    opts.heightmapFormat = heightmap
+                    opts.meshFormat = mesh
+                    opts.verticalScale = 1.0
+                    opts.meshStride = 2
+                    return theia.graph_export2(g, opts)
+                }
+            }
+        }
+    }
+
+    let pngObj = callExport2("terrain_png", theia.HeightmapFormat.png16, theia.MeshFormat.obj)
+    h.expect(pngObj.ok, "png/obj export2 failed: \(graphError(g))")
+    let raw = callExport2("terrain_raw", theia.HeightmapFormat.r16, theia.MeshFormat.none)
+    h.expect(raw.ok, "r16 export2 failed: \(graphError(g))")
+    let pfm = callExport2("terrain_pfm", theia.HeightmapFormat.pfm32, theia.MeshFormat.none)
+    h.expect(pfm.ok, "pfm32 export2 failed: \(graphError(g))")
+
+    let expectedFiles = [
+        "\(dir)/terrain_png_height.png",
+        "\(dir)/terrain_png.obj",
+        "\(dir)/terrain_raw_height.r16",
+        "\(dir)/terrain_pfm.pfm",
+    ]
+    for path in expectedFiles {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = attrs?[.size] as? NSNumber
+        h.expect((size?.intValue ?? 0) > 0, "export2 missing/empty \(path)")
+    }
+    let rawAttrs = try? FileManager.default.attributesOfItem(atPath: "\(dir)/terrain_raw_height.r16")
+    let rawSize = rawAttrs?[.size] as? NSNumber
+    h.expect(rawSize?.intValue == 8 * 8 * 2, "r16 size should be 128 bytes")
+}
+
 h.test("Production export rejects invalid options without writing") {
     let dir = NSTemporaryDirectory() + "theia_export_bad_\(getpid())"
     defer { try? FileManager.default.removeItem(atPath: dir) }
@@ -533,6 +619,42 @@ h.test("Production export rejects invalid options without writing") {
     defer { theia.graph_destroy(empty) }
     let noSink = theia.graph_export(empty, "", 8, 8, "", "", "", "", "", out, 1.0, 1)
     h.expect(!noSink.ok, "export should reject empty sink")
+}
+
+h.test("Structured graph_export2 rejects invalid options") {
+    let dir = NSTemporaryDirectory() + "theia_export2_bad_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    _ = theia.graph_add_node(g, "p", "perlin")
+
+    func callExport2(_ width: UInt32,
+                     _ heightmap: theia.HeightmapFormat,
+                     _ mesh: theia.MeshFormat) -> theia.GraphEvalResult {
+        dir.withCString { dirPtr in
+            "bad".withCString { basePtr in
+                "p".withCString { sinkPtr in
+                    var opts = theia.GraphExportOptions()
+                    opts.sinkId = sinkPtr
+                    opts.width = width
+                    opts.height = width
+                    opts.outDir = dirPtr
+                    opts.basename = basePtr
+                    opts.heightmapFormat = heightmap
+                    opts.meshFormat = mesh
+                    opts.verticalScale = 1.0
+                    opts.meshStride = 1
+                    return theia.graph_export2(g, opts)
+                }
+            }
+        }
+    }
+
+    let noOutputs = callExport2(8, theia.HeightmapFormat.none, theia.MeshFormat.none)
+    h.expect(!noOutputs.ok, "export2 should reject no outputs")
+    let badSize = callExport2(1, theia.HeightmapFormat.png16, theia.MeshFormat.none)
+    h.expect(!badSize.ok, "export2 should reject 1x1 resolution")
 }
 
 h.test("Loads the showcase graph (full pipeline)") {
@@ -1611,6 +1733,76 @@ h.test("Particle hydrology examples load and evaluate") {
                  "\(path) out of range")
         h.expect(r.variance > 1e-8, "\(path) degenerate")
     }
+}
+
+func runCLI(_ args: [String]) -> (Int32, String, String) {
+    let root = FileManager.default.currentDirectoryPath
+    let debugCLI = URL(fileURLWithPath: root).appendingPathComponent(".build/debug/theia-cli").path
+    let process = Process()
+    if FileManager.default.isExecutableFile(atPath: debugCLI) {
+        process.executableURL = URL(fileURLWithPath: debugCLI)
+        process.arguments = args
+    } else {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["swift", "run", "theia-cli"] + args
+    }
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return (127, "", error.localizedDescription)
+    }
+    let stdout = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(),
+                        encoding: .utf8) ?? ""
+    let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+                        encoding: .utf8) ?? ""
+    return (process.terminationStatus, stdout, stderr)
+}
+
+h.test("CLI JSON commands are parseable and unknown options exit 2") {
+    let nodes = runCLI(["nodes", "--json"])
+    h.expect(nodes.0 == 0, "nodes --json exit \(nodes.0): \(nodes.2)")
+    let nodesObject = try? JSONSerialization.jsonObject(with: Data(nodes.1.utf8)) as? [String: Any]
+    let nodeList = nodesObject?["nodes"] as? [[String: Any]] ?? []
+    h.expect(nodeList.contains { ($0["type"] as? String) == "perlin" },
+             "nodes JSON missing perlin")
+
+    let diagnose = runCLI(["diagnose", "examples/foundation.json", "--json"])
+    h.expect(diagnose.0 == 0, "diagnose --json exit \(diagnose.0): \(diagnose.2)")
+    let diagnoseObject = try? JSONSerialization.jsonObject(with: Data(diagnose.1.utf8)) as? [String: Any]
+    h.expect(diagnoseObject?["summary"] != nil, "diagnose JSON missing summary")
+
+    let runPNG = NSTemporaryDirectory() + "theia_cli_run_\(getpid()).png"
+    defer {
+        try? FileManager.default.removeItem(atPath: runPNG)
+        try? FileManager.default.removeItem(atPath: String(runPNG.dropLast(4)) + ".pfm")
+    }
+    let run = runCLI(["run", "examples/foundation.json", "--size", "32", "--out", runPNG, "--json"])
+    h.expect(run.0 == 0, "run --json exit \(run.0): \(run.2)")
+    let runObject = try? JSONSerialization.jsonObject(with: Data(run.1.utf8)) as? [String: Any]
+    h.expect(runObject?["stats"] != nil, "run JSON missing stats")
+
+    let exportDir = NSTemporaryDirectory() + "theia_cli_export_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: exportDir) }
+    let export = runCLI([
+        "export", "examples/foundation.json",
+        "--size", "32",
+        "--out-dir", exportDir,
+        "--basename", "foundation",
+        "--heightmap", "r16",
+        "--mesh", "obj",
+        "--json",
+    ])
+    h.expect(export.0 == 0, "export --json exit \(export.0): \(export.2)")
+    let exportObject = try? JSONSerialization.jsonObject(with: Data(export.1.utf8)) as? [String: Any]
+    h.expect(exportObject?["paths"] != nil, "export JSON missing paths")
+
+    let bad = runCLI(["nodes", "--bogus"])
+    h.expect(bad.0 == 2, "unknown option should exit 2, got \(bad.0)")
 }
 
 print("\n\(h.checks) checks, \(h.failures) failure(s)")
