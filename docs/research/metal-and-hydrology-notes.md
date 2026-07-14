@@ -52,7 +52,7 @@ Theia already follows several Metal practices from the book:
 
 ## Metal Gaps Worth Considering Later
 
-- The core currently waits synchronously for each graph evaluation. This is simple and deterministic, but viewer live edits can stutter on expensive graphs. A future job queue could evaluate snapshots asynchronously and drop stale results.
+- The core API remains synchronous for deterministic CLI/export behavior. The viewer now evaluates live-edit snapshots on a serial background worker and drops stale results before they reach the renderer.
 - The core uses shared buffers for easy CPU readback. That is convenient for CLI/export/tests. If viewport-only GPU workflows grow, private storage plus explicit blits may be faster.
 - Runtime MSL compilation is convenient for SwiftPM-only development. For production builds, consider optional precompiled libraries or a pipeline warmup step if launch latency becomes noticeable.
 - Texture-backed heightfields could help material preview and GPU export maps, but buffer-backed heightfields remain better aligned with current node kernels.

@@ -87,7 +87,7 @@ private func statsObject(_ r: theia.GraphEvalResult) -> [String: Any] {
 
 private func usage() -> String {
     """
-    theia-cli 0.9.0-alpha.1
+    theia-cli 0.10.0-alpha.1
 
     USAGE:
       theia-cli [--json] [--quiet] [--no-color] [--verbose] COMMAND [ARGS]
@@ -97,9 +97,9 @@ private func usage() -> String {
       doctor                          Check core capabilities and Metal smoke test.
       nodes [--json]                  List registered node types.
       diagnose GRAPH.json [--sink ID] Analyze graph health.
-      run GRAPH.json [--sink ID] [--size N] [--out PATH]
+      run GRAPH.json [--sink ID] [--output NAME] [--size N] [--out PATH]
                                       Evaluate a graph to PNG16 + PFM.
-      export GRAPH.json [--sink ID] [--size N] [--out-dir DIR]
+      export GRAPH.json [--sink ID] [--output NAME] [--size N] [--out-dir DIR]
              [--basename NAME] [--heightmap png16|r16|pfm32|none]
              [--mesh obj|none] [--vertical-scale V] [--mesh-stride S]
                                       Export engine-ready heightmap and mesh.
@@ -190,10 +190,37 @@ private func capabilitiesObject() -> [String: Any] {
 private func nodeCatalog() -> [[String: Any]] {
     let types = readCxxString { theia.node_type_list($0, $1) }
         .split(separator: ",")
-        .map(String.init)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
 
     return types.map { type in
+        let inputCount = theia.graph_node_type_input_count(type)
+        let inputs: [[String: Any]] = (0..<inputCount).map { index in
+            let name = readCxxString {
+                theia.graph_node_type_input_name(type, index, $0, $1)
+            }
+            let kinds = readCxxString {
+                theia.graph_node_type_input_kinds(type, index, $0, $1)
+            }.split(separator: ",").map(String.init)
+            return ["name": name, "kinds": kinds]
+        }
+        let outputCount = theia.graph_node_type_output_count(type)
+        let outputs: [[String: Any]] = (0..<outputCount).map { index in
+            let name = readCxxString {
+                theia.graph_node_type_output_name(type, index, $0, $1)
+            }
+            let kind = readCxxString {
+                theia.graph_node_type_output_kind(type, index, $0, $1)
+            }
+            let inheritInput = theia.graph_node_type_output_inherit_input(type, index)
+            var output: [String: Any] = [
+                "name": name,
+                "kind": kind,
+                "default": theia.graph_node_type_output_is_default(type, index),
+            ]
+            if inheritInput >= 0 { output["inheritsInput"] = Int(inheritInput) }
+            return output
+        }
         let count = theia.graph_default_param_count(type)
         let params: [[String: Any]] = (0..<count).map { index in
             let name = readCxxString {
@@ -204,7 +231,9 @@ private func nodeCatalog() -> [[String: Any]] {
         }
         return [
             "type": type,
-            "inputs": Int(theia.graph_node_type_input_count(type)),
+            "inputCount": Int(inputCount),
+            "inputs": inputs,
+            "outputs": outputs,
             "defaultParams": params,
         ]
     }
@@ -220,10 +249,12 @@ private func printNodeCatalog(json: Bool, quiet: Bool) {
     print("Available node types")
     for item in catalog {
         let type = item["type"] as? String ?? ""
-        let inputs = item["inputs"] as? Int ?? 0
+        let inputs = item["inputCount"] as? Int ?? 0
+        let outputs = item["outputs"] as? [[String: Any]] ?? []
+        let outputNames = outputs.compactMap { $0["name"] as? String }.joined(separator: ",")
         let params = item["defaultParams"] as? [[String: Any]] ?? []
         let names = params.compactMap { $0["name"] as? String }.joined(separator: ", ")
-        print("  \(type)  inputs=\(inputs)\(names.isEmpty ? "" : "  params=\(names)")")
+        print("  \(type)  inputs=\(inputs)  outputs=\(outputNames)\(names.isEmpty ? "" : "  params=\(names)")")
     }
 }
 
@@ -365,9 +396,10 @@ private func commandDemo(args: [String], options: GlobalOptions) throws -> Int32
 
 private func commandRun(args: [String], options: GlobalOptions) throws -> Int32 {
     guard let path = args.first, !path.hasPrefix("--") else {
-        throw CLIError.usage("usage: theia-cli run GRAPH.json [--sink ID] [--size N] [--out PATH]")
+        throw CLIError.usage("usage: theia-cli run GRAPH.json [--sink ID] [--output NAME] [--size N] [--out PATH]")
     }
     var sink = ""
+    var output = ""
     var size: UInt32 = 0
     var out = "terrain.png"
     var i = 1
@@ -375,6 +407,9 @@ private func commandRun(args: [String], options: GlobalOptions) throws -> Int32 
         switch args[i] {
         case "--sink":
             sink = try requireValue(args, i, "--sink")
+            i += 2
+        case "--output":
+            output = try requireValue(args, i, "--output")
             i += 2
         case "--size":
             size = try parseUInt32(try requireValue(args, i, "--size"), flag: "--size")
@@ -390,13 +425,14 @@ private func commandRun(args: [String], options: GlobalOptions) throws -> Int32 
     let pfm = out.hasSuffix(".png") ? String(out.dropLast(4)) + ".pfm" : out + ".pfm"
     let g = try loadGraph(path: path)
     defer { theia.graph_destroy(g) }
-    let r = theia.graph_evaluate(g, sink, size, size, out, pfm)
+    let r = theia.graph_evaluate_output(g, sink, output, size, size, out, pfm)
     let err = readCxxString { theia.graph_last_error(g, $0, $1) }
     if options.json {
         emitJSON([
             "ok": r.ok,
             "graph": path,
             "sink": sink.isEmpty ? NSNull() : sink,
+            "output": output.isEmpty ? NSNull() : output,
             "stats": statsObject(r),
             "paths": ["png": out, "pfm": pfm],
             "error": err,
@@ -419,6 +455,7 @@ private func commandRun(args: [String], options: GlobalOptions) throws -> Int32 
 private func graphExport2(
     graph: OpaquePointer,
     sink: String,
+    output: String,
     size: UInt32,
     outDir: String,
     basename: String,
@@ -445,22 +482,11 @@ private func graphExport2(
     }
     return outDir.withCString { outPtr in
         basename.withCString { basePtr in
-            if sink.isEmpty {
-                var opts = theia.GraphExportOptions()
-                opts.sinkId = nil
-                opts.width = size
-                opts.height = size
-                opts.outDir = outPtr
-                opts.basename = basePtr
-                opts.heightmapFormat = heightFormat(heightmap)
-                opts.meshFormat = meshFormat(mesh)
-                opts.verticalScale = verticalScale
-                opts.meshStride = meshStride
-                return theia.graph_export2(graph, opts)
-            }
-            return sink.withCString { sinkPtr in
+            func makeOptions(sinkPtr: UnsafePointer<CChar>?,
+                             outputPtr: UnsafePointer<CChar>?) -> theia.GraphExportOptions {
                 var opts = theia.GraphExportOptions()
                 opts.sinkId = sinkPtr
+                opts.outputName = outputPtr
                 opts.width = size
                 opts.height = size
                 opts.outDir = outPtr
@@ -469,7 +495,26 @@ private func graphExport2(
                 opts.meshFormat = meshFormat(mesh)
                 opts.verticalScale = verticalScale
                 opts.meshStride = meshStride
-                return theia.graph_export2(graph, opts)
+                return opts
+            }
+            if sink.isEmpty && output.isEmpty {
+                return theia.graph_export2(graph, makeOptions(sinkPtr: nil, outputPtr: nil))
+            }
+            if sink.isEmpty {
+                return output.withCString { outputPtr in
+                    theia.graph_export2(graph, makeOptions(sinkPtr: nil, outputPtr: outputPtr))
+                }
+            }
+            if output.isEmpty {
+                return sink.withCString { sinkPtr in
+                    theia.graph_export2(graph, makeOptions(sinkPtr: sinkPtr, outputPtr: nil))
+                }
+            }
+            return sink.withCString { sinkPtr in
+                output.withCString { outputPtr in
+                    theia.graph_export2(graph, makeOptions(sinkPtr: sinkPtr,
+                                                            outputPtr: outputPtr))
+                }
             }
         }
     }
@@ -480,6 +525,7 @@ private func commandExport(args: [String], options: GlobalOptions) throws -> Int
         throw CLIError.usage("usage: theia-cli export GRAPH.json [--heightmap png16|r16|pfm32|none] [--mesh obj|none]")
     }
     var sink = ""
+    var output = ""
     var size: UInt32 = 1024
     var outDir = "."
     var basename = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
@@ -494,6 +540,9 @@ private func commandExport(args: [String], options: GlobalOptions) throws -> Int
         switch args[i] {
         case "--sink":
             sink = try requireValue(args, i, "--sink")
+            i += 2
+        case "--output":
+            output = try requireValue(args, i, "--output")
             i += 2
         case "--size":
             size = try parseUInt32(try requireValue(args, i, "--size"), flag: "--size", min: 2)
@@ -542,6 +591,9 @@ private func commandExport(args: [String], options: GlobalOptions) throws -> Int
     if heightmap == "none" && mesh == "none" && legacyMaps == nil {
         throw CLIError.usage("choose at least one export output")
     }
+    if legacyMaps != nil && !output.isEmpty {
+        throw CLIError.usage("--output cannot be combined with legacy --maps")
+    }
 
     let g = try loadGraph(path: path)
     defer { theia.graph_destroy(g) }
@@ -574,13 +626,16 @@ private func commandExport(args: [String], options: GlobalOptions) throws -> Int
         if !mask.isEmpty { paths["mask"] = mask }
         if !obj.isEmpty { paths["obj"] = obj }
     } else {
-        r = graphExport2(graph: g, sink: sink, size: size, outDir: outDir,
+        r = graphExport2(graph: g, sink: sink, output: output,
+                         size: size, outDir: outDir,
                          basename: basename, heightmap: heightmap, mesh: mesh,
                          verticalScale: verticalScale, meshStride: meshStride)
+        let suffix = output.isEmpty || output == "height" ? "_height" : "_\(output)"
         switch heightmap {
-        case "png16": paths["heightmap"] = file("_height.png")
-        case "r16": paths["heightmap"] = file("_height.r16")
-        case "pfm32": paths["heightmap"] = file(".pfm")
+        case "png16": paths["heightmap"] = file("\(suffix).png")
+        case "r16": paths["heightmap"] = file("\(suffix).r16")
+        case "pfm32": paths["heightmap"] = output.isEmpty || output == "height"
+            ? file(".pfm") : file("\(suffix).pfm")
         default: break
         }
         if mesh == "obj" { paths["mesh"] = file(".obj") }
@@ -592,6 +647,7 @@ private func commandExport(args: [String], options: GlobalOptions) throws -> Int
             "ok": r.ok,
             "graph": path,
             "sink": sink.isEmpty ? NSNull() : sink,
+            "output": output.isEmpty ? NSNull() : output,
             "stats": statsObject(r),
             "paths": paths,
             "error": err,
@@ -617,11 +673,12 @@ private func diagnosticSource(path: String, sink: String) throws -> String {
     guard !sink.isEmpty,
           let data = text.data(using: .utf8),
           let object = try? JSONSerialization.jsonObject(with: data),
-          var dict = object as? [String: Any],
+    var dict = object as? [String: Any],
           JSONSerialization.isValidJSONObject(dict) else {
         return text
     }
     dict["sink"] = sink
+    dict.removeValue(forKey: "sinkOutput")
     guard let encoded = try? JSONSerialization.data(withJSONObject: dict),
           let updated = String(data: encoded, encoding: .utf8) else {
         return text

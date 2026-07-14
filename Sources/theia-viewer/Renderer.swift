@@ -11,6 +11,7 @@ struct Uniforms {
     var lightDirection: SIMD4<Float>
     var viewportParams: SIMD4<Float>
     var terrainParams: SIMD4<Float>
+    var brushParams: SIMD4<Float>
     var gridParams: SIMD4<UInt32>
 }
 
@@ -26,6 +27,7 @@ final class Renderer {
     let queue: MTLCommandQueue
     let colorFormat: MTLPixelFormat
     let depthFormat: MTLPixelFormat = .depth32Float
+    var displayInvalidationHandler: (() -> Void)?
 
     private var pipeline: MTLRenderPipelineState
     private var linePipeline: MTLRenderPipelineState
@@ -52,6 +54,13 @@ final class Renderer {
     private var materialPreset: MaterialPreset = .natural
     private var maskOpacity: Float = 0.65
     private var terrainBaseHeight: Float = 0
+    private var surfaceHeights: [Float] = []
+    private var surfaceWidth = 0
+    private var surfaceHeight = 0
+    private var surfaceMaxHeight: Float = 0
+    private var brushCenterUV = SIMD2<Float>(repeating: 0)
+    private var brushRadius: Float = 0
+    private var brushVisible = false
     private var projectionMode: ViewportProjection = .perspective
     var wireframeEnabled = false
     var gridVisible = true
@@ -119,6 +128,10 @@ final class Renderer {
         let sampledData = Self.viewerHeights(sourceData, width: width, height: height,
                                             maxGrid: maxViewerGrid)
         terrainBaseHeight = sampledHeights.values.min() ?? 0
+        surfaceHeights = sampledHeights.values
+        surfaceWidth = sampledHeights.width
+        surfaceHeight = sampledHeights.height
+        surfaceMaxHeight = sampledHeights.values.max() ?? terrainBaseHeight
         heightBuffer = device.makeBuffer(bytes: sampledHeights.values,
                                          length: sampledHeights.values.count *
                                             MemoryLayout<Float>.stride,
@@ -133,6 +146,7 @@ final class Renderer {
             gridW = UInt32(sampledHeights.width)
             gridH = UInt32(sampledHeights.height)
         }
+        invalidateDisplay()
     }
 
     private static func viewerHeights(_ heights: [Float], width: Int, height: Int,
@@ -231,6 +245,8 @@ final class Renderer {
                             Float(displayMode.rendererMode),
                             Float(materialPreset.rendererPreset)),
                          terrainParams: SIMD4<Float>(terrainBaseHeight, 0, 0, 0),
+                         brushParams: SIMD4<Float>(brushCenterUV.x, brushCenterUV.y,
+                                                   brushRadius, brushVisible ? 1 : 0),
                          gridParams: SIMD4<UInt32>(gridW, gridH, 0, 0))
         if let hb = heightBuffer, let db = dataBuffer, let ib = indexBuffer,
            indexCount > 0 {
@@ -285,30 +301,36 @@ final class Renderer {
         self.gridVisible = gridVisible
         self.axisVisible = axisVisible
         self.projectionMode = projectionMode
+        invalidateDisplay()
     }
 
     func resetCamera() {
         camera.reset(heightExaggeration: heightExaggeration)
+        invalidateDisplay()
     }
 
     func setCameraPreset(_ preset: CameraPreset) {
         camera.applyPreset(preset, heightExaggeration: heightExaggeration)
+        invalidateDisplay()
     }
 
     func orbitCamera(delta: CGSize) {
         camera.azimuth -= Float(delta.width) * 0.01
         let el = camera.elevation - Float(delta.height) * 0.01
         camera.elevation = max(0.05, min(.pi / 2 - 0.02, el))
+        invalidateDisplay()
     }
 
     func panCamera(delta: CGSize, viewportSize: CGSize) {
         camera.pan(deltaX: Float(delta.width),
                    deltaY: Float(delta.height),
                    viewportHeight: Float(max(1, viewportSize.height)))
+        invalidateDisplay()
     }
 
     func zoomCamera(deltaY: CGFloat) {
         camera.zoom(deltaY: Float(deltaY))
+        invalidateDisplay()
     }
 
     func terrainUV(at point: CGPoint, in viewSize: CGSize) -> CGPoint? {
@@ -327,12 +349,50 @@ final class Renderer {
         let end = SIMD3<Float>(far.x, far.y, far.z)
         let dir = normalize(end - origin)
         guard abs(dir.y) > 1e-5 else { return nil }
-        let t = (0.0 - origin.y) / dir.y
-        guard t.isFinite, t > 0 else { return nil }
-        let hit = origin + dir * t
-        guard hit.x >= -1, hit.x <= 1, hit.z >= -1, hit.z <= 1 else { return nil }
-        return CGPoint(x: CGFloat((hit.x + 1) * 0.5),
-                       y: CGFloat((hit.z + 1) * 0.5))
+        return TerrainSurfacePicker.intersect(origin: origin, direction: dir,
+                                              heights: surfaceHeights,
+                                              width: surfaceWidth,
+                                              height: surfaceHeight,
+                                              baseHeight: terrainBaseHeight,
+                                              maxHeight: surfaceMaxHeight,
+                                              heightScale: heightExaggeration)
+    }
+
+    func setMaskBrushCursor(uv: CGPoint?, radius: Double) {
+        guard let uv else {
+            guard brushVisible else { return }
+            brushVisible = false
+            invalidateDisplay()
+            return
+        }
+        brushCenterUV = SIMD2<Float>(Float(min(max(uv.x, 0), 1)),
+                                     Float(min(max(uv.y, 0), 1)))
+        brushRadius = Float(min(max(radius, 0.003), 0.20))
+        brushVisible = true
+        invalidateDisplay()
+    }
+
+    func applyMaskEraseStroke(_ stroke: GraphMaskEraseStroke) {
+        applyMaskEraseStrokes([stroke])
+    }
+
+    func applyMaskEraseStrokes(_ strokes: [GraphMaskEraseStroke]) {
+        guard !strokes.isEmpty else { return }
+        guard let dataBuffer else { return }
+        let width = Int(gridW)
+        let height = Int(gridH)
+        let count = min(width * height,
+                        dataBuffer.length / MemoryLayout<Float>.stride)
+        guard width > 0, height > 0, count >= width * height else { return }
+        let pointer = dataBuffer.contents().bindMemory(to: Float.self, capacity: count)
+        let values = UnsafeMutableBufferPointer(start: pointer, count: count)
+        MaskBrushRasterizer.apply(strokes: strokes, to: values,
+                                  width: width, height: height)
+        invalidateDisplay()
+    }
+
+    private func invalidateDisplay() {
+        displayInvalidationHandler?()
     }
 
     private func lightDirection() -> SIMD4<Float> {
@@ -344,6 +404,8 @@ final class Renderer {
 
     // Offscreen render of a single frame to a PNG. No window required.
     func renderToPNG(path: String, width: Int, height: Int) -> Bool {
+        guard heightBuffer != nil, dataBuffer != nil,
+              indexBuffer != nil, indexCount > 0 else { return false }
         let cd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: colorFormat, width: width, height: height, mipmapped: false)
         cd.usage = [.renderTarget]

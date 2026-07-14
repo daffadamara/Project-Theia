@@ -13,6 +13,7 @@ struct Uniforms {
     float4 lightDirection;
     float4 viewportParams; // x=heightScale, y=maskOpacity, z=displayMode, w=materialPreset
     float4 terrainParams;  // x=base height offset for geometry
+    float4 brushParams;    // xy=center UV, z=radius UV, w=visible
     uint4  gridParams;     // x=gridW, y=gridH
 };
 
@@ -21,6 +22,7 @@ struct VOut {
     float3 normal;
     float  height;
     float  data;
+    float2 uv;
 };
 
 struct LineVertexIn {
@@ -69,6 +71,8 @@ vertex VOut terrain_vertex(uint vid [[vertex_id]],
     o.normal = N;
     o.height = h;
     o.data = d;
+    o.uv = float2(float(gx) / float(gridW - 1),
+                  float(gz) / float(gridH - 1));
     return o;
 }
 
@@ -125,6 +129,22 @@ float3 materialRamp(float h, float slope, float mask, uint preset) {
     return mix(col, float3(0.24, 0.24, 0.23), mask * 0.55);
 }
 
+float4 applyBrushDecal(float4 base, float2 uv, constant Uniforms& U) {
+    if (U.brushParams.w < 0.5) {
+        return base;
+    }
+    float radius = max(U.brushParams.z, 0.0001);
+    float d = distance(uv, U.brushParams.xy);
+    float aa = max(fwidth(d) * 1.35, radius * 0.012);
+    float inside = 1.0 - smoothstep(radius - aa, radius + aa, d);
+    float ringWidth = max(radius * 0.075, aa * 1.5);
+    float ring = 1.0 - smoothstep(ringWidth, ringWidth + aa,
+                                  abs(d - radius));
+    float blend = max(inside * 0.16, ring * 0.92);
+    float3 brushBlue = float3(0.05, 0.62, 1.0);
+    return float4(mix(base.rgb, brushBlue, clamp(blend, 0.0, 1.0)), base.a);
+}
+
 fragment float4 terrain_fragment(VOut in [[stage_in]],
                                  constant Uniforms& U [[buffer(1)]]) {
     float3 N = normalize(in.normal);
@@ -142,14 +162,15 @@ fragment float4 terrain_fragment(VOut in [[stage_in]],
     float3 shaded = terrainRamp(h, slope) * lit;
 
     if (mode == 1) {
-        return float4(float3(h), 1.0);
+        return applyBrushDecal(float4(float3(h), 1.0), in.uv, U);
     }
 
     if (mode == 2) {
         float3 lowMask = float3(0.04, 0.07, 0.10);
         float3 highMask = float3(0.06, 0.52, 1.00);
         float3 maskRamp = mix(lowMask, highMask, smoothstep(0.0, 1.0, mask));
-        return float4(mix(shaded, maskRamp, opacity), 1.0);
+        return applyBrushDecal(float4(mix(shaded, maskRamp, opacity), 1.0),
+                               in.uv, U);
     }
 
     // Slope/normal preview follows the same terrain-derived-map idea as GDAL's
@@ -162,18 +183,30 @@ fragment float4 terrain_fragment(VOut in [[stage_in]],
         float3 highSlope = float3(0.86, 0.22, 0.16);
         float3 col = mix(lowSlope, midSlope, smoothstep(0.0, 0.55, slope01));
         col = mix(col, highSlope, smoothstep(0.50, 1.0, slope01));
-        return float4(col, 1.0);
+        return applyBrushDecal(float4(col, 1.0), in.uv, U);
     }
 
     if (mode == 4) {
-        return float4(N * 0.5 + 0.5, 1.0);
+        return applyBrushDecal(float4(N * 0.5 + 0.5, 1.0), in.uv, U);
     }
 
     if (mode == 5) {
         float3 col = materialRamp(h, slope, mask, preset);
-        return float4(col * lit, 1.0);
+        return applyBrushDecal(float4(col * lit, 1.0), in.uv, U);
     }
 
-    return float4(shaded, 1.0);
+    if (mode == 6) {
+        float value = clamp(in.data, 0.0, 1.0);
+        float3 crease = float3(0.08, 0.32, 0.78);
+        float3 neutral = float3(0.48, 0.50, 0.52);
+        float3 ridge = float3(0.94, 0.36, 0.12);
+        float3 lower = mix(crease, neutral, smoothstep(0.0, 0.5, value));
+        float3 upper = mix(neutral, ridge, smoothstep(0.5, 1.0, value));
+        float3 col = value < 0.5 ? lower : upper;
+        return applyBrushDecal(float4(col * (0.68 + 0.32 * lit), 1.0),
+                               in.uv, U);
+    }
+
+    return applyBrushDecal(float4(shaded, 1.0), in.uv, U);
 }
 """

@@ -7,7 +7,9 @@ final class TerrainMTKView: MTKView {
     weak var modelRef: TerrainModel?
     private var lastDrag: NSPoint?
     private var dragMode: DragMode?
-    private let brushLayer = CAShapeLayer()
+    private var lastBrushUV: CGPoint?
+    private var lastBrushSampleTimestamp = -Double.greatestFiniteMagnitude
+    private var lastBrushCursorTimestamp = -Double.greatestFiniteMagnitude
     private var tracking: NSTrackingArea?
 
     override var acceptsFirstResponder: Bool { true }
@@ -20,12 +22,10 @@ final class TerrainMTKView: MTKView {
 
     override init(frame frameRect: NSRect, device: MTLDevice?) {
         super.init(frame: frameRect, device: device)
-        configureBrushLayer()
     }
 
     required init(coder: NSCoder) {
         super.init(coder: coder)
-        configureBrushLayer()
     }
 
     override func updateTrackingAreas() {
@@ -48,6 +48,7 @@ final class TerrainMTKView: MTKView {
     }
 
     override func mouseUp(with e: NSEvent) {
+        _ = eraseMask(with: e, begin: false, force: true)
         endDrag()
     }
 
@@ -90,6 +91,7 @@ final class TerrainMTKView: MTKView {
             r.zoomCamera(deltaY: e.scrollingDeltaY)
         }
         modelRef?.viewportCameraDidChange()
+        updateBrushCursor(with: e)
         setNeedsDisplay(bounds)
     }
 
@@ -97,15 +99,20 @@ final class TerrainMTKView: MTKView {
         guard let r = rendererRef else { return }
         r.zoomCamera(deltaY: CGFloat(e.magnification) * 90)
         modelRef?.viewportCameraDidChange()
+        updateBrushCursor(with: e)
         setNeedsDisplay(bounds)
     }
 
     override func mouseMoved(with e: NSEvent) {
+        guard e.timestamp - lastBrushCursorTimestamp >= 1.0 / 60.0 else { return }
+        lastBrushCursorTimestamp = e.timestamp
         updateBrushCursor(with: e)
     }
 
     override func mouseExited(with event: NSEvent) {
-        brushLayer.isHidden = true
+        lastBrushUV = nil
+        rendererRef?.setMaskBrushCursor(uv: nil, radius: 0)
+        setNeedsDisplay(bounds)
     }
 
     override func keyDown(with e: NSEvent) {
@@ -122,6 +129,12 @@ final class TerrainMTKView: MTKView {
             model.setViewportTool(.pan)
         case "z":
             model.setViewportTool(.zoom)
+        case "e":
+            guard model.canEditActiveMask else {
+                super.keyDown(with: e)
+                return
+            }
+            model.setMaskBrushEnabled(!model.maskBrushEnabled)
         case "g":
             model.setGridVisible(!model.gridVisible)
         case "a":
@@ -174,6 +187,7 @@ final class TerrainMTKView: MTKView {
         }
         modelRef?.viewportCameraDidChange()
         self.lastDrag = p
+        updateBrushCursor(with: e)
         setNeedsDisplay(bounds)
     }
 
@@ -183,26 +197,26 @@ final class TerrainMTKView: MTKView {
         dragMode = nil
     }
 
-    private func configureBrushLayer() {
-        wantsLayer = true
-        brushLayer.fillColor = NSColor.systemBlue.withAlphaComponent(0.16).cgColor
-        brushLayer.strokeColor = NSColor.systemBlue.withAlphaComponent(0.85).cgColor
-        brushLayer.lineWidth = 1.5
-        brushLayer.isHidden = true
-        layer?.addSublayer(brushLayer)
-    }
-
-    private func eraseMask(with e: NSEvent, begin: Bool) -> Bool {
+    private func eraseMask(with e: NSEvent, begin: Bool,
+                           force: Bool = false) -> Bool {
         guard let model = modelRef,
               model.maskBrushEnabled,
               model.canEditActiveMask else { return false }
+        if begin {
+            lastBrushSampleTimestamp = e.timestamp
+        } else if !force,
+                  e.timestamp - lastBrushSampleTimestamp < 1.0 / 60.0 {
+            return true
+        } else {
+            lastBrushSampleTimestamp = e.timestamp
+        }
         guard let uv = terrainUV(for: e) else {
-            updateBrushCursor(with: e)
+            setBrushCursor(uv: nil, model: model)
             return true
         }
         let used = begin ? model.beginMaskBrush(at: uv) : model.continueMaskBrush(at: uv)
         if used {
-            updateBrushCursor(with: e)
+            setBrushCursor(uv: uv, model: model)
             setNeedsDisplay(bounds)
         }
         return used
@@ -218,15 +232,31 @@ final class TerrainMTKView: MTKView {
         guard let model = modelRef,
               model.maskBrushEnabled,
               model.canEditActiveMask else {
-            brushLayer.isHidden = true
+            rendererRef?.setMaskBrushCursor(uv: nil, radius: 0)
             return
         }
-        let p = convert(e.locationInWindow, from: nil)
-        let radius = CGFloat(model.maskBrushRadius) * min(bounds.width, bounds.height)
-        let rect = CGRect(x: p.x - radius, y: p.y - radius,
-                          width: radius * 2, height: radius * 2)
-        brushLayer.path = CGPath(ellipseIn: rect, transform: nil)
-        brushLayer.isHidden = false
+        let uv = terrainUV(for: e)
+        setBrushCursor(uv: uv, model: model)
+    }
+
+    private func setBrushCursor(uv: CGPoint?, model: TerrainModel) {
+        lastBrushUV = uv
+        rendererRef?.setMaskBrushCursor(uv: uv, radius: model.maskBrushRadius)
+        setNeedsDisplay(bounds)
+    }
+
+    func syncBrushCursorState() {
+        guard let model = modelRef,
+              model.maskBrushEnabled,
+              model.canEditActiveMask,
+              let lastBrushUV else {
+            rendererRef?.setMaskBrushCursor(uv: nil, radius: 0)
+            setNeedsDisplay(bounds)
+            return
+        }
+        rendererRef?.setMaskBrushCursor(uv: lastBrushUV,
+                                        radius: model.maskBrushRadius)
+        setNeedsDisplay(bounds)
     }
 }
 
@@ -235,7 +265,9 @@ final class ViewportDelegate: NSObject, MTKViewDelegate {
     let renderer: Renderer
     init(renderer: Renderer) { self.renderer = renderer }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        view.setNeedsDisplay(view.bounds)
+    }
 
     func draw(in view: MTKView) {
         guard let rpd = view.currentRenderPassDescriptor,

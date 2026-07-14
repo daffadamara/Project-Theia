@@ -14,10 +14,48 @@ struct GraphDocumentNode: Codable, Identifiable {
 
 struct GraphDocumentConnection: Codable, Identifiable, Equatable {
     var from: String
+    var output: String
     var to: String
     var input: UInt32
 
-    var id: String { "\(from)->\(to).\(input)" }
+    var id: String { "\(from).\(output)->\(to).\(input)" }
+
+    enum CodingKeys: String, CodingKey { case from, output, to, input }
+
+    init(from: String, output: String = "", to: String, input: UInt32) {
+        self.from = from
+        self.output = output
+        self.to = to
+        self.input = input
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        from = try c.decode(String.self, forKey: .from)
+        output = try c.decodeIfPresent(String.self, forKey: .output) ?? ""
+        to = try c.decode(String.self, forKey: .to)
+        input = try c.decodeIfPresent(UInt32.self, forKey: .input) ?? 0
+    }
+}
+
+enum GraphFieldKind: String, Codable {
+    case terrain
+    case mask
+    case data
+}
+
+struct GraphOutputPort: Identifiable, Equatable {
+    let name: String
+    let declaredKind: GraphFieldKind
+    let inheritInput: Int?
+    let isDefault: Bool
+
+    var id: String { name }
+}
+
+struct GraphOutputReference: Codable, Hashable, Sendable {
+    var node: String
+    var output: String
 }
 
 struct GraphNodePosition: Codable, Equatable {
@@ -40,6 +78,7 @@ enum ViewportDisplayMode: String, CaseIterable, Identifiable {
     case slope
     case normal
     case material
+    case data
 
     var id: String { rawValue }
 
@@ -52,6 +91,7 @@ enum ViewportDisplayMode: String, CaseIterable, Identifiable {
         case .slope: return "slope"
         case .normal: return "normal"
         case .material: return "material"
+        case .data: return "data"
         }
     }
 
@@ -63,6 +103,7 @@ enum ViewportDisplayMode: String, CaseIterable, Identifiable {
         case .slope: return 3
         case .normal: return 4
         case .material: return 5
+        case .data: return 6
         }
     }
 }
@@ -142,7 +183,7 @@ struct GraphPreviewSettings: Codable {
 struct GraphDocumentUI: Codable {
     var positions: [String: GraphNodePosition] = [:]
     var preview = GraphPreviewSettings()
-    var maskErases: [String: [GraphMaskEraseStroke]] = [:]
+    var maskErases: [String: [String: [GraphMaskEraseStroke]]] = [:]
 
     enum CodingKeys: String, CodingKey {
         case positions, preview, maskErases
@@ -150,7 +191,7 @@ struct GraphDocumentUI: Codable {
 
     init(positions: [String: GraphNodePosition] = [:],
          preview: GraphPreviewSettings = GraphPreviewSettings(),
-         maskErases: [String: [GraphMaskEraseStroke]] = [:]) {
+         maskErases: [String: [String: [GraphMaskEraseStroke]]] = [:]) {
         self.positions = positions
         self.preview = preview
         self.maskErases = maskErases
@@ -162,29 +203,44 @@ struct GraphDocumentUI: Codable {
                                           forKey: .positions) ?? [:]
         preview = try c.decodeIfPresent(GraphPreviewSettings.self,
                                         forKey: .preview) ?? GraphPreviewSettings()
-        maskErases = try c.decodeIfPresent([String: [GraphMaskEraseStroke]].self,
-                                           forKey: .maskErases) ?? [:]
+        if let nested = try? c.decodeIfPresent(
+            [String: [String: [GraphMaskEraseStroke]]].self,
+            forKey: .maskErases) {
+            maskErases = nested
+        } else if let legacy = try? c.decodeIfPresent(
+            [String: [GraphMaskEraseStroke]].self,
+            forKey: .maskErases) {
+            maskErases = legacy.mapValues { ["": $0] }
+        } else {
+            maskErases = [:]
+        }
     }
 }
 
 struct GraphDocument: Codable {
+    var formatVersion: Int
     var resolution: GraphResolution
     var sink: String
+    var sinkOutput: String
     var nodes: [GraphDocumentNode]
     var connections: [GraphDocumentConnection]
     var ui: GraphDocumentUI?
 
     enum CodingKeys: String, CodingKey {
-        case resolution, sink, nodes, connections, ui
+        case formatVersion, resolution, sink, sinkOutput, nodes, connections, ui
     }
 
-    init(resolution: GraphResolution,
+    init(formatVersion: Int = 2,
+         resolution: GraphResolution,
          sink: String,
+         sinkOutput: String = "",
          nodes: [GraphDocumentNode],
          connections: [GraphDocumentConnection],
          ui: GraphDocumentUI?) {
+        self.formatVersion = formatVersion
         self.resolution = resolution
         self.sink = sink
+        self.sinkOutput = sinkOutput
         self.nodes = nodes
         self.connections = connections
         self.ui = ui
@@ -192,9 +248,11 @@ struct GraphDocument: Codable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try c.decodeIfPresent(Int.self, forKey: .formatVersion) ?? 1
         resolution = try c.decodeIfPresent(GraphResolution.self, forKey: .resolution)
             ?? GraphResolution(width: 512, height: 512)
         sink = try c.decodeIfPresent(String.self, forKey: .sink) ?? ""
+        sinkOutput = try c.decodeIfPresent(String.self, forKey: .sinkOutput) ?? ""
         nodes = try c.decodeIfPresent([GraphDocumentNode].self, forKey: .nodes) ?? []
         connections = try c.decodeIfPresent([GraphDocumentConnection].self, forKey: .connections) ?? []
         ui = try c.decodeIfPresent(GraphDocumentUI.self, forKey: .ui)
@@ -202,9 +260,11 @@ struct GraphDocument: Codable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(2, forKey: .formatVersion)
         try c.encode(resolution, forKey: .resolution)
         if !sink.isEmpty {
             try c.encode(sink, forKey: .sink)
+            try c.encode(sinkOutput, forKey: .sinkOutput)
         }
         try c.encode(nodes, forKey: .nodes)
         try c.encode(connections, forKey: .connections)
@@ -228,15 +288,19 @@ struct GraphDocument: Codable {
     }
 
     static func emptyDocument(width: UInt32 = 512, height: UInt32 = 512) -> GraphDocument {
-        GraphDocument(resolution: GraphResolution(width: width, height: height),
+        GraphDocument(formatVersion: 2,
+                      resolution: GraphResolution(width: width, height: height),
                       sink: "",
+                      sinkOutput: "",
                       nodes: [],
                       connections: [],
                       ui: GraphDocumentUI())
     }
 
     mutating func ensureLayout() {
+        formatVersion = 2
         ensureNodeDefaults()
+        migrateNamedOutputs()
         repairRiverCarveConnections()
         if ui == nil { ui = GraphDocumentUI() }
         var positions = ui?.positions ?? [:]
@@ -253,6 +317,44 @@ struct GraphDocument: Codable {
                 ui?.maskErases.removeValue(forKey: key)
             }
         }
+    }
+
+    private mutating func migrateNamedOutputs() {
+        for index in connections.indices where connections[index].output.isEmpty {
+            guard let source = node(id: connections[index].from) else { continue }
+            connections[index].output = Self.defaultOutputName(for: source.type)
+        }
+        if sink.isEmpty {
+            sinkOutput = ""
+        } else if let sinkNode = node(id: sink) {
+            let names = Set(Self.outputPorts(for: sinkNode.type).map(\.name))
+            if sinkOutput.isEmpty || !names.contains(sinkOutput) {
+                sinkOutput = Self.defaultOutputName(for: sinkNode.type)
+            }
+        }
+        guard var eraseNodes = ui?.maskErases else { return }
+        for (nodeId, var outputs) in eraseNodes {
+            guard let graphNode = node(id: nodeId) else {
+                eraseNodes.removeValue(forKey: nodeId)
+                continue
+            }
+            let defaultOutput = Self.defaultOutputName(for: graphNode.type)
+            if let legacy = outputs.removeValue(forKey: ""), !legacy.isEmpty {
+                outputs[defaultOutput, default: []].append(contentsOf: legacy)
+            }
+            let validMaskOutputs = Set(Self.outputPorts(for: graphNode.type)
+                .filter {
+                    resolvedOutputKind(nodeId: nodeId, output: $0.name) == .mask
+                }
+                .map(\.name))
+            outputs = outputs.filter { validMaskOutputs.contains($0.key) }
+            if outputs.isEmpty {
+                eraseNodes.removeValue(forKey: nodeId)
+            } else {
+                eraseNodes[nodeId] = outputs
+            }
+        }
+        ui?.maskErases = eraseNodes
     }
 
     mutating func ensureNodeDefaults() {
@@ -273,16 +375,17 @@ struct GraphDocument: Codable {
 
     private mutating func migrateLegacySlopeMaskDefaults(index: Int) {
         guard nodes[index].type == "slopemask" else { return }
+        let defaults = Self.defaultParams(for: "slopemask")
         let params = nodes[index].params
-        let low = params["low"] ?? 15.0
-        let high = params["high"] ?? 55.0
-        let heightScale = params["heightScale"] ?? 1.0
+        let low = params["low"] ?? defaults["low"] ?? 15.0
+        let high = params["high"] ?? defaults["high"] ?? 50.0
+        let heightScale = params["heightScale"] ?? defaults["heightScale"] ?? 100.0
         if (low >= -1.0 && low <= 1.0 && high >= -1.0 && high <= 1.0) ||
             high <= low ||
             heightScale == 64.0 {
-            nodes[index].params["low"] = 15.0
-            nodes[index].params["high"] = 55.0
-            nodes[index].params["heightScale"] = 1.0
+            nodes[index].params["low"] = defaults["low"] ?? 15.0
+            nodes[index].params["high"] = defaults["high"] ?? 50.0
+            nodes[index].params["heightScale"] = defaults["heightScale"] ?? 100.0
         }
     }
 
@@ -310,6 +413,7 @@ struct GraphDocument: Codable {
         }
         if sink.isEmpty && inputCount(for: type) == 0 {
             sink = id
+            sinkOutput = Self.defaultOutputName(for: type)
         }
         return id
     }
@@ -332,11 +436,15 @@ struct GraphDocument: Codable {
         }
         for edge in connections where ids.contains(edge.from) && ids.contains(edge.to) {
             guard let from = idMap[edge.from], let to = idMap[edge.to] else { continue }
-            connections.append(GraphDocumentConnection(from: from, to: to, input: edge.input))
+            connections.append(GraphDocumentConnection(from: from,
+                                                       output: edge.output,
+                                                       to: to,
+                                                       input: edge.input))
         }
         if let oldSink = ids.contains(sink) ? sink : originals.last?.id,
            let newSink = idMap[oldSink] {
-            sink = newSink
+            let duplicatedOutput = oldSink == sink ? sinkOutput : ""
+            setSink(nodeId: newSink, output: duplicatedOutput)
         }
         return duplicatedIds
     }
@@ -345,7 +453,11 @@ struct GraphDocument: Codable {
         nodes.removeAll { $0.id == id }
         connections.removeAll { $0.from == id || $0.to == id }
         ui?.positions.removeValue(forKey: id)
-        if sink == id { sink = nodes.last?.id ?? "" }
+        ui?.maskErases.removeValue(forKey: id)
+        if sink == id {
+            sink = nodes.last?.id ?? ""
+            sinkOutput = node(id: sink).map { Self.defaultOutputName(for: $0.type) } ?? ""
+        }
     }
 
     mutating func deleteNodes(ids: Set<String>) {
@@ -357,6 +469,7 @@ struct GraphDocument: Codable {
         }
         if ids.contains(sink) {
             sink = nodes.last?.id ?? ""
+            sinkOutput = node(id: sink).map { Self.defaultOutputName(for: $0.type) } ?? ""
         }
     }
 
@@ -375,22 +488,73 @@ struct GraphDocument: Codable {
         ui?.preview = settings
     }
 
-    mutating func addMaskEraseStroke(nodeId: String, stroke: GraphMaskEraseStroke) {
-        if ui == nil { ui = GraphDocumentUI() }
-        ui?.maskErases[nodeId, default: []].append(stroke)
+    mutating func addMaskEraseStroke(nodeId: String, output: String,
+                                     stroke: GraphMaskEraseStroke) {
+        addMaskEraseStrokes(nodeId: nodeId, output: output, strokes: [stroke])
     }
 
-    mutating func clearMaskEraseStrokes(nodeId: String) {
-        ui?.maskErases.removeValue(forKey: nodeId)
+    mutating func addMaskEraseStroke(nodeId: String, stroke: GraphMaskEraseStroke) {
+        guard let type = node(id: nodeId)?.type else { return }
+        addMaskEraseStroke(nodeId: nodeId,
+                           output: Self.defaultOutputName(for: type),
+                           stroke: stroke)
+    }
+
+    mutating func addMaskEraseStrokes(nodeId: String, output: String,
+                                      strokes: [GraphMaskEraseStroke]) {
+        guard !strokes.isEmpty else { return }
+        if ui == nil { ui = GraphDocumentUI() }
+        ui?.maskErases[nodeId, default: [:]][output, default: []]
+            .append(contentsOf: strokes)
+    }
+
+    mutating func addMaskEraseStrokes(nodeId: String,
+                                      strokes: [GraphMaskEraseStroke]) {
+        guard let type = node(id: nodeId)?.type else { return }
+        addMaskEraseStrokes(nodeId: nodeId,
+                            output: Self.defaultOutputName(for: type),
+                            strokes: strokes)
+    }
+
+    mutating func clearMaskEraseStrokes(nodeId: String, output: String? = nil) {
+        if let output {
+            ui?.maskErases[nodeId]?.removeValue(forKey: output)
+            if ui?.maskErases[nodeId]?.isEmpty == true {
+                ui?.maskErases.removeValue(forKey: nodeId)
+            }
+        } else {
+            ui?.maskErases.removeValue(forKey: nodeId)
+        }
+    }
+
+    @discardableResult
+    mutating func resetNodeState(nodeId: String) -> Bool {
+        guard let index = nodes.firstIndex(where: { $0.id == nodeId }) else {
+            return false
+        }
+        nodes[index].params = Self.defaultParams(for: nodes[index].type)
+        clearMaskEraseStrokes(nodeId: nodeId)
+        return true
+    }
+
+    func maskEraseStrokes(nodeId: String, output: String) -> [GraphMaskEraseStroke] {
+        ui?.maskErases[nodeId]?[output] ?? []
     }
 
     func maskEraseStrokes(nodeId: String) -> [GraphMaskEraseStroke] {
-        ui?.maskErases[nodeId] ?? []
+        guard let type = node(id: nodeId)?.type else { return [] }
+        return maskEraseStrokes(nodeId: nodeId,
+                                output: Self.defaultOutputName(for: type))
     }
 
-    mutating func connect(from: String, to: String, input: UInt32) {
+    mutating func connect(from: String, output: String = "",
+                          to: String, input: UInt32) {
         connections.removeAll { $0.to == to && $0.input == input }
-        let edge = GraphDocumentConnection(from: from, to: to, input: input)
+        let resolvedOutput = output.isEmpty
+            ? node(id: from).map { Self.defaultOutputName(for: $0.type) } ?? ""
+            : output
+        let edge = GraphDocumentConnection(from: from, output: resolvedOutput,
+                                           to: to, input: input)
         if !connections.contains(edge) {
             connections.append(edge)
         }
@@ -422,6 +586,86 @@ struct GraphDocument: Codable {
 
     func upstreamNodeId(to nodeId: String, input: UInt32) -> String? {
         connections.first { $0.to == nodeId && $0.input == input }?.from
+    }
+
+    func outputPorts(nodeId: String) -> [GraphOutputPort] {
+        guard let node = node(id: nodeId) else { return [] }
+        return Self.outputPorts(for: node.type)
+    }
+
+    func resolvedOutputKind(nodeId: String, output: String,
+                            visited: Set<GraphOutputReference> = []) -> GraphFieldKind? {
+        guard let graphNode = node(id: nodeId) else { return nil }
+        let selected = output.isEmpty ? Self.defaultOutputName(for: graphNode.type) : output
+        let reference = GraphOutputReference(node: nodeId, output: selected)
+        guard !visited.contains(reference),
+              let port = Self.outputPorts(for: graphNode.type)
+                .first(where: { $0.name == selected }) else { return nil }
+        guard let inheritedInput = port.inheritInput else { return port.declaredKind }
+        guard let edge = connections.first(where: {
+            $0.to == nodeId && $0.input == UInt32(inheritedInput)
+        }) else { return port.declaredKind }
+        var nextVisited = visited
+        nextVisited.insert(reference)
+        return resolvedOutputKind(nodeId: edge.from, output: edge.output,
+                                  visited: nextVisited)
+    }
+
+    func terrainReference(for reference: GraphOutputReference,
+                          visited: Set<String> = []) -> GraphOutputReference? {
+        guard !visited.contains(reference.node),
+              let graphNode = node(id: reference.node) else { return nil }
+        for port in Self.outputPorts(for: graphNode.type) {
+            if resolvedOutputKind(nodeId: reference.node, output: port.name) == .terrain {
+                return GraphOutputReference(node: reference.node, output: port.name)
+            }
+        }
+        var nextVisited = visited
+        nextVisited.insert(reference.node)
+        for edge in connections.filter({ $0.to == reference.node })
+            .sorted(by: { $0.input < $1.input }) {
+            let upstream = GraphOutputReference(node: edge.from, output: edge.output)
+            if let terrain = terrainReference(for: upstream, visited: nextVisited) {
+                return terrain
+            }
+        }
+        return nil
+    }
+
+    mutating func setSink(nodeId: String, output: String = "") {
+        sink = nodeId
+        guard let type = node(id: nodeId)?.type else {
+            sinkOutput = ""
+            return
+        }
+        let names = Set(Self.outputPorts(for: type).map(\.name))
+        sinkOutput = !output.isEmpty && names.contains(output)
+            ? output : Self.defaultOutputName(for: type)
+    }
+
+    static func outputPorts(for type: String) -> [GraphOutputPort] {
+        let count = theia.graph_node_type_output_count(type)
+        return (0..<count).compactMap { index in
+            let name = readCxxString {
+                theia.graph_node_type_output_name(type, index, $0, $1)
+            }
+            let kindName = readCxxString {
+                theia.graph_node_type_output_kind(type, index, $0, $1)
+            }
+            guard !name.isEmpty, let kind = GraphFieldKind(rawValue: kindName) else {
+                return nil
+            }
+            let inherited = theia.graph_node_type_output_inherit_input(type, index)
+            return GraphOutputPort(name: name,
+                                   declaredKind: kind,
+                                   inheritInput: inherited >= 0 ? Int(inherited) : nil,
+                                   isDefault: theia.graph_node_type_output_is_default(type, index))
+        }
+    }
+
+    static func defaultOutputName(for type: String) -> String {
+        let ports = outputPorts(for: type)
+        return ports.first(where: \.isDefault)?.name ?? ports.first?.name ?? ""
     }
 
     static func defaultParams(for type: String) -> [String: Double] {

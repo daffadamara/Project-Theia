@@ -20,6 +20,7 @@ struct Args {
     var shotPath: String?
     var size: UInt32 = 0      // 0 => default (512)
     var smoke = false
+    var selfTest = false
     // optional camera overrides (mainly for --shot verification)
     var azimuth: Float?
     var elevation: Float?
@@ -39,6 +40,7 @@ func parseArgs() -> Args {
         case "--el": if let v = nextFloat() { a.elevation = v * .pi / 180; i += 1 }
         case "--dist": if let v = nextFloat() { a.distance = v; i += 1 }
         case "--smoke": a.smoke = true
+        case "--self-test": a.selfTest = true
         default:
             if !argv[i].hasPrefix("--") { a.graphPath = argv[i] }
         }
@@ -128,6 +130,9 @@ final class AutosaveController: NSObject {
 }
 
 let args = parseArgs()
+if args.selfTest {
+    exit(runViewerSelfTests())
+}
 let viewSize: UInt32 = args.size != 0 ? args.size : 512
 
 guard let device = MTLCreateSystemDefaultDevice() else { fail("no Metal device available") }
@@ -154,10 +159,11 @@ if let shot = args.shotPath {
     guard let renderer = Renderer(device: device, colorFormat: .bgra8Unorm) else {
         fail("renderer init failed")
     }
+    renderer.setHeights(initialHeights, width: initialW, height: initialH)
     applyCameraOverrides(renderer)
     let model = TerrainModel(engine: engine, renderer: renderer, size: viewSize)
-    if let initialEval {
-        model.record(initialEval.result)
+    guard model.refreshTerrainSynchronously() else {
+        fail("snapshot preview failed: \(engine.lastError())")
     }
     let ok = renderer.renderToPNG(path: shot, width: 1200, height: 800)
     print(ok ? "✅ wrote \(shot)" : "❌ offscreen render failed")
@@ -179,9 +185,15 @@ let mtkView = TerrainMTKView(frame: frame, device: device)
 mtkView.colorPixelFormat = .bgra8Unorm
 mtkView.depthStencilPixelFormat = .depth32Float
 mtkView.clearColor = MTLClearColor(red: 0.09, green: 0.11, blue: 0.14, alpha: 1.0)
+mtkView.isPaused = true
+mtkView.enableSetNeedsDisplay = true
 
 guard let renderer = Renderer(device: device, colorFormat: mtkView.colorPixelFormat) else {
     fail("renderer init failed")
+}
+renderer.displayInvalidationHandler = { [weak mtkView] in
+    guard let mtkView else { return }
+    mtkView.setNeedsDisplay(mtkView.bounds)
 }
 renderer.setHeights(initialHeights, width: initialW, height: initialH)
 applyCameraOverrides(renderer)

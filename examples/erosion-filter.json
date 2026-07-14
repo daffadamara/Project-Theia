@@ -1,0 +1,37 @@
+{
+  "formatVersion": 2,
+  "resolution": { "width": 512, "height": 512 },
+  "sink": "gullies",
+  "sinkOutput": "height",
+  "nodes": [
+    {
+      "id": "base",
+      "type": "perlin",
+      "params": {
+        "seed": 2026,
+        "octaves": 3,
+        "frequency": 1.4,
+        "lacunarity": 2.0,
+        "gain": 0.45,
+        "heightScale": 1.0
+      }
+    },
+    {
+      "id": "gullies",
+      "type": "erosionfilter",
+      "params": {
+        "seed": 1337,
+        "scale": 0.1,
+        "strength": 0.18,
+        "octaves": 5,
+        "gain": 0.5,
+        "gullyWeight": 0.5,
+        "detail": 1.5,
+        "heightOffset": -0.65
+      }
+    }
+  ],
+  "connections": [
+    { "from": "base", "output": "height", "to": "gullies", "input": 0 }
+  ]
+}

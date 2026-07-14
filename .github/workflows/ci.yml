@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-render:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: |
+          uname -m
+          sw_vers
+          swift --version
+
+      - name: Build all products
+        run: swift build
+
+      - name: Run core and CLI regression suite
+        run: swift run --skip-build theia-tests
+
+      - name: Run headless viewer authoring tests
+        run: .build/debug/theia-viewer --self-test
+
+      - name: Validate example graph diagnostics
+        run: |
+          for graph in examples/*.json; do
+            .build/debug/theia-cli diagnose "$graph" --json > /dev/null
+          done
+
+      - name: Render viewer smoke artifact
+        run: |
+          mkdir -p .ci-artifacts
+          .build/debug/theia-viewer --shot .ci-artifacts/foundation.png examples/foundation.json --size 128
+          test -s .ci-artifacts/foundation.png
+
+      - name: Upload viewer smoke render
+        uses: actions/upload-artifact@v4
+        with:
+          name: viewer-smoke-render
+          path: .ci-artifacts/foundation.png
+
+      - name: Check patch whitespace
+        run: git diff --check

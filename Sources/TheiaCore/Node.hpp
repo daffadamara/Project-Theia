@@ -16,6 +16,28 @@ namespace theia {
 class GPUContext;
 class Heightfield;
 
+enum class FieldKind : std::uint32_t {
+    terrain = 0,
+    mask = 1,
+    data = 2,
+};
+
+const char* fieldKindName(FieldKind kind);
+
+struct InputPortDescriptor {
+    std::string name;
+    std::vector<FieldKind> acceptedKinds;
+};
+
+struct OutputPortDescriptor {
+    std::string name;
+    FieldKind kind = FieldKind::data;
+    // Generic transforms use the resolved kind of one input while retaining a
+    // concrete fallback kind for type catalog introspection.
+    int inheritInput = -1;
+    bool isDefault = false;
+};
+
 // All node parameters are scalars stored as double (cast as needed by nodes).
 // Ordered map => deterministic iteration for hashing/serialization.
 struct ParamSet {
@@ -42,11 +64,23 @@ public:
     // Number of heightfield inputs this node consumes (0 for generators).
     virtual std::size_t inputCount() const = 0;
 
+    // Stable named port descriptors. Existing nodes use the centralized
+    // defaults in Node.cpp; multi-output nodes can override as needed.
+    virtual std::vector<InputPortDescriptor> inputPorts() const;
+    virtual std::vector<OutputPortDescriptor> outputPorts() const;
+
     // Produce this node's output into `out` (already allocated at the graph
     // resolution). `inputs` holds inputCount() resolved upstream heightfields.
     virtual bool evaluate(GPUContext& ctx,
                           const std::vector<const Heightfield*>& inputs,
                           Heightfield& out, std::string& error) = 0;
+
+    // Atomic multi-output adapter. The default keeps every legacy node source
+    // compatible by evaluating its first/default output only.
+    virtual bool evaluateOutputs(GPUContext& ctx,
+                                 const std::vector<const Heightfield*>& inputs,
+                                 const std::vector<Heightfield*>& outputs,
+                                 std::string& error);
 
     // Content hash of type + parameters. Basis for incremental cache keys: if a
     // param changes, this changes, which changes the node's (and descendants')

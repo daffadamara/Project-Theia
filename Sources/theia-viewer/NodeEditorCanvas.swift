@@ -1,19 +1,19 @@
 import AppKit
 import SwiftUI
 
-private let nodeSize = CGSize(width: 150, height: 96)
-private let inputGap: CGFloat = 18
+let nodeSize = CGSize(width: 150, height: 96)
+let inputGap: CGFloat = 18
 private let minCanvasZoom = 0.35
 private let maxCanvasZoom = 2.5
 
-private struct NodeTypeGroup: Identifiable {
+struct NodeTypeGroup: Identifiable {
     let id: String
     let title: String
     let systemImage: String
     let types: [String]
 }
 
-private enum NodeTypeCatalog {
+enum NodeTypeCatalog {
     private static let groups: [NodeTypeGroup] = [
         NodeTypeGroup(id: "source", title: "Source", systemImage: "sparkles",
                       types: ["perlin", "ridged"]),
@@ -26,7 +26,7 @@ private enum NodeTypeCatalog {
         NodeTypeGroup(id: "mask", title: "Mask", systemImage: "circle.lefthalf.filled",
                       types: ["slopemask", "invert", "clamp", "remap"]),
         NodeTypeGroup(id: "erosion", title: "Erosion", systemImage: "drop.triangle",
-                      types: ["hydraulic", "thermal", "dropleterosion"]),
+                      types: ["erosionfilter", "hydraulic", "thermal", "dropleterosion"]),
         NodeTypeGroup(id: "river", title: "River", systemImage: "water.waves",
                       types: ["river", "rivercarve"]),
         NodeTypeGroup(id: "output", title: "Output", systemImage: "square.and.arrow.up",
@@ -60,6 +60,7 @@ private enum NodeTypeCatalog {
         switch type {
         case "scalebias": return "Scale Bias"
         case "dropleterosion": return "Droplet Erosion"
+        case "erosionfilter": return "Erosion Filter"
         case "rivercarve": return "River Carve"
         case "slopemask": return "Slope Mask"
         default:
@@ -79,7 +80,7 @@ struct NodeEditorCanvas: View {
     @State private var nodeDragId: String?
     @State private var marqueeStart: CGPoint?
     @State private var marqueeEnd: CGPoint?
-    @State private var pendingSource: String?
+    @State private var pendingSource: GraphOutputReference?
     @State private var pendingPoint: CGPoint?
 
     var body: some View {
@@ -96,7 +97,7 @@ struct NodeEditorCanvas: View {
 
                 ForEach(model.document.connections) { edge in
                     EdgeView(edge: edge,
-                             start: screen(outputPort(edge.from)),
+                             start: screen(outputPort(edge.from, output: edge.output)),
                              end: screen(inputPort(edge.to, input: edge.input)),
                              selected: model.selectedConnectionId == edge.id,
                              zoom: zoom)
@@ -111,7 +112,8 @@ struct NodeEditorCanvas: View {
                 }
 
                 if let source = pendingSource, let point = pendingPoint {
-                    EdgeShape(start: screen(outputPort(source)),
+                    EdgeShape(start: screen(outputPort(source.node,
+                                                       output: source.output)),
                               end: point,
                               minHandle: 50 * CGFloat(zoom))
                         .stroke(.blue, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
@@ -139,6 +141,7 @@ struct NodeEditorCanvas: View {
                              position: screen(nodePosition(node.id)),
                              selected: model.selectedNodeIds.contains(node.id),
                              inputCount: model.document.inputCount(for: node.type),
+                             outputPorts: model.outputPorts(for: node.id),
                              connectedInputs: connectedInputs(for: node.id),
                              missingInputs: model.missingDiagnosticInputs(for: node.id),
                              diagnosticSeverity: model.diagnosticSeverity(for: node.id),
@@ -160,12 +163,16 @@ struct NodeEditorCanvas: View {
                                      viewport.setNeedsDisplay(viewport.bounds)
                                  }
                              },
-                             onOutputDragChanged: { point in
-                                 pendingSource = node.id
+                             onOutputDragChanged: { output, point in
+                                 pendingSource = GraphOutputReference(node: node.id,
+                                                                      output: output)
                                  pendingPoint = point
                              },
-                             onOutputDragEnded: { point in
-                                 finishConnectionDrop(from: node.id, point: point)
+                             onOutputDragEnded: { output, point in
+                                 finishConnectionDrop(
+                                    from: GraphOutputReference(node: node.id,
+                                                               output: output),
+                                    point: point)
                              },
                              zoom: zoom)
                     .gesture(DragGesture(minimumDistance: 1)
@@ -314,9 +321,14 @@ struct NodeEditorCanvas: View {
         CGPoint(x: (point.x - pan.width) / zoom, y: (point.y - pan.height) / zoom)
     }
 
-    private func outputPort(_ id: String) -> CGPoint {
+    private func outputPort(_ id: String, output: String) -> CGPoint {
         let p = nodePosition(id)
-        return CGPoint(x: p.x + nodeSize.width, y: p.y + nodeSize.height * 0.5)
+        let outputs = model.outputPorts(for: id)
+        let count = max(1, outputs.count)
+        let index = outputs.firstIndex(where: { $0.name == output }) ?? 0
+        let startY = nodeSize.height * 0.5 - CGFloat(count - 1) * inputGap * 0.5
+        return CGPoint(x: p.x + nodeSize.width,
+                       y: p.y + startY + CGFloat(index) * inputGap)
     }
 
     private func inputPort(_ id: String, input: UInt32) -> CGPoint {
@@ -328,14 +340,15 @@ struct NodeEditorCanvas: View {
         Set(model.document.connections.compactMap { $0.to == nodeId ? $0.input : nil })
     }
 
-    private func finishConnection(from: String, to: String, input: UInt32) {
+    private func finishConnection(from: GraphOutputReference,
+                                  to: String, input: UInt32) {
         pendingSource = nil
         pendingPoint = nil
-        model.connect(from: from, to: to, input: input)
+        model.connect(from: from.node, output: from.output, to: to, input: input)
         viewport.setNeedsDisplay(viewport.bounds)
     }
 
-    private func finishConnectionDrop(from: String, point: CGPoint) {
+    private func finishConnectionDrop(from: GraphOutputReference, point: CGPoint) {
         let docPoint = documentPoint(point)
         var best: (node: String, input: UInt32, distance: CGFloat)?
         for node in model.document.nodes {
@@ -794,373 +807,5 @@ private struct NodeSearchField: NSViewRepresentable {
             guard let field = notification.object as? NSSearchField else { return }
             text = field.stringValue
         }
-    }
-}
-
-struct NodeCard: View {
-    let node: GraphDocumentNode
-    let position: CGPoint
-    let selected: Bool
-    let inputCount: UInt32
-    let connectedInputs: Set<UInt32>
-    let missingInputs: Set<UInt32>
-    let diagnosticSeverity: String?
-    let onSelect: () -> Void
-    let onDelete: () -> Void
-    let onDuplicate: () -> Void
-    let onSelectUpstream: () -> Void
-    let onSelectDownstream: () -> Void
-    let onInputTap: (UInt32) -> Void
-    let onInputDisconnect: (UInt32) -> Void
-    let onOutputDragChanged: (CGPoint) -> Void
-    let onOutputDragEnded: (CGPoint) -> Void
-    let zoom: Double
-
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color(nsColor: .controlBackgroundColor))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(borderColor,
-                                lineWidth: selected ? 2 : 1))
-                .shadow(color: selected ? .accentColor.opacity(0.22) : .black.opacity(0.22),
-                        radius: selected ? 7 : 4,
-                        y: selected ? 0 : 2)
-
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(node.id)
-                        .font(.caption.weight(.semibold))
-                        .lineLimit(1)
-                    Spacer()
-                }
-                Text(node.type)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(10)
-
-            if isMaskNode {
-                Image(systemName: "circle.lefthalf.filled")
-                    .font(.caption2)
-                    .foregroundStyle(Color.cyan.opacity(0.85))
-                    .position(x: nodeSize.width - 14, y: 14)
-            }
-
-            if node.type == "export" {
-                badge(systemImage: "square.and.arrow.up",
-                      color: .purple)
-                    .position(x: nodeSize.width - 14, y: 14)
-            }
-
-            if let diagnosticSeverity {
-                badge(systemImage: diagnosticSeverity == "error"
-                      ? "exclamationmark.triangle.fill"
-                      : "exclamationmark.circle.fill",
-                      color: diagnosticSeverity == "error" ? .red : .orange)
-                    .position(x: nodeSize.width - 14, y: isMaskNode || node.type == "export" ? 32 : 14)
-                    .transition(.scale.combined(with: .opacity))
-            }
-
-            ForEach(0..<Int(inputCount), id: \.self) { input in
-                PortView(color: .green,
-                         warning: missingInputs.contains(UInt32(input)))
-                    .position(x: 0, y: 34 + CGFloat(input) * inputGap)
-                    .onTapGesture { onInputTap(UInt32(input)) }
-                    .contextMenu {
-                        if connectedInputs.contains(UInt32(input)) {
-                            Button("Disconnect") {
-                                onInputDisconnect(UInt32(input))
-                            }
-                        }
-                    }
-            }
-
-            PortView(color: .blue)
-                .position(x: nodeSize.width, y: nodeSize.height * 0.5)
-                .gesture(DragGesture(coordinateSpace: .named("node-canvas"))
-                    .onChanged { onOutputDragChanged($0.location) }
-                    .onEnded { onOutputDragEnded($0.location) })
-        }
-        .frame(width: nodeSize.width, height: nodeSize.height)
-        .scaleEffect(zoom, anchor: .center)
-        .position(x: position.x + nodeSize.width * CGFloat(zoom) * 0.5,
-                  y: position.y + nodeSize.height * CGFloat(zoom) * 0.5)
-        .onTapGesture(perform: onSelect)
-        .animation(.easeOut(duration: 0.14), value: selected)
-        .animation(.easeOut(duration: 0.14), value: diagnosticSeverity)
-        .contextMenu {
-            Button("Duplicate", action: onDuplicate)
-            Divider()
-            Button("Select Upstream", action: onSelectUpstream)
-            Button("Select Downstream", action: onSelectDownstream)
-            Divider()
-            Button("Delete", role: .destructive, action: onDelete)
-        }
-    }
-
-    private func badge(systemImage: String, color: Color) -> some View {
-        Image(systemName: systemImage)
-            .font(.caption2.weight(.bold))
-            .foregroundStyle(color)
-            .frame(width: 16, height: 16)
-            .background(Color.black.opacity(0.42), in: Circle())
-    }
-
-    private var isMaskNode: Bool {
-        node.type == "slopemask" || node.type == "river"
-    }
-
-    private var borderColor: Color {
-        if selected { return .accentColor }
-        if diagnosticSeverity == "error" { return Color.red.opacity(0.75) }
-        if isMaskNode { return Color.cyan.opacity(0.55) }
-        return Color.secondary.opacity(0.35)
-    }
-}
-
-struct PortView: View {
-    let color: Color
-    var warning = false
-
-    var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 11, height: 11)
-            .overlay(Circle().stroke(.white.opacity(0.75), lineWidth: 1))
-    }
-}
-
-struct EdgeView: View {
-    let edge: GraphDocumentConnection
-    let start: CGPoint
-    let end: CGPoint
-    let selected: Bool
-    let zoom: Double
-
-    var body: some View {
-        ZStack {
-            EdgeShape(start: start, end: end, minHandle: 50 * CGFloat(zoom))
-                .stroke(Color.primary.opacity(0.001),
-                        style: StrokeStyle(lineWidth: max(6, 16 * CGFloat(zoom)),
-                                           lineCap: .round))
-            EdgeShape(start: start, end: end, minHandle: 50 * CGFloat(zoom))
-                .stroke(selected ? Color.accentColor : Color.secondary,
-                        style: StrokeStyle(lineWidth: max(1, (selected ? 3 : 2) * CGFloat(zoom)),
-                                           lineCap: .round))
-        }
-    }
-}
-
-struct EdgeShape: Shape {
-    var start: CGPoint
-    var end: CGPoint
-    var minHandle: CGFloat = 50
-
-    func path(in rect: CGRect) -> Path {
-        var p = Path()
-        let dx = max(minHandle, abs(end.x - start.x) * 0.45)
-        p.move(to: start)
-        p.addCurve(to: end,
-                   control1: CGPoint(x: start.x + dx, y: start.y),
-                   control2: CGPoint(x: end.x - dx, y: end.y))
-        return p
-    }
-}
-
-struct CanvasGrid: View {
-    let pan: CGSize
-    let zoom: Double
-
-    var body: some View {
-        Canvas { context, size in
-            let step = max(6, 24 * CGFloat(zoom))
-            var minor = Path()
-            var major = Path()
-
-            var x = pan.width.truncatingRemainder(dividingBy: step)
-            if x > 0 { x -= step }
-            while x <= size.width {
-                let index = Int(round((x - pan.width) / step))
-                if index.isMultiple(of: 5) {
-                    major.move(to: CGPoint(x: x, y: 0))
-                    major.addLine(to: CGPoint(x: x, y: size.height))
-                } else {
-                    minor.move(to: CGPoint(x: x, y: 0))
-                    minor.addLine(to: CGPoint(x: x, y: size.height))
-                }
-                x += step
-            }
-
-            var y = pan.height.truncatingRemainder(dividingBy: step)
-            if y > 0 { y -= step }
-            while y <= size.height {
-                let index = Int(round((y - pan.height) / step))
-                if index.isMultiple(of: 5) {
-                    major.move(to: CGPoint(x: 0, y: y))
-                    major.addLine(to: CGPoint(x: size.width, y: y))
-                } else {
-                    minor.move(to: CGPoint(x: 0, y: y))
-                    minor.addLine(to: CGPoint(x: size.width, y: y))
-                }
-                y += step
-            }
-
-            context.stroke(minor, with: .color(.secondary.opacity(0.10)), lineWidth: 1)
-            context.stroke(major, with: .color(.secondary.opacity(0.18)), lineWidth: 1)
-        }
-    }
-}
-
-struct CanvasMouseEventView: NSViewRepresentable {
-    let onChanged: (CGSize) -> Void
-    let onEnded: () -> Void
-    let onZoom: (CGFloat, CGPoint) -> Void
-    let onPanBy: (CGSize) -> Void
-    let nodeTypes: [String]
-    let onAddNode: (String, CGPoint) -> Void
-    let isOverNode: (CGPoint) -> Bool
-
-    func makeNSView(context: Context) -> NSView {
-        let view = CanvasMouseEventNSView()
-        apply(to: view)
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        guard let view = nsView as? CanvasMouseEventNSView else { return }
-        apply(to: view)
-    }
-
-    private func apply(to view: CanvasMouseEventNSView) {
-        view.onChanged = onChanged
-        view.onEnded = onEnded
-        view.onZoom = onZoom
-        view.onPanBy = onPanBy
-        view.nodeTypes = nodeTypes
-        view.onAddNode = onAddNode
-        view.isOverNode = isOverNode
-    }
-}
-
-// Canvas navigation, following node-editor conventions (Godot GraphEdit /
-// Blender / Figma):
-//   two-finger scroll        pan
-//   pinch or cmd+scroll      zoom about the cursor
-//   right-drag / MMB-drag    pan
-//   right-click empty space  add-node context menu at the cursor
-final class CanvasMouseEventNSView: NSView {
-    var onChanged: ((CGSize) -> Void)?
-    var onEnded: (() -> Void)?
-    var onZoom: ((CGFloat, CGPoint) -> Void)?
-    var onPanBy: ((CGSize) -> Void)?
-    var nodeTypes: [String] = []
-    var onAddNode: ((String, CGPoint) -> Void)?
-    var isOverNode: ((CGPoint) -> Bool)?
-    private var start: NSPoint?
-    private var dragDistance: CGFloat = 0
-    private var contextPoint: CGPoint = .zero
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        guard let event = window?.currentEvent else { return nil }
-        switch event.type {
-        case .rightMouseDown, .rightMouseDragged, .rightMouseUp:
-            let local = convert(point, from: superview)
-            let flipped = CGPoint(x: local.x, y: bounds.height - local.y)
-            if event.type == .rightMouseDown, isOverNode?(flipped) == true {
-                return nil
-            }
-            return self
-        case .otherMouseDown, .otherMouseDragged, .otherMouseUp,
-             .scrollWheel, .magnify:
-            return self
-        default:
-            return nil
-        }
-    }
-
-    override func rightMouseDown(with event: NSEvent) { beginDrag(event) }
-    override func rightMouseDragged(with event: NSEvent) { dragged(event) }
-    override func rightMouseUp(with event: NSEvent) {
-        let wasClick = dragDistance < 4
-        endDrag()
-        if wasClick { showAddMenu(with: event) }
-    }
-    override func otherMouseDown(with event: NSEvent) { beginDrag(event) }
-    override func otherMouseDragged(with event: NSEvent) { dragged(event) }
-    override func otherMouseUp(with event: NSEvent) { endDrag() }
-
-    private func beginDrag(_ event: NSEvent) {
-        start = event.locationInWindow
-        dragDistance = 0
-    }
-
-    private func dragged(_ event: NSEvent) {
-        guard let start else { return }
-        let p = event.locationInWindow
-        dragDistance = max(dragDistance, abs(p.x - start.x) + abs(p.y - start.y))
-        onChanged?(CGSize(width: p.x - start.x, height: p.y - start.y))
-    }
-
-    private func endDrag() {
-        start = nil
-        onEnded?()
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        let point = localPoint(event)
-        if event.modifierFlags.contains(.command) {
-            onZoom?(event.scrollingDeltaY, point)
-        } else {
-            onPanBy?(CGSize(width: event.scrollingDeltaX,
-                            height: event.scrollingDeltaY))
-        }
-    }
-
-    override func magnify(with event: NSEvent) {
-        onZoom?(event.magnification * 100, localPoint(event))
-    }
-
-    private func localPoint(_ event: NSEvent) -> CGPoint {
-        let local = convert(event.locationInWindow, from: nil)
-        return CGPoint(x: local.x, y: bounds.height - local.y)
-    }
-
-    private func showAddMenu(with event: NSEvent) {
-        guard !nodeTypes.isEmpty else { return }
-        contextPoint = localPoint(event)
-        let menu = NSMenu()
-        let header = NSMenuItem(title: "Add Node", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        menu.addItem(.separator())
-        let groups = NodeTypeCatalog.grouped(nodeTypes)
-        for (index, group) in groups.enumerated() {
-            if index > 0 {
-                menu.addItem(.separator())
-            }
-            let groupItem = NSMenuItem(title: group.title, action: nil, keyEquivalent: "")
-            groupItem.image = NSImage(systemSymbolName: group.systemImage,
-                                      accessibilityDescription: group.title)
-            groupItem.isEnabled = false
-            menu.addItem(groupItem)
-            for type in group.types {
-                let item = NSMenuItem(title: NodeTypeCatalog.title(for: type),
-                                      action: #selector(addNodeItem(_:)),
-                                      keyEquivalent: "")
-                item.indentationLevel = 1
-                item.representedObject = type
-                item.target = self
-                menu.addItem(item)
-            }
-        }
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
-    }
-
-    @objc private func addNodeItem(_ sender: NSMenuItem) {
-        guard let type = sender.representedObject as? String else { return }
-        onAddNode?(type, contextPoint)
     }
 }

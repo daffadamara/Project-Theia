@@ -292,7 +292,7 @@ void splat(std::vector<float>& mask, std::uint32_t w, std::uint32_t h,
             const float dy = float(yy) - y;
             const float d2 = dx * dx + dy * dy;
             if (d2 > r2) continue;
-            const float k = smoothStep(1.0f, 0.0f, d2 / r2);
+            const float k = 1.0f - smoothStep(0.0f, 1.0f, d2 / r2);
             const std::size_t i = idx(std::uint32_t(xx), std::uint32_t(yy), w);
             mask[i] += value * k;
         }

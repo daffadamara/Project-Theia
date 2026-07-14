@@ -58,8 +58,8 @@ let h = Harness()
 
 h.test("Version and capabilities API are parseable") {
     let version = readCxxString { theia.theia_version_string($0, $1) }
-    h.expect(version == "0.9.0-alpha.1", "unexpected version: \(version)")
-    h.expect(theia.theia_api_version() >= 2, "api version should be >= 2")
+    h.expect(version == "0.10.0-alpha.1", "unexpected version: \(version)")
+    h.expect(theia.theia_api_version() >= 3, "api version should be >= 3")
     let capsText = readCxxLongString { theia.theia_capabilities_json($0, $1) }
     guard let data = capsText.data(using: .utf8),
           let caps = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -728,7 +728,7 @@ h.test("Graph node and parameter enumeration exposes slider data") {
     h.expect(theia.graph_param_value(g, "missing", "frequency", 42) == 42, "fallback value")
 }
 
-h.test("Graph loads JSON text transactionally and ignores editor UI metadata") {
+h.test("Graph loads JSON text transactionally and preserves editor UI metadata") {
     guard let g = theia.graph_create() else { h.expect(false, "create"); return }
     defer { theia.graph_destroy(g) }
     let valid = """
@@ -766,6 +766,106 @@ h.test("Graph loads JSON text transactionally and ignores editor UI metadata") {
     let after = theia.graph_evaluate(g, "", 64, 64, nil, nil)
     h.expect(after.ok, "previous graph should survive failed text load: \(graphError(g))")
     h.expect(after.reused == 2, "surviving graph should reuse cache, got \(after.reused)")
+
+    let tmp = NSTemporaryDirectory() + "theia_ui_roundtrip_\(getpid()).json"
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    h.expect(theia.graph_save_json_file(g, tmp), "save with UI metadata failed")
+    let saved = (try? String(contentsOfFile: tmp, encoding: .utf8)) ?? ""
+    h.expect(saved.contains("positions"), "graph save should preserve UI metadata")
+}
+
+h.test("Mask erase metadata affects cache, downstream terrain, and export evaluation") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    let baselineJSON = """
+    {
+      "resolution": { "width": 64, "height": 64 },
+      "sink": "carve",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": { "seed": 5109, "frequency": 3.5 } },
+        { "id": "mask", "type": "river", "params": { "seed": 2027, "water": 0.8, "width": 3.0, "headwaters": 32 } },
+        { "id": "carve", "type": "rivercarve", "params": { "depth": 0.7 } }
+      ],
+      "connections": [
+        { "from": "base", "to": "mask", "input": 0 },
+        { "from": "base", "to": "carve", "input": 0 },
+        { "from": "mask", "to": "carve", "input": 1 }
+      ]
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, baselineJSON), "baseline load: \(graphError(g))")
+    var baselineMask = [Float](repeating: 0, count: 64 * 64)
+    let maskResult = baselineMask.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "mask", 64, 64, $0.baseAddress, $0.count)
+    }
+    var baselineCarve = [Float](repeating: 0, count: 64 * 64)
+    let carveResult = baselineCarve.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "carve", 64, 64, $0.baseAddress, $0.count)
+    }
+    h.expect(maskResult.ok && carveResult.ok, "baseline evaluation failed: \(graphError(g))")
+    guard let peak = baselineMask.indices.max(by: { baselineMask[$0] < baselineMask[$1] }) else {
+        h.expect(false, "missing mask peak")
+        return
+    }
+    h.expect(baselineMask[peak] > 0.25, "river mask peak too weak for edit test")
+    let editX = Double(peak % 64) / 63.0
+    let editY = Double(peak / 64) / 63.0
+    let editedJSON = baselineJSON.dropLast(2) + """
+      ,"ui": {
+        "positions": {},
+        "maskErases": {
+          "mask": [
+            { "x": \(editX), "y": \(editY), "radius": 0.08, "strength": 1.0 }
+          ]
+        }
+      }
+    }
+    """
+    h.expect(theia.graph_load_json_text(g, String(editedJSON)), "edited load: \(graphError(g))")
+    var editedMask = [Float](repeating: 0, count: 64 * 64)
+    let editedMaskResult = editedMask.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "mask", 64, 64, $0.baseAddress, $0.count)
+    }
+    h.expect(editedMaskResult.ok, "edited mask eval: \(graphError(g))")
+    h.expect(editedMaskResult.evaluated == 1 && editedMaskResult.reused == 1,
+             "mask edit should reuse base and recompute mask: \(editedMaskResult.evaluated)/\(editedMaskResult.reused)")
+    h.expect(editedMask[peak] < 1e-6, "erase stroke should clear selected mask cell")
+
+    var editedCarve = [Float](repeating: 0, count: 64 * 64)
+    let editedCarveResult = editedCarve.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "carve", 64, 64, $0.baseAddress, $0.count)
+    }
+    h.expect(editedCarveResult.ok, "edited carve eval: \(graphError(g))")
+    h.expect(editedCarveResult.evaluated == 1 && editedCarveResult.reused == 2,
+             "downstream carve should be the only remaining recompute")
+    h.expect(editedCarve[peak] > baselineCarve[peak],
+             "erasing river mask should reduce downstream carving")
+
+    let dir = NSTemporaryDirectory() + "theia_mask_export_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let exported = dir.withCString { dirPtr in
+        "edited-mask".withCString { basePtr in
+            "mask".withCString { sinkPtr in
+                var options = theia.GraphExportOptions()
+                options.sinkId = sinkPtr
+                options.width = 64
+                options.height = 64
+                options.outDir = dirPtr
+                options.basename = basePtr
+                options.heightmapFormat = theia.HeightmapFormat.r16
+                options.meshFormat = theia.MeshFormat.none
+                return theia.graph_export2(g, options)
+            }
+        }
+    }
+    h.expect(exported.ok, "edited mask export failed: \(graphError(g))")
+    let raw = (try? Data(contentsOf: URL(fileURLWithPath: dir + "/edited-mask_height.r16"))) ?? Data()
+    h.expect(raw.count == 64 * 64 * 2, "edited R16 size mismatch")
+    if raw.count == 64 * 64 * 2 {
+        let offset = peak * 2
+        let sample = UInt16(raw[offset]) | (UInt16(raw[offset + 1]) << 8)
+        h.expect(sample == 0, "exported mask should contain the erased cell")
+    }
 }
 
 h.test("Graph diagnostics JSON reports health and authoring issues") {
@@ -1135,6 +1235,24 @@ func evalGraphHeightsJSON(_ json: String, sink: String = "",
     return buf
 }
 
+@MainActor
+func evalGraphOutputHeightsJSON(_ json: String, sink: String,
+                                output: String, size: UInt32 = 96) -> [Float] {
+    guard let g = theia.graph_create() else {
+        h.expect(false, "create failed")
+        return []
+    }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, json), "load json: \(graphError(g))")
+    var buf = [Float](repeating: 0, count: Int(size * size))
+    let r = buf.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights_output(g, sink, output, size, size,
+                                            $0.baseAddress, $0.count)
+    }
+    h.expect(r.ok, "eval heights \(sink).\(output): \(graphError(g))")
+    return buf
+}
+
 func maxNeighborDelta(_ values: [Float], size: Int) -> Float {
     var maxDelta: Float = 0
     for y in 0..<size {
@@ -1307,7 +1425,393 @@ h.test("Foundation example graphs load and evaluate") {
         h.expect(r.minHeight >= -1e-6 && r.maxHeight <= 1.000001,
                  "\(path) out of range")
         h.expect(r.variance > 1e-8, "\(path) degenerate")
+        var values = [Float](repeating: 0, count: 128 * 128)
+        let heights = values.withUnsafeMutableBufferPointer {
+            theia.graph_evaluate_heights(g, "", 128, 128,
+                                         $0.baseAddress, $0.count)
+        }
+        h.expect(heights.ok, "height readback \(path): \(graphError(g))")
+        h.expect(values.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 },
+                 "\(path) contains non-finite or out-of-range samples")
     }
+}
+
+// --- Experimental point-local erosion filter -------------------------------
+
+func erosionFilterJSON(seed: Int = 1337, strength: Double = 0.22,
+                       scale: Double = 0.15, detail: Double = 1.5,
+                       gullyWeight: Double = 0.5) -> String {
+    """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "e",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 2026, "frequency": 3.2, "octaves": 6, "heightScale": 1.0
+        } },
+        { "id": "e", "type": "erosionfilter", "params": {
+          "seed": \(seed), "scale": \(scale), "strength": \(strength),
+          "octaves": 5, "gullyWeight": \(gullyWeight), "detail": \(detail)
+        } }
+      ],
+      "connections": [
+        { "from": "p", "to": "e", "input": 0 }
+      ]
+    }
+    """
+}
+
+h.test("Experimental erosion filter is registered with stable defaults") {
+    let types = readCxxString { theia.node_type_list($0, $1) }
+    h.expect(types.contains("erosionfilter"),
+             "erosionfilter missing from node_type_list: \(types)")
+    h.expect(theia.graph_node_type_input_count("erosionfilter") == 1,
+             "erosionfilter input count")
+    h.expect(theia.graph_node_type_output_count("erosionfilter") == 2,
+             "erosionfilter output count")
+    let heightName = readCxxString {
+        theia.graph_node_type_output_name("erosionfilter", 0, $0, $1)
+    }
+    let heightKind = readCxxString {
+        theia.graph_node_type_output_kind("erosionfilter", 0, $0, $1)
+    }
+    let ridgeName = readCxxString {
+        theia.graph_node_type_output_name("erosionfilter", 1, $0, $1)
+    }
+    let ridgeKind = readCxxString {
+        theia.graph_node_type_output_kind("erosionfilter", 1, $0, $1)
+    }
+    h.expect(heightName == "height" && heightKind == "terrain" &&
+             theia.graph_node_type_output_is_default("erosionfilter", 0),
+             "height output descriptor")
+    h.expect(ridgeName == "ridge" && ridgeKind == "data" &&
+             !theia.graph_node_type_output_is_default("erosionfilter", 1),
+             "ridge output descriptor")
+    h.expect(theia.graph_default_param_count("erosionfilter") == 18,
+             "erosionfilter default count")
+    let defaults: [(String, Double)] = [
+        ("seed", 1337), ("scale", 0.15), ("strength", 0.22),
+        ("octaves", 5), ("lacunarity", 2.0), ("gain", 0.5),
+        ("gullyWeight", 0.5), ("detail", 1.5),
+        ("ridgeRounding", 0.1), ("creaseRounding", 0.0),
+        ("onset", 1.25), ("assumedSlope", 0.7), ("slopeMix", 1.0),
+        ("cellScale", 0.7), ("normalization", 0.5),
+        ("heightOffset", -0.65), ("fadeCenter", 0.5), ("fadeRange", 0.5),
+    ]
+    for (key, expected) in defaults {
+        h.expect(theia.graph_default_param_value("erosionfilter", key, -99) == expected,
+                 "erosionfilter \(key) default")
+    }
+}
+
+h.test("Erosion filter height and ridge share one atomic cache entry") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, erosionFilterJSON()),
+             "load erosionfilter: \(graphError(g))")
+    h.expect(theia.graph_output_count(g, "e") == 2,
+             "graph instance should enumerate both erosion outputs")
+    let instanceRidge = readCxxString {
+        theia.graph_output_name(g, "e", 1, $0, $1)
+    }
+    let instanceKind = readCxxString {
+        theia.graph_output_kind(g, "e", "ridge", $0, $1)
+    }
+    h.expect(instanceRidge == "ridge" && instanceKind == "data" &&
+             !theia.graph_output_is_default(g, "e", 1),
+             "graph instance ridge descriptor")
+    var height = [Float](repeating: 0, count: 96 * 96)
+    let heightResult = height.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights_output(g, "e", "height", 96, 96,
+                                            $0.baseAddress, $0.count)
+    }
+    var ridge = [Float](repeating: 0, count: 96 * 96)
+    let ridgeResult = ridge.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights_output(g, "e", "ridge", 96, 96,
+                                            $0.baseAddress, $0.count)
+    }
+    h.expect(heightResult.ok && ridgeResult.ok,
+             "named output evaluation: \(graphError(g))")
+    h.expect(heightResult.evaluated == 2,
+             "cold height should evaluate source+filter: \(heightResult.evaluated)")
+    h.expect(ridgeResult.evaluated == 0 && ridgeResult.reused == 2,
+             "ridge should reuse atomic source+filter cache: \(ridgeResult.evaluated)/\(ridgeResult.reused)")
+    h.expect(ridge.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 },
+             "ridge contains non-finite or out-of-range values")
+    let ridgeRange = (ridge.max() ?? 0) - (ridge.min() ?? 0)
+    h.expect(ridgeRange > 1e-4, "ridge output is degenerate: range \(ridgeRange)")
+    let independentRidge = evalGraphOutputHeightsJSON(
+        erosionFilterJSON(), sink: "e", output: "ridge", size: 96)
+    h.expect(independentRidge == ridge,
+             "ridge should be bitwise deterministic across graph instances")
+    let neutralRidge = evalGraphOutputHeightsJSON(
+        erosionFilterJSON(strength: 0), sink: "e", output: "ridge", size: 96)
+    h.expect(neutralRidge.allSatisfy { $0 == 0.5 },
+             "strength=0 ridge should be neutral 0.5")
+
+    var legacy = [Float](repeating: 0, count: 96 * 96)
+    let legacyResult = legacy.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "e", 96, 96, $0.baseAddress, $0.count)
+    }
+    h.expect(legacyResult.ok && legacy == height,
+             "legacy default output must be bit-identical to named height")
+
+    h.expect(theia.graph_set_param(g, "p", "seed", 2027), "change upstream seed")
+    let changed = theia.graph_evaluate_output(g, "e", "ridge", 96, 96, nil, nil)
+    h.expect(changed.ok && changed.evaluated == 2 && changed.reused == 0,
+             "upstream change must invalidate every output: \(changed.evaluated)/\(changed.reused)")
+}
+
+h.test("Downstream cache keys include the selected source output") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_add_node(g, "p", "perlin"), "add source")
+    h.expect(theia.graph_add_node(g, "e", "erosionfilter"), "add erosionfilter")
+    h.expect(theia.graph_add_node(g, "n", "normalize"), "add transform")
+    h.expect(theia.graph_connect(g, "p", "e", 0), "connect source")
+    h.expect(theia.graph_connect_output(g, "e", "height", "n", 0),
+             "connect height output")
+    var heightPath = [Float](repeating: 0, count: 64 * 64)
+    let first = heightPath.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "n", 64, 64, $0.baseAddress, $0.count)
+    }
+    h.expect(first.ok && first.evaluated == 3,
+             "cold height path should evaluate three nodes")
+
+    h.expect(theia.graph_connect_output(g, "e", "ridge", "n", 0),
+             "switch transform to ridge output")
+    var ridgePath = [Float](repeating: 0, count: 64 * 64)
+    let switched = ridgePath.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights(g, "n", 64, 64, $0.baseAddress, $0.count)
+    }
+    h.expect(switched.ok && switched.evaluated == 1 && switched.reused == 2,
+             "port switch should reuse upstream but recompute downstream: \(switched.evaluated)/\(switched.reused)")
+    h.expect(meanAbsoluteDifference(heightPath, ridgePath) > 1e-4,
+             "switching source ports should change downstream content")
+    let resolvedKind = readCxxString {
+        theia.graph_output_kind(g, "n", "field", $0, $1)
+    }
+    h.expect(resolvedKind == "data", "generic transform should inherit ridge data kind")
+}
+
+h.test("Graph format v2 migrates default ports and output-scoped mask edits") {
+    let legacy = """
+    {
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "mask",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {} },
+        { "id": "mask", "type": "river", "params": {} }
+      ],
+      "connections": [ { "from": "p", "to": "mask", "input": 0 } ],
+      "ui": { "positions": {}, "maskErases": {
+        "mask": [ { "x": 0.5, "y": 0.5, "radius": 0.1, "strength": 1.0 } ],
+        "p": [ { "x": 0.5, "y": 0.5, "radius": 0.1, "strength": 1.0 } ]
+      } }
+    }
+    """
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, legacy), "load v1: \(graphError(g))")
+    let path = NSTemporaryDirectory() + "theia_graph_v2_\(getpid()).json"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    h.expect(theia.graph_save_json_file(g, path), "save v2: \(graphError(g))")
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        h.expect(false, "saved v2 JSON did not parse")
+        return
+    }
+    h.expect(root["formatVersion"] as? Int == 2, "formatVersion should be 2")
+    h.expect(root["sinkOutput"] as? String == "mask", "migrated sinkOutput")
+    let edges = root["connections"] as? [[String: Any]] ?? []
+    h.expect(edges.first?["output"] as? String == "height",
+             "legacy connection should map to source default output")
+    let ui = root["ui"] as? [String: Any]
+    let erases = ui?["maskErases"] as? [String: Any]
+    let outputs = erases?["mask"] as? [String: Any]
+    h.expect((outputs?["mask"] as? [[String: Any]])?.count == 1,
+             "legacy mask edits should migrate under default output")
+    h.expect(erases?["p"] == nil,
+             "mask edits attached to terrain outputs should be discarded")
+}
+
+h.test("Named output validation rejects unknown and incompatible ports") {
+    let unknown = erosionFilterJSON().replacingOccurrences(
+        of: "\"sink\": \"e\",", with: "\"sink\": \"e\", \"sinkOutput\": \"removed\",")
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(!theia.graph_load_json_text(g, unknown),
+             "unknown sink output should be rejected")
+    h.expect(graphError(g).contains("output"), "unknown output error: \(graphError(g))")
+
+    let incompatible = """
+    {
+      "formatVersion": 2,
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "river", "sinkOutput": "mask",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {} },
+        { "id": "e", "type": "erosionfilter", "params": {} },
+        { "id": "river", "type": "river", "params": {} }
+      ],
+      "connections": [
+        { "from": "p", "output": "height", "to": "e", "input": 0 },
+        { "from": "e", "output": "ridge", "to": "river", "input": 0 }
+      ]
+    }
+    """
+    h.expect(!theia.graph_load_json_text(g, incompatible),
+             "data output connected to terrain input should be rejected")
+    h.expect(graphError(g).contains("does not accept"),
+             "kind mismatch error: \(graphError(g))")
+    h.expect(diagnosticCodes(incompatible).contains("incompatible_kind"),
+             "diagnostics should report incompatible_kind")
+
+    let binaryMismatch = """
+    {
+      "formatVersion": 2,
+      "resolution": { "width": 32, "height": 32 },
+      "sink": "mix", "sinkOutput": "field",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {} },
+        { "id": "e", "type": "erosionfilter", "params": {} },
+        { "id": "mix", "type": "blend", "params": {} }
+      ],
+      "connections": [
+        { "from": "p", "output": "height", "to": "e", "input": 0 },
+        { "from": "p", "output": "height", "to": "mix", "input": 0 },
+        { "from": "e", "output": "ridge", "to": "mix", "input": 1 }
+      ]
+    }
+    """
+    h.expect(!theia.graph_load_json_text(g, binaryMismatch),
+             "binary operation should reject mixed kinds")
+    h.expect(diagnosticCodes(binaryMismatch).contains("incompatible_binary_kinds"),
+             "diagnostics should report binary kind mismatch")
+}
+
+h.test("Named ridge export supports rasters and rejects OBJ") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, erosionFilterJSON()),
+             "load erosionfilter: \(graphError(g))")
+    let dir = NSTemporaryDirectory() + "theia_ridge_export_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let raster = dir.withCString { dirPtr in
+        "analysis".withCString { basePtr in
+            "e".withCString { sinkPtr in
+                "ridge".withCString { outputPtr in
+                    var options = theia.GraphExportOptions()
+                    options.sinkId = sinkPtr
+                    options.outputName = outputPtr
+                    options.width = 32
+                    options.height = 32
+                    options.outDir = dirPtr
+                    options.basename = basePtr
+                    options.heightmapFormat = theia.HeightmapFormat.r16
+                    options.meshFormat = theia.MeshFormat.none
+                    return theia.graph_export2(g, options)
+                }
+            }
+        }
+    }
+    h.expect(raster.ok, "ridge raster export: \(graphError(g))")
+    let ridgeData = try? Data(contentsOf: URL(fileURLWithPath: dir + "/analysis_ridge.r16"))
+    h.expect(ridgeData?.count == 32 * 32 * 2, "ridge R16 output missing or wrong size")
+
+    let mesh = dir.withCString { dirPtr in
+        "invalid".withCString { basePtr in
+            "e".withCString { sinkPtr in
+                "ridge".withCString { outputPtr in
+                    var options = theia.GraphExportOptions()
+                    options.sinkId = sinkPtr
+                    options.outputName = outputPtr
+                    options.width = 32
+                    options.height = 32
+                    options.outDir = dirPtr
+                    options.basename = basePtr
+                    options.heightmapFormat = theia.HeightmapFormat.none
+                    options.meshFormat = theia.MeshFormat.obj
+                    return theia.graph_export2(g, options)
+                }
+            }
+        }
+    }
+    h.expect(!mesh.ok && graphError(g).contains("terrain output"),
+             "ridge OBJ export should be rejected: \(graphError(g))")
+}
+
+h.test("Experimental erosion filter is deterministic and normalized") {
+    let a = evalGraphHeightsJSON(erosionFilterJSON(), size: 96)
+    let b = evalGraphHeightsJSON(erosionFilterJSON(), size: 96)
+    let base = evalGraphHeightsJSON(erosionFilterJSON(strength: 0), size: 96)
+    h.expect(a.count == 96 * 96 && a == b,
+             "erosionfilter should be bitwise deterministic")
+    h.expect(a.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 },
+             "erosionfilter contains non-finite or out-of-range samples")
+    h.expect((a.max() ?? 0) > (a.min() ?? 0), "erosionfilter degenerate")
+    h.expect(meanAbsoluteDifference(a, base) > 1e-4,
+             "erosionfilter should visibly alter the input terrain")
+}
+
+h.test("Experimental erosion filter identity, seed, and controls respond") {
+    let identity = evalGraphHeightsJSON(erosionFilterJSON(strength: 0), size: 96)
+    let input = evalGraphHeightsJSON("""
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "p",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 2026, "frequency": 3.2, "octaves": 6, "heightScale": 1.0
+        } }
+      ],
+      "connections": []
+    }
+    """, size: 96)
+    h.expect(identity == input, "strength=0 must preserve every input sample")
+
+    let seedA = evalGraphHeightsJSON(erosionFilterJSON(seed: 100), size: 96)
+    let seedB = evalGraphHeightsJSON(erosionFilterJSON(seed: 101), size: 96)
+    h.expect(meanAbsoluteDifference(seedA, seedB) > 1e-5,
+             "seed should change the procedural drainage field")
+
+    let fine = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.08), size: 96)
+    let broad = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.24), size: 96)
+    h.expect(meanAbsoluteDifference(fine, broad) > 1e-4,
+             "scale should change gully structure")
+
+    let lowGully = evalGraphHeightsJSON(erosionFilterJSON(gullyWeight: 0.15), size: 96)
+    let highGully = evalGraphHeightsJSON(erosionFilterJSON(gullyWeight: 0.9), size: 96)
+    h.expect(meanAbsoluteDifference(lowGully, highGully) > 1e-4,
+             "gullyWeight should change output")
+}
+
+h.test("Experimental erosion filter preserves graph cache behavior") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, erosionFilterJSON()),
+             "load erosionfilter: \(graphError(g))")
+    let first = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    let warm = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    h.expect(first.ok && warm.ok, "erosionfilter eval failed: \(graphError(g))")
+    h.expect(warm.evaluated == 0 && warm.reused == 2,
+             "warm cache should reuse source+filter: \(warm.evaluated)/\(warm.reused)")
+    h.expect(theia.graph_set_param(g, "e", "strength", 0.3),
+             "set erosionfilter strength")
+    let changed = theia.graph_evaluate(g, "", 96, 96, nil, nil)
+    h.expect(changed.evaluated == 1 && changed.reused == 1,
+             "filter param change should reuse source: \(changed.evaluated)/\(changed.reused)")
+}
+
+h.test("Experimental erosion filter example loads and evaluates") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_file(g, "examples/erosion-filter.json"),
+             "load example: \(graphError(g))")
+    let r = theia.graph_evaluate(g, "", 128, 128, nil, nil)
+    h.expect(r.ok, "eval example: \(graphError(g))")
+    h.expect(r.minHeight >= 0 && r.maxHeight <= 1 && r.variance > 1e-8,
+             "example output invalid [\(r.minHeight), \(r.maxHeight)]")
 }
 
 // --- Phase 7: particle hydrology --------------------------------------------
@@ -1344,8 +1848,7 @@ func hydrologyJSON(type: String, seed: Int = 1337, particles: Int = 900,
 }
 
 func riverJSON(seed: Int = 1337, water: Double = 0.7, width: Double = 2.0,
-               depth: Double = 0.65, downcutting: Double = 0.55,
-               headwaters: Int = 12, renderSurface: Int = 0) -> String {
+               headwaters: Int = 12) -> String {
     """
     {
       "resolution": { "width": 96, "height": 96 },
@@ -1358,11 +1861,7 @@ func riverJSON(seed: Int = 1337, water: Double = 0.7, width: Double = 2.0,
           "seed": \(seed),
           "water": \(water),
           "width": \(width),
-          "depth": \(depth),
-          "downcutting": \(downcutting),
-          "riverValleyWidth": 0.0,
-          "headwaters": \(headwaters),
-          "renderSurface": \(renderSurface)
+          "headwaters": \(headwaters)
         } }
       ],
       "connections": [
@@ -1596,9 +2095,7 @@ h.test("River carve consumes a separate river mask") {
           "seed": 91, "frequency": 4.5, "octaves": 6, "heightScale": 1.0
         } },
         { "id": "r", "type": "river", "params": {
-          "seed": 2027, "water": 0.7, "width": 2.0,
-          "depth": 0.65, "downcutting": 0.55,
-          "riverValleyWidth": 0.0, "headwaters": 32, "renderSurface": 0
+          "seed": 2027, "water": 0.7, "width": 2.0, "headwaters": 32
         } },
         { "id": "carve", "type": "rivercarve", "params": {
           "depth": 0.45, "downcutting": 0.55, "riverValleyWidth": 2.0
@@ -1768,8 +2265,25 @@ h.test("CLI JSON commands are parseable and unknown options exit 2") {
     h.expect(nodes.0 == 0, "nodes --json exit \(nodes.0): \(nodes.2)")
     let nodesObject = try? JSONSerialization.jsonObject(with: Data(nodes.1.utf8)) as? [String: Any]
     let nodeList = nodesObject?["nodes"] as? [[String: Any]] ?? []
-    h.expect(nodeList.contains { ($0["type"] as? String) == "perlin" },
-             "nodes JSON missing perlin")
+    let expectedTypes = readCxxString { theia.node_type_list($0, $1) }
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    let actualTypes = nodeList.compactMap { $0["type"] as? String }
+    h.expect(actualTypes == expectedTypes, "nodes JSON type catalog mismatch: \(actualTypes)")
+    h.expect(actualTypes.allSatisfy { $0 == $0.trimmingCharacters(in: .whitespacesAndNewlines) },
+             "node types must not contain surrounding whitespace")
+    let combine = nodeList.first { ($0["type"] as? String) == "combine" }
+    let ridged = nodeList.first { ($0["type"] as? String) == "ridged" }
+    let erosionFilter = nodeList.first { ($0["type"] as? String) == "erosionfilter" }
+    h.expect((combine?["inputCount"] as? Int) == 2, "combine input count missing from catalog")
+    h.expect(!((ridged?["defaultParams"] as? [[String: Any]]) ?? []).isEmpty,
+             "ridged defaults missing from catalog")
+    let erosionOutputs = erosionFilter?["outputs"] as? [[String: Any]] ?? []
+    h.expect(erosionOutputs.count == 2 &&
+             erosionOutputs.contains { ($0["name"] as? String) == "ridge" &&
+                 ($0["kind"] as? String) == "data" &&
+                 ($0["default"] as? Bool) == false },
+             "erosionfilter named outputs missing from catalog")
 
     let diagnose = runCLI(["diagnose", "examples/foundation.json", "--json"])
     h.expect(diagnose.0 == 0, "diagnose --json exit \(diagnose.0): \(diagnose.2)")
@@ -1800,6 +2314,42 @@ h.test("CLI JSON commands are parseable and unknown options exit 2") {
     h.expect(export.0 == 0, "export --json exit \(export.0): \(export.2)")
     let exportObject = try? JSONSerialization.jsonObject(with: Data(export.1.utf8)) as? [String: Any]
     h.expect(exportObject?["paths"] != nil, "export JSON missing paths")
+
+    let ridgeRunPNG = NSTemporaryDirectory() + "theia_cli_ridge_\(getpid()).png"
+    defer {
+        try? FileManager.default.removeItem(atPath: ridgeRunPNG)
+        try? FileManager.default.removeItem(
+            atPath: String(ridgeRunPNG.dropLast(4)) + ".pfm")
+    }
+    let ridgeRun = runCLI([
+        "run", "examples/erosion-filter.json",
+        "--output", "ridge", "--size", "32", "--out", ridgeRunPNG, "--json",
+    ])
+    h.expect(ridgeRun.0 == 0, "named ridge run exit \(ridgeRun.0): \(ridgeRun.2)")
+    let ridgeRunObject = try? JSONSerialization.jsonObject(
+        with: Data(ridgeRun.1.utf8)) as? [String: Any]
+    h.expect(ridgeRunObject?["output"] as? String == "ridge",
+             "named run JSON should report ridge")
+
+    let ridgeExport = runCLI([
+        "export", "examples/erosion-filter.json",
+        "--output", "ridge", "--size", "32",
+        "--out-dir", exportDir, "--basename", "ridge",
+        "--heightmap", "r16", "--mesh", "none", "--json",
+    ])
+    h.expect(ridgeExport.0 == 0,
+             "named ridge export exit \(ridgeExport.0): \(ridgeExport.2)")
+    h.expect(FileManager.default.fileExists(atPath: exportDir + "/ridge_ridge.r16"),
+             "named ridge export file missing")
+
+    let invalidMesh = runCLI([
+        "export", "examples/erosion-filter.json",
+        "--output", "ridge", "--size", "32",
+        "--out-dir", exportDir, "--basename", "invalid-ridge",
+        "--heightmap", "none", "--mesh", "obj", "--json",
+    ])
+    h.expect(invalidMesh.0 == 1,
+             "ridge OBJ export should fail with exit 1, got \(invalidMesh.0)")
 
     let bad = runCLI(["nodes", "--bogus"])
     h.expect(bad.0 == 2, "unknown option should exit 2, got \(bad.0)")

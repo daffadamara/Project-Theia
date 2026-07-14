@@ -90,8 +90,9 @@ std::size_t generate_error(const GenerateResult& r, char* out, std::size_t cap);
 //
 // Node types include generators ("perlin", "ridged"), unary filters/remaps
 // ("scalebias", "invert", "clamp", "remap", "blur", "warp", "hydraulic",
-// "dropleterosion", "river", "rivercarve", "export", "thermal", "terrace",
-// "normalize", "slopemask"), and binary combiners ("combine", "blend").
+// "dropleterosion", "erosionfilter", "river", "rivercarve", "export",
+// "thermal", "terrace", "normalize", "slopemask"), and binary combiners
+// ("combine", "blend").
 
 struct GraphHandle;  // opaque; defined in the implementation
 
@@ -102,6 +103,9 @@ bool graph_add_node(GraphHandle* g, const char* id, const char* type);
 bool graph_set_param(GraphHandle* g, const char* id, const char* key, double value);
 bool graph_connect(GraphHandle* g, const char* fromId, const char* toId,
                    std::uint32_t inputIndex);
+bool graph_connect_output(GraphHandle* g, const char* fromId,
+                          const char* outputName, const char* toId,
+                          std::uint32_t inputIndex);
 
 bool graph_load_json_file(GraphHandle* g, const char* path);
 bool graph_load_json_text(GraphHandle* g, const char* text);
@@ -142,6 +146,10 @@ enum class GraphErrorCode : std::uint32_t {
 GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
                                std::uint32_t width, std::uint32_t height,
                                const char* pngPath, const char* pfmPath);
+GraphEvalResult graph_evaluate_output(GraphHandle* g, const char* sinkId,
+                                      const char* outputName,
+                                      std::uint32_t width, std::uint32_t height,
+                                      const char* pngPath, const char* pfmPath);
 
 std::size_t graph_last_error(GraphHandle* g, char* out, std::size_t cap);
 GraphErrorCode graph_last_error_code(GraphHandle* g);
@@ -152,6 +160,10 @@ GraphErrorCode graph_last_error_code(GraphHandle* g);
 GraphEvalResult graph_evaluate_heights(GraphHandle* g, const char* sinkId,
                                        std::uint32_t width, std::uint32_t height,
                                        float* dst, std::size_t capElems);
+GraphEvalResult graph_evaluate_heights_output(
+    GraphHandle* g, const char* sinkId, const char* outputName,
+    std::uint32_t width, std::uint32_t height,
+    float* dst, std::size_t capElems);
 
 // Production export helper. Any path may be nullptr/"" to skip that output.
 // `maskPngPath` writes the selected sink normalized over [0,1], intended for
@@ -181,6 +193,7 @@ enum class MeshFormat : std::uint32_t {
 
 struct GraphExportOptions {
     const char* sinkId = nullptr;
+    const char* outputName = nullptr;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     const char* outDir = nullptr;
@@ -191,11 +204,11 @@ struct GraphExportOptions {
     std::uint32_t meshStride = 1;
 };
 
-// Structured export helper. Writes engine-facing heightmap and mesh outputs:
-//   png16 -> <basename>_height.png
-//   r16   -> <basename>_height.r16 (little-endian unsigned 16-bit)
-//   pfm32 -> <basename>.pfm
+// Structured export helper. Writes engine-facing scalar and mesh outputs.
+// Legacy/default output filenames keep `_height`; an explicit non-height
+// output uses `_<outputName>`. R16 is little-endian unsigned 16-bit.
 //   obj   -> <basename>.obj
+// OBJ is valid only when the selected output resolves to terrain.
 GraphEvalResult graph_export2(GraphHandle* g, const GraphExportOptions& options);
 
 // Node/parameter enumeration for the viewer inspector. Strings use the same
@@ -211,6 +224,29 @@ std::size_t graph_param_name(GraphHandle* g, const char* nodeId,
 double graph_param_value(GraphHandle* g, const char* nodeId, const char* key,
                          double fallback);
 std::uint32_t graph_node_type_input_count(const char* type);
+std::size_t graph_node_type_input_name(const char* type, std::uint32_t index,
+                                       char* out, std::size_t cap);
+std::size_t graph_node_type_input_kinds(const char* type, std::uint32_t index,
+                                        char* out, std::size_t cap);
+std::uint32_t graph_node_type_output_count(const char* type);
+std::size_t graph_node_type_output_name(const char* type, std::uint32_t index,
+                                        char* out, std::size_t cap);
+std::size_t graph_node_type_output_kind(const char* type, std::uint32_t index,
+                                        char* out, std::size_t cap);
+bool graph_node_type_output_is_default(const char* type, std::uint32_t index);
+std::int32_t graph_node_type_output_inherit_input(const char* type,
+                                                  std::uint32_t index);
+std::size_t graph_resolved_output_kind(GraphHandle* g, const char* nodeId,
+                                       const char* outputName,
+                                       char* out, std::size_t cap);
+std::uint32_t graph_output_count(GraphHandle* g, const char* nodeId);
+std::size_t graph_output_name(GraphHandle* g, const char* nodeId,
+                              std::uint32_t index, char* out, std::size_t cap);
+std::size_t graph_output_kind(GraphHandle* g, const char* nodeId,
+                              const char* outputName,
+                              char* out, std::size_t cap);
+bool graph_output_is_default(GraphHandle* g, const char* nodeId,
+                             std::uint32_t index);
 std::uint32_t graph_default_param_count(const char* type);
 std::size_t graph_default_param_name(const char* type, std::uint32_t index,
                                      char* out, std::size_t cap);
