@@ -84,6 +84,31 @@ float smoothStart(float value, float smoothing) {
     return 0.5f * value * value / smoothing;
 }
 
+// C1-continuous altitude fade. The reference method accepts a user-supplied
+// signed fade target; Theia derives it from normalized height and removes the
+// hard-knee discontinuities at the requested range boundaries.
+float stableFadeTarget(float height, float center, float range) {
+    const float halfMapped = 0.5f +
+        0.5f * (height - center) / max(1.0e-4f, range);
+    const float t = clamp01(halfMapped);
+    const float hermite = t * t * (3.0f - 2.0f * t);
+    return 2.0f * hermite - 1.0f;
+}
+
+// Compress a signed displacement into the remaining [0,1] headroom. This is
+// first-order identity around zero but approaches either boundary asymptotically,
+// avoiding new hard-clipped spike/hole plateaus.
+float addBoundedDelta(float base, float delta) {
+    if (delta >= 0.0f) {
+        const float headroom = max(0.0f, 1.0f - base);
+        return base + delta * headroom / max(1.0e-8f, headroom + delta);
+    }
+    const float magnitude = -delta;
+    const float headroom = max(0.0f, base);
+    return base - magnitude * headroom /
+        max(1.0e-8f, headroom + magnitude);
+}
+
 // Returns normalized cosine/sine stripe phases and the derivative direction.
 float4 phacelle(float2 p, float2 direction, float stripeFrequency,
                 float phaseOffset, float normalization, uint seed) {
@@ -115,11 +140,22 @@ float4 phacelle(float2 p, float2 direction, float stripeFrequency,
     return float4(interpolated / max(magnitude, 1.0e-8f), sideDirection);
 }
 
-float sampleHeight(device const float* input, uint x, uint y,
-                   constant ErosionFilterParams& p) {
-    x = min(x, p.width - 1u);
-    y = min(y, p.height - 1u);
-    return clamp01(input[y * p.width + x]);
+// Bilinear height sample at a normalized-domain position (clamped edges).
+float sampleHeightUV(device const float* input, float2 uv,
+                     constant ErosionFilterParams& p) {
+    const float fx = clamp(uv.x, 0.0f, 1.0f) * float(max(1u, p.width - 1u));
+    const float fy = clamp(uv.y, 0.0f, 1.0f) * float(max(1u, p.height - 1u));
+    const uint x0 = uint(fx);
+    const uint y0 = uint(fy);
+    const uint x1 = min(x0 + 1u, p.width - 1u);
+    const uint y1 = min(y0 + 1u, p.height - 1u);
+    const float tx = fx - float(x0);
+    const float ty = fy - float(y0);
+    const float a = clamp01(input[y0 * p.width + x0]);
+    const float b = clamp01(input[y0 * p.width + x1]);
+    const float c = clamp01(input[y1 * p.width + x0]);
+    const float d = clamp01(input[y1 * p.width + x1]);
+    return mix(mix(a, b, tx), mix(c, d, tx), ty);
 }
 
 kernel void erosion_filter(device float* output [[buffer(0)]],
@@ -137,23 +173,27 @@ kernel void erosion_filter(device float* output [[buffer(0)]],
         return;
     }
 
-    const uint left = gid.x > 0u ? gid.x - 1u : gid.x;
-    const uint right = gid.x + 1u < p.width ? gid.x + 1u : gid.x;
-    const uint down = gid.y > 0u ? gid.y - 1u : gid.y;
-    const uint up = gid.y + 1u < p.height ? gid.y + 1u : gid.y;
-    const float dxScale = 0.5f * float(max(1u, p.width - 1u));
-    const float dyScale = 0.5f * float(max(1u, p.height - 1u));
-    const float slopeX = (sampleHeight(input, right, gid.y, p) -
-                          sampleHeight(input, left, gid.y, p)) * dxScale;
-    const float slopeY = (sampleHeight(input, gid.x, up, p) -
-                          sampleHeight(input, gid.x, down, p)) * dyScale;
-
     const float2 uv = float2(
         float(gid.x) / float(max(1u, p.width - 1u)),
         float(gid.y) / float(max(1u, p.height - 1u)));
-    const float fadeRange = max(1.0e-4f, p.fadeRange);
-    float fadeTarget = clamp((inputHeight - p.fadeCenter) / fadeRange,
-                             -1.0f, 1.0f);
+
+    // Estimate the input gradient at the gully-cell scale (quarter of a cell,
+    // never below one texel). Per-texel derivatives on detail-bearing rasters
+    // can rotate the stripe direction at every sample and fragment otherwise
+    // coherent gullies.
+    const float minStep = 1.0f / float(max(
+        1u, min(p.width - 1u, p.height - 1u)));
+    const float slopeStep = max(minStep, p.scale * p.cellScale * 0.25f);
+    const float slopeX =
+        (sampleHeightUV(input, uv + float2(slopeStep, 0.0f), p) -
+         sampleHeightUV(input, uv - float2(slopeStep, 0.0f), p)) /
+        (2.0f * slopeStep);
+    const float slopeY =
+        (sampleHeightUV(input, uv + float2(0.0f, slopeStep), p) -
+         sampleHeightUV(input, uv - float2(0.0f, slopeStep), p)) /
+        (2.0f * slopeStep);
+    float fadeTarget = stableFadeTarget(
+        inputHeight, p.fadeCenter, p.fadeRange);
 
     float3 heightAndSlope = float3(inputHeight, slopeX, slopeY);
     const float3 original = heightAndSlope;
@@ -173,37 +213,57 @@ kernel void erosion_filter(device float* output [[buffer(0)]],
     const float2 measuredSlope = heightAndSlope.yz;
     const float2 overriddenSlope = safeNormalize(measuredSlope) * p.assumedSlope;
     float2 gullySlope = mix(measuredSlope, overriddenSlope, clamp01(p.slopeMix));
+    const float sampleSpan = float(min(
+        max(1u, p.width - 1u), max(1u, p.height - 1u)));
 
     const uint octaveCount = min(p.octaves, 8u);
     for (uint octave = 0u; octave < octaveCount; ++octave) {
+        // A directly tessellated height grid needs more margin than the
+        // theoretical two-sample Nyquist bound. Fade an octave in from 2.5 to
+        // 4 samples per stripe cycle and reject all higher octaves once zero.
+        const float cyclesPerDomain = frequency * p.cellScale;
+        const float samplesPerCycle = sampleSpan /
+            max(1.0e-5f, cyclesPerDomain);
+        const float bandWeight = smoothstep(2.5f, 4.0f, samplesPerCycle);
+        if (bandWeight <= 1.0e-6f) break;
+        const float effectiveStrength = octaveStrength * bandWeight;
+
         float4 phase = phacelle(uv * frequency, safeNormalize(gullySlope),
             p.cellScale, 0.25f, p.normalization,
             p.seed);
         phase.zw *= -frequency;
         const float sloping = abs(phase.y);
 
-        gullySlope += sign(phase.y) * phase.zw * octaveStrength * p.gullyWeight;
+        gullySlope += sign(phase.y) * phase.zw *
+            effectiveStrength * p.gullyWeight;
 
         const float3 gullies = float3(phase.x, phase.y * phase.zw);
         const float3 faded = mix(float3(fadeTarget, 0.0f, 0.0f),
                                  gullies * p.gullyWeight,
                                  combinedMask);
-        heightAndSlope += faded * octaveStrength;
-        magnitude += octaveStrength;
-        fadeTarget = faded.x;
+        heightAndSlope += faded * effectiveStrength;
+        magnitude += effectiveStrength;
+        fadeTarget = mix(fadeTarget, faded.x, bandWeight);
 
         const float octaveRounding = mix(p.creaseRounding, p.ridgeRounding,
             clamp01(phase.x + 0.5f)) * roundingMultiplier;
         const float newMask = easeOut(smoothStart(
             sloping * p.onset, octaveRounding * p.onset));
-        combinedMask = inversePowerCurve(combinedMask, p.detail) * newMask;
+        const float nextCombinedMask =
+            inversePowerCurve(combinedMask, p.detail) * newMask;
+        combinedMask = mix(combinedMask, nextCombinedMask, bandWeight);
 
         // Parallel unrounded/unweighted fade chain from the Advanced Terrain
         // Erosion Filter. It produces analysis data, not connected hydrology.
-        ridgeMapFadeTarget = mix(ridgeMapFadeTarget, gullies.x,
-                                 ridgeMapCombiMask);
+        const float nextRidgeMapFadeTarget = mix(
+            ridgeMapFadeTarget, gullies.x, ridgeMapCombiMask);
+        ridgeMapFadeTarget = mix(
+            ridgeMapFadeTarget, nextRidgeMapFadeTarget, bandWeight);
         const float newRidgeMask = easeOut(sloping * 1.5f);
-        ridgeMapCombiMask *= newRidgeMask;
+        ridgeMapCombiMask = mix(
+            ridgeMapCombiMask,
+            ridgeMapCombiMask * newRidgeMask,
+            bandWeight);
 
         octaveStrength *= p.gain;
         frequency *= p.lacunarity;
@@ -212,7 +272,8 @@ kernel void erosion_filter(device float* output [[buffer(0)]],
 
     const float erosionDelta = heightAndSlope.x - original.x;
     const float offset = p.heightOffset * magnitude;
-    output[index] = clamp01(inputHeight + erosionDelta + offset);
+    output[index] = clamp01(addBoundedDelta(
+        inputHeight, erosionDelta + offset));
     const float ridgeMap = ridgeMapFadeTarget * (1.0f - ridgeMapCombiMask);
     ridgeOutput[index] = clamp01(ridgeMap * 0.5f + 0.5f);
 }

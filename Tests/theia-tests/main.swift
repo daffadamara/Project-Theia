@@ -1439,8 +1439,12 @@ h.test("Foundation example graphs load and evaluate") {
 // --- Experimental point-local erosion filter -------------------------------
 
 func erosionFilterJSON(seed: Int = 1337, strength: Double = 0.22,
-                       scale: Double = 0.15, detail: Double = 1.5,
-                       gullyWeight: Double = 0.5) -> String {
+                       scale: Double = 0.05, detail: Double = 1.5,
+                       gullyWeight: Double = 0.35,
+                       normalization: Double = 0.4,
+                       fadeCenter: Double = 0.5,
+                       fadeRange: Double = 0.5,
+                       octaves: Int = 5) -> String {
     """
     {
       "resolution": { "width": 96, "height": 96 },
@@ -1451,7 +1455,9 @@ func erosionFilterJSON(seed: Int = 1337, strength: Double = 0.22,
         } },
         { "id": "e", "type": "erosionfilter", "params": {
           "seed": \(seed), "scale": \(scale), "strength": \(strength),
-          "octaves": 5, "gullyWeight": \(gullyWeight), "detail": \(detail)
+          "octaves": \(octaves), "gullyWeight": \(gullyWeight), "detail": \(detail),
+          "normalization": \(normalization), "fadeCenter": \(fadeCenter),
+          "fadeRange": \(fadeRange)
         } }
       ],
       "connections": [
@@ -1459,6 +1465,51 @@ func erosionFilterJSON(seed: Int = 1337, strength: Double = 0.22,
       ]
     }
     """
+}
+
+func maximumAdjacentJump(_ values: [Float], width: Int) -> Float {
+    guard width > 0, values.count >= width else { return 0 }
+    let height = values.count / width
+    var result: Float = 0
+    for y in 0..<height {
+        for x in 0..<width {
+            let index = y * width + x
+            if x + 1 < width {
+                result = max(result, abs(values[index] - values[index + 1]))
+            }
+            if y + 1 < height {
+                result = max(result, abs(values[index] - values[index + width]))
+            }
+        }
+    }
+    return result
+}
+
+func introducedBoundaryCount(input: [Float], output: [Float]) -> Int {
+    guard input.count == output.count else { return Int.max }
+    return zip(input, output).reduce(into: 0) { count, pair in
+        let (before, after) = pair
+        let inputIsInterior = before > 0 && before < 1
+        if inputIsInterior && (after <= 0 || after >= 1) {
+            count += 1
+        }
+    }
+}
+
+func maximumLocalResidual(_ values: [Float], width: Int) -> Float {
+    guard width > 2, values.count >= width * 3 else { return 0 }
+    let height = values.count / width
+    var result: Float = 0
+    for y in 1..<(height - 1) {
+        for x in 1..<(width - 1) {
+            let index = y * width + x
+            let neighborMean = (
+                values[index - 1] + values[index + 1] +
+                values[index - width] + values[index + width]) * 0.25
+            result = max(result, abs(values[index] - neighborMean))
+        }
+    }
+    return result
 }
 
 h.test("Experimental erosion filter is registered with stable defaults") {
@@ -1487,21 +1538,60 @@ h.test("Experimental erosion filter is registered with stable defaults") {
     h.expect(ridgeName == "ridge" && ridgeKind == "data" &&
              !theia.graph_node_type_output_is_default("erosionfilter", 1),
              "ridge output descriptor")
-    h.expect(theia.graph_default_param_count("erosionfilter") == 18,
+    h.expect(theia.graph_default_param_count("erosionfilter") == 19,
              "erosionfilter default count")
     let defaults: [(String, Double)] = [
-        ("seed", 1337), ("scale", 0.15), ("strength", 0.22),
+        ("seed", 1337), ("scale", 0.05), ("strength", 0.22),
         ("octaves", 5), ("lacunarity", 2.0), ("gain", 0.5),
-        ("gullyWeight", 0.5), ("detail", 1.5),
-        ("ridgeRounding", 0.1), ("creaseRounding", 0.0),
+        ("gullyWeight", 0.35), ("detail", 1.5),
+        ("ridgeRounding", 0.18), ("creaseRounding", 0.1),
         ("onset", 1.25), ("assumedSlope", 0.7), ("slopeMix", 1.0),
-        ("cellScale", 0.7), ("normalization", 0.5),
-        ("heightOffset", -0.65), ("fadeCenter", 0.5), ("fadeRange", 0.5),
+        ("cellScale", 0.7), ("normalization", 0.4),
+        ("heightOffset", -0.65), ("fadeAuto", 1),
+        ("fadeCenter", 0.5), ("fadeRange", 0.5),
     ]
     for (key, expected) in defaults {
         h.expect(theia.graph_default_param_value("erosionfilter", key, -99) == expected,
                  "erosionfilter \(key) default")
     }
+}
+
+h.test("Erosion filter fadeAuto calibrates fade from the input range") {
+    func graph(_ erosionParams: String) -> String {
+        """
+        {
+          "resolution": { "width": 96, "height": 96 },
+          "sink": "e",
+          "nodes": [
+            { "id": "p", "type": "perlin", "params": {
+              "seed": 2026, "frequency": 3.2, "octaves": 6, "heightScale": 1.0
+            } },
+            { "id": "e", "type": "erosionfilter", "params": { \(erosionParams) } }
+          ],
+          "connections": [ { "from": "p", "to": "e", "input": 0 } ]
+        }
+        """
+    }
+
+    let auto = evalGraphJSON(graph("\"fadeAuto\": 1"))
+    let manual = evalGraphJSON(graph("\"fadeAuto\": 0"))
+    h.expect(auto.mean != manual.mean || auto.variance != manual.variance,
+             "fadeAuto should change the fade mapping on a narrow-range input")
+
+    let identity = evalGraphJSON(
+        graph("\"fadeAuto\": 1, \"strength\": 0"))
+    let input = evalGraphJSON("""
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "p",
+      "nodes": [ { "id": "p", "type": "perlin", "params": {
+        "seed": 2026, "frequency": 3.2, "octaves": 6, "heightScale": 1.0
+      } } ],
+      "connections": []
+    }
+    """)
+    h.expect(identity.mean == input.mean && identity.variance == input.variance,
+             "strength 0 with fadeAuto must preserve the input")
 }
 
 h.test("Erosion filter height and ridge share one atomic cache entry") {
@@ -1754,6 +1844,75 @@ h.test("Experimental erosion filter is deterministic and normalized") {
              "erosionfilter should visibly alter the input terrain")
 }
 
+h.test("Erosion filter stability envelope prevents spikes and clipped holes") {
+    let input = evalGraphHeightsJSON(erosionFilterJSON(strength: 0), size: 96)
+    let inputJump = maximumAdjacentJump(input, width: 96)
+    let inputResidual = maximumLocalResidual(input, width: 96)
+    let profiles: [(String, String)] = [
+        ("default", erosionFilterJSON()),
+        ("overscale", erosionFilterJSON(scale: 0.5)),
+        ("heavy gullies", erosionFilterJSON(gullyWeight: 1.0)),
+        ("full normalization", erosionFilterJSON(normalization: 1.0)),
+        ("low fade center", erosionFilterJSON(fadeCenter: 0.0)),
+        ("high fade center", erosionFilterJSON(fadeCenter: 1.0)),
+    ]
+
+    for (name, json) in profiles {
+        let output = evalGraphHeightsJSON(json, size: 96)
+        h.expect(output.count == input.count &&
+                 output.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 },
+                 "\(name) stability output invalid")
+        let jump = maximumAdjacentJump(output, width: 96)
+        h.expect(jump <= inputJump + 0.08,
+                 "\(name) introduced an excessive adjacent jump: \(jump) vs \(inputJump)")
+        let residual = maximumLocalResidual(output, width: 96)
+        h.expect(residual <= inputResidual + 0.04,
+                 "\(name) introduced an isolated curvature spike: \(residual) vs \(inputResidual)")
+        h.expect(introducedBoundaryCount(input: input, output: output) == 0,
+                 "\(name) introduced a hard-clipped zero/one sample")
+    }
+
+    let scaleLimit = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.06), size: 96)
+    let scaleAbove = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.5), size: 96)
+    h.expect(scaleLimit == scaleAbove,
+             "scale above the safe envelope should clamp to 0.06")
+
+    let gullyLimit = evalGraphHeightsJSON(erosionFilterJSON(gullyWeight: 0.65), size: 96)
+    let gullyAbove = evalGraphHeightsJSON(erosionFilterJSON(gullyWeight: 1.0), size: 96)
+    h.expect(gullyLimit == gullyAbove,
+             "gullyWeight above the safe envelope should clamp to 0.65")
+
+    let normalizationLimit = evalGraphHeightsJSON(
+        erosionFilterJSON(normalization: 0.5), size: 96)
+    let normalizationAbove = evalGraphHeightsJSON(
+        erosionFilterJSON(normalization: 1.0), size: 96)
+    h.expect(normalizationLimit == normalizationAbove,
+             "normalization above the safe envelope should clamp to 0.5")
+}
+
+h.test("Erosion filter rejects octaves above the terrain sampling band") {
+    let supported = evalGraphHeightsJSON(
+        erosionFilterJSON(octaves: 1), size: 96)
+    let excessive = evalGraphHeightsJSON(
+        erosionFilterJSON(octaves: 8), size: 96)
+    h.expect(supported == excessive,
+             "96x96 output should reject octaves below 2.5 samples per cycle")
+
+    let supportedRidge = evalGraphOutputHeightsJSON(
+        erosionFilterJSON(octaves: 1), sink: "e", output: "ridge", size: 96)
+    let excessiveRidge = evalGraphOutputHeightsJSON(
+        erosionFilterJSON(octaves: 8), sink: "e", output: "ridge", size: 96)
+    h.expect(supportedRidge == excessiveRidge,
+             "rejected octaves must not leak into the ridge analysis output")
+
+    let higherResolution = evalGraphHeightsJSON(
+        erosionFilterJSON(octaves: 8), size: 256)
+    let oneOctaveHighResolution = evalGraphHeightsJSON(
+        erosionFilterJSON(octaves: 1), size: 256)
+    h.expect(meanAbsoluteDifference(higherResolution, oneOctaveHighResolution) > 1e-5,
+             "higher resolution should admit additional resolved octaves")
+}
+
 h.test("Experimental erosion filter identity, seed, and controls respond") {
     let identity = evalGraphHeightsJSON(erosionFilterJSON(strength: 0), size: 96)
     let input = evalGraphHeightsJSON("""
@@ -1775,8 +1934,8 @@ h.test("Experimental erosion filter identity, seed, and controls respond") {
     h.expect(meanAbsoluteDifference(seedA, seedB) > 1e-5,
              "seed should change the procedural drainage field")
 
-    let fine = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.08), size: 96)
-    let broad = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.24), size: 96)
+    let fine = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.02), size: 96)
+    let broad = evalGraphHeightsJSON(erosionFilterJSON(scale: 0.06), size: 96)
     h.expect(meanAbsoluteDifference(fine, broad) > 1e-4,
              "scale should change gully structure")
 

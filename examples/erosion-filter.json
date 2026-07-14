@@ -21,11 +21,11 @@
       "type": "erosionfilter",
       "params": {
         "seed": 1337,
-        "scale": 0.1,
+        "scale": 0.05,
         "strength": 0.18,
         "octaves": 5,
         "gain": 0.5,
-        "gullyWeight": 0.5,
+        "gullyWeight": 0.35,
         "detail": 1.5,
         "heightOffset": -0.65
       }

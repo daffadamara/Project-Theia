@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Stabilized `erosionfilter` defaults and extreme controls, and added
+  resolution-aware octave band-limiting to prevent cell distortion,
+  under-sampled micro-spikes, normalization spikes, and clipped fade holes.
+- `erosionfilter` now samples the input gradient at the gully-cell scale
+  (coherent gullies on detail-bearing inputs) and auto-calibrates the fade
+  target from the input's measured height range (`fadeAuto`, on by default),
+  matching the reference's amplitude-normalized altitude fade.
+
 ## 0.10.0-alpha.1
 
 - Added typed named graph ports with `terrain`, `mask`, and `data` field kinds.

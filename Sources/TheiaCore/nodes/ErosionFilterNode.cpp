@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 #include "GPUContext.hpp"
@@ -98,25 +99,51 @@ bool ErosionFilterNode::evaluatePair(
         std::isfinite(seedValue) ? seedValue : 1337.0, 0.0, 4294967295.0));
     p.octaves = static_cast<std::uint32_t>(std::clamp(
         std::isfinite(octaveValue) ? octaveValue : 5.0, 0.0, 8.0));
-    p.scale = finiteParam(params, "scale", 0.15, 0.005f, 1.0f);
+    p.scale = finiteParam(params, "scale", 0.05, 0.005f, 0.06f);
     p.strength = finiteParam(params, "strength", 0.22, 0.0f, 1.0f);
     p.lacunarity = finiteParam(params, "lacunarity", 2.0, 1.0f, 4.0f);
     p.gain = finiteParam(params, "gain", 0.50, 0.0f, 1.0f);
-    p.gullyWeight = finiteParam(params, "gullyWeight", 0.50, 0.0f, 1.0f);
+    p.gullyWeight = finiteParam(params, "gullyWeight", 0.35, 0.0f, 0.65f);
     p.detail = finiteParam(params, "detail", 1.50, 0.05f, 6.0f);
-    p.ridgeRounding = finiteParam(params, "ridgeRounding", 0.10, 0.0f, 1.0f);
-    p.creaseRounding = finiteParam(params, "creaseRounding", 0.00, 0.0f, 1.0f);
+    p.ridgeRounding = finiteParam(params, "ridgeRounding", 0.18, 0.0f, 1.0f);
+    p.creaseRounding = finiteParam(params, "creaseRounding", 0.10, 0.0f, 1.0f);
     p.onset = finiteParam(params, "onset", 1.25, 0.05f, 8.0f);
     p.assumedSlope = finiteParam(params, "assumedSlope", 0.70, 0.0f, 8.0f);
     p.slopeMix = finiteParam(params, "slopeMix", 1.00, 0.0f, 1.0f);
     p.cellScale = finiteParam(params, "cellScale", 0.70, 0.10f, 4.0f);
-    p.normalization = finiteParam(params, "normalization", 0.50, 0.0f, 1.0f);
+    p.normalization = finiteParam(params, "normalization", 0.40, 0.0f, 0.50f);
     p.heightOffset = finiteParam(params, "heightOffset", -0.65, -1.0f, 1.0f);
     p.fadeCenter = finiteParam(params, "fadeCenter", 0.50, 0.0f, 1.0f);
     p.fadeRange = finiteParam(params, "fadeRange", 0.50, 0.01f, 1.0f);
 
+    // The published method derives its fade target from altitude normalized by
+    // terrain amplitude. Auto mode fits the equivalent center and 60%-half-span
+    // range to this input. Near-flat inputs retain the manual mapping so tiny
+    // noise is not expanded into a full signed fade.
+    if (p.strength > 1.0e-7f && p.octaves > 0u &&
+        params.get("fadeAuto", 1.0) >= 0.5) {
+        const float* data = input->data();
+        const std::size_t count = input->count();
+        if (data && count > 0) {
+            float lo = data[0];
+            float hi = data[0];
+            for (std::size_t i = 1; i < count; ++i) {
+                const float value = data[i];
+                if (value < lo) lo = value;
+                if (value > hi) hi = value;
+            }
+            const float span = hi - lo;
+            if (std::isfinite(span) && span > 1.0e-4f) {
+                p.fadeCenter = std::clamp(
+                    0.5f * (lo + hi), 0.0f, 1.0f);
+                p.fadeRange = std::clamp(
+                    0.3f * span, 0.01f, 1.0f);
+            }
+        }
+    }
+
     return ctx.dispatch2D(
-        "erosion_filter_v1", kernels::kErosionFilter, "erosion_filter",
+        "erosion_filter_v4", kernels::kErosionFilter, "erosion_filter",
         out.width(), out.height(),
         [&](MTL::ComputeCommandEncoder* encoder) {
             encoder->setBuffer(out.buffer(), 0, 0);

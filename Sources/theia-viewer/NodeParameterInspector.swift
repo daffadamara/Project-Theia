@@ -542,6 +542,7 @@ private struct ParameterPresentation {
         case "slopeMix": return "Slope Override"
         case "cellScale": return "Cell Scale"
         case "heightOffset": return "Height Offset"
+        case "fadeAuto": return "Fade Auto"
         case "fadeCenter": return "Fade Center"
         case "fadeRange": return "Fade Range"
         default:
@@ -615,6 +616,7 @@ private struct ParameterPresentation {
         case "cellScale": return "Sets the procedural drainage-cell size."
         case "normalization" where param.nodeType == "erosionfilter": return "Controls phase blending between adjacent cells."
         case "heightOffset": return "Offsets each erosion octave vertically."
+        case "fadeAuto": return "Fits the fade to the input's measured height range."
         case "fadeCenter": return "Altitude around which broad erosion changes direction."
         case "fadeRange": return "Width of the altitude-driven erosion transition."
         default: return nil
@@ -645,7 +647,7 @@ private struct ParameterPresentation {
         case "assumedSlope", "slopeMix": return "angle"
         case "cellScale": return "square.grid.3x3"
         case "heightOffset": return "arrow.up.and.down"
-        case "fadeCenter", "fadeRange": return "circle.lefthalf.filled"
+        case "fadeAuto", "fadeCenter", "fadeRange": return "circle.lefthalf.filled"
         case "mode": return "square.stack.3d.up"
         default: return "slider.horizontal.3"
         }
@@ -824,10 +826,14 @@ struct SliderConfig {
             return SliderConfig(range: 0.001...0.2, step: 0.001, precision: 3)
         case "scale":
             if param.nodeType == "erosionfilter" {
-                return SliderConfig(range: 0.01...0.5, step: 0.005, precision: 3)
+                return SliderConfig(range: 0.005...0.06, step: 0.005, precision: 3)
             }
             return SliderConfig(range: -4...4, step: 0.01, precision: 2)
-        case "gullyWeight", "normalization", "slopeMix", "ridgeRounding", "creaseRounding":
+        case "gullyWeight":
+            return SliderConfig(range: 0...0.65, step: 0.01, precision: 2)
+        case "normalization":
+            return SliderConfig(range: 0...0.5, step: 0.01, precision: 2)
+        case "slopeMix", "ridgeRounding", "creaseRounding":
             return SliderConfig(range: 0...1, step: 0.01, precision: 2)
         case "detail":
             return SliderConfig(range: 0.1...4, step: 0.05, precision: 2)
@@ -839,6 +845,8 @@ struct SliderConfig {
             return SliderConfig(range: 0.1...2, step: 0.05, precision: 2)
         case "heightOffset":
             return SliderConfig(range: -1...1, step: 0.01, precision: 2)
+        case "fadeAuto":
+            return SliderConfig(range: 0...1, step: 1, precision: 0)
         case "fadeCenter":
             return SliderConfig(range: 0...1, step: 0.01, precision: 2)
         case "fadeRange":
