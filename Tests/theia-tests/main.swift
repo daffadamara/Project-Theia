@@ -58,7 +58,7 @@ let h = Harness()
 
 h.test("Version and capabilities API are parseable") {
     let version = readCxxString { theia.theia_version_string($0, $1) }
-    h.expect(version == "0.10.0-alpha.1", "unexpected version: \(version)")
+    h.expect(version == "0.10.0-alpha.2", "unexpected version: \(version)")
     h.expect(theia.theia_api_version() >= 3, "api version should be >= 3")
     let capsText = readCxxLongString { theia.theia_capabilities_json($0, $1) }
     guard let data = capsText.data(using: .utf8),

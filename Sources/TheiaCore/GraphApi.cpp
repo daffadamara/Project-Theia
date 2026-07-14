@@ -25,7 +25,7 @@ using json = nlohmann::json;
 namespace theia {
 
 namespace {
-constexpr const char* kTheiaVersion = "0.10.0-alpha.1";
+constexpr const char* kTheiaVersion = "0.10.0-alpha.2";
 constexpr std::uint32_t kTheiaAPIVersion = 3;
 
 std::size_t copyOutStr(const std::string& s, char* out, std::size_t cap) {

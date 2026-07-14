@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0-alpha.2
+
 - Stabilized `erosionfilter` defaults and extreme controls, and added
   resolution-aware octave band-limiting to prevent cell distortion,
   under-sampled micro-spikes, normalization spikes, and clipped fade holes.

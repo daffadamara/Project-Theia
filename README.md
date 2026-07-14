@@ -1,6 +1,6 @@
 # Theia
 
-**Current version:** `0.10.0-alpha.1`
+**Current version:** `0.10.0-alpha.2`
 
 A node-based procedural terrain generator for macOS, built on Metal compute —
 a Mac-native take on tools like GAEA and World Machine (which are Windows-only).
