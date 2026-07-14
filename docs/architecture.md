@@ -16,8 +16,14 @@ Theia is split into a portable graph engine and two Swift front ends.
 - A node evaluation is atomic across all outputs. The cache stores the complete
   output set in one entry, while downstream keys are derived from the node key,
   selected output name, and resolved kind.
-- Graph format v2 connections are `{from, output, to, input}` and the active
-  result is `{sink, sinkOutput}`. Missing v1 output fields map to default ports.
+- Graph format v3 retains v2 connections `{from, output, to, input}` and the
+  persisted result `{sink, sinkOutput}`, then adds an optional top-level
+  `materialStack`. Missing v1 output fields map to default ports; v1/v2 files
+  migrate without acquiring a material stack.
+- A material stack is a derived document asset over scalar graph outputs, not a
+  new field kind. The core evaluates one terrain reference and up to three
+  deduplicated mask/data sources, normalizes four weights, and transactionally
+  exports linear RGBA8 weights plus a channel/source manifest.
 - `ui.maskErases[nodeId][outputName]` is the one semantic editor field: it participates in node
   hashes and graph evaluation so preview, downstream nodes, CLI, and viewer
   export agree. It is applied only when the resolved output kind is `mask`.
@@ -32,12 +38,16 @@ Theia is split into a portable graph engine and two Swift front ends.
 - `TerrainPreviewWorker` owns a separate graph handle on a serial background
   queue. New snapshots supersede queued work and stale completed results are
   discarded.
-- The active named output supplies preview data. Non-terrain fields reuse a
+- The ephemeral `previewReference` supplies preview data, while
+  `sink`/`sinkOutput` changes only through an explicit authoring action.
+  Non-terrain fields reuse a
   terrain output from the same node, or the nearest upstream terrain, as mesh
   geometry. Auto mode follows the resolved field kind.
 - `TerrainEngine` is retained for synchronous validation and explicit save.
 - `Renderer`, `TerrainSurfacePicker`, and `TerrainShaders` own rendering and
-  surface-aware viewport interaction.
+  surface-aware viewport interaction. Material preview passes packed scalar
+  weights to Metal, decodes stored sRGB colors to linear light, blends, lights,
+  and encodes for the non-sRGB display target.
 - Export, graph output, node inspector, viewport controls, and the main content
   shell are separate SwiftUI files to keep feature boundaries reviewable.
 

@@ -1,5 +1,7 @@
 #include "nodes/ScaleBiasNode.hpp"
 
+#include <cmath>
+
 #include <Metal/Metal.hpp>
 
 #include "GPUContext.hpp"
@@ -15,8 +17,13 @@ bool ScaleBiasNode::evaluate(GPUContext& ctx,
         error = "scalebias '" + id() + "' requires 1 input";
         return false;
     }
-    const float sb[2] = {static_cast<float>(params.get("scale", 1.0)),
-                         static_cast<float>(params.get("bias", 0.0))};
+    const double scale = params.get("scale", 1.0);
+    const double bias = params.get("bias", 0.0);
+    if (!std::isfinite(scale) || !std::isfinite(bias)) {
+        error = "scalebias '" + id() + "' scale/bias must be finite";
+        return false;
+    }
+    const float sb[2] = {static_cast<float>(scale), static_cast<float>(bias)};
     const std::uint32_t dim[2] = {out.width(), out.height()};
     const Heightfield* in = inputs[0];
 

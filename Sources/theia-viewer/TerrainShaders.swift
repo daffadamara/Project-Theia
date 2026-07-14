@@ -15,6 +15,11 @@ struct Uniforms {
     float4 terrainParams;  // x=base height offset for geometry
     float4 brushParams;    // xy=center UV, z=radius UV, w=visible
     uint4  gridParams;     // x=gridW, y=gridH
+    float4 materialColor0; // sRGB preview colors
+    float4 materialColor1;
+    float4 materialColor2;
+    float4 materialColor3;
+    float4 materialParams; // x=packed weights available
 };
 
 struct VOut {
@@ -22,6 +27,7 @@ struct VOut {
     float3 normal;
     float  height;
     float  data;
+    float4 weights;
     float2 uv;
 };
 
@@ -38,7 +44,8 @@ struct LineOut {
 vertex VOut terrain_vertex(uint vid [[vertex_id]],
                            const device float* heights [[buffer(0)]],
                            constant Uniforms& U [[buffer(1)]],
-                           const device float* dataValues [[buffer(2)]]) {
+                           const device float* dataValues [[buffer(2)]],
+                           const device float4* materialWeights [[buffer(3)]]) {
     uint gridW = U.gridParams.x;
     uint gridH = U.gridParams.y;
     float heightScale = U.viewportParams.x;
@@ -71,6 +78,7 @@ vertex VOut terrain_vertex(uint vid [[vertex_id]],
     o.normal = N;
     o.height = h;
     o.data = d;
+    o.weights = materialWeights[gz * gridW + gx];
     o.uv = float2(float(gx) / float(gridW - 1),
                   float(gz) / float(gridH - 1));
     return o;
@@ -127,6 +135,19 @@ float3 materialRamp(float h, float slope, float mask, uint preset) {
 
     float3 col = terrainRamp(h, slope);
     return mix(col, float3(0.24, 0.24, 0.23), mask * 0.55);
+}
+
+float3 srgbToLinear(float3 value) {
+    return select(value / 12.92,
+                  pow((value + 0.055) / 1.055, float3(2.4)),
+                  value > 0.04045);
+}
+
+float3 linearToSrgb(float3 value) {
+    value = max(value, 0.0);
+    return select(value * 12.92,
+                  1.055 * pow(value, float3(1.0 / 2.4)) - 0.055,
+                  value > 0.0031308);
 }
 
 float4 applyBrushDecal(float4 base, float2 uv, constant Uniforms& U) {
@@ -191,6 +212,18 @@ fragment float4 terrain_fragment(VOut in [[stage_in]],
     }
 
     if (mode == 5) {
+        if (U.materialParams.x > 0.5) {
+            float4 weights = max(in.weights, 0.0);
+            float sum = max(dot(weights, float4(1.0)), 0.000001);
+            weights /= sum;
+            float3 linearColor =
+                srgbToLinear(U.materialColor0.rgb) * weights.r +
+                srgbToLinear(U.materialColor1.rgb) * weights.g +
+                srgbToLinear(U.materialColor2.rgb) * weights.b +
+                srgbToLinear(U.materialColor3.rgb) * weights.a;
+            float3 col = clamp(linearToSrgb(linearColor * lit), 0.0, 1.0);
+            return applyBrushDecal(float4(col, 1.0), in.uv, U);
+        }
         float3 col = materialRamp(h, slope, mask, preset);
         return applyBrushDecal(float4(col * lit, 1.0), in.uv, U);
     }

@@ -1,6 +1,6 @@
 # Theia
 
-**Current version:** `0.10.0-alpha.2`
+**Current version:** `0.11.0-alpha.1`
 
 A node-based procedural terrain generator for macOS, built on Metal compute —
 a Mac-native take on tools like GAEA and World Machine (which are Windows-only).
@@ -10,7 +10,8 @@ carve it with hydraulic and thermal erosion, then shape it with filters. All the
 heavy work runs as Metal compute kernels on the GPU.
 
 > **Status:** headless core engine + CLI + macOS 3D viewer/node editor with
-> typed multi-output fields plus terrain/mask/data preview modes.
+> typed multi-output fields, semantic material layer stacks, and
+> terrain/mask/data/material preview modes.
 
 ## Requirements
 
@@ -65,6 +66,14 @@ swift run theia-cli export examples/foundation.json \
   --heightmap png16 \
   --mesh obj
 
+# Export a terrain + exact-sum RGBA8 material-weight bundle
+swift run theia-cli export-material examples/material-stack.json \
+  --size 1024 \
+  --out-dir /private/tmp/theia-material \
+  --basename landscape \
+  --heightmap r16 \
+  --mesh obj
+
 # Run the test suite
 swift run theia-tests
 
@@ -93,12 +102,24 @@ The legacy Phase 6 `--maps height,pfm,normal,slope,mask` flag remains accepted
 as a compatibility alias, but new scripts should prefer `--heightmap` and
 `--mesh`.
 
-The viewer can display the active named output as shaded terrain, height, mask,
+The viewer can display the previewed named output as shaded terrain, height, mask,
 data, slope, normal, or material preview. In `auto` mode the renderer follows
 the resolved `FieldKind`: mask outputs use an overlay and data outputs use a
 diverging ramp centered at `0.5`. Non-terrain fields use a sibling terrain
 output as geometry when available, then fall back to the nearest upstream
 terrain.
+Node and port selection is preview-only: it does not dirty the document or
+change CLI/export behavior. Use **Set as Graph Output** to update the persisted
+`sink`/`sinkOutput` explicitly.
+
+Graph format v3 can store one semantic `materialStack`: a terrain reference,
+one base/fallback color, and up to three overlay sources resolved as `mask` or
+`data`. The viewer's global Material Layers panel authors channel order,
+sources, names, and sRGB preview colors. Preview colors are decoded to linear
+light before a convex weight blend; color-only edits update shader uniforms
+without reevaluating the graph. `export-material` writes the terrain artifact,
+optional OBJ, linear `<basename>_weights.png` (`RGBA8`, every texel sums to
+`255`), and a channel/source manifest.
 When a mask preview is active, the viewport exposes an erase brush for hiding
 unwanted mask strokes. Select an active mask output, click `Erase` in the top toolbar (or
 press `E`), then drag over the terrain; brush radius and `Clear` remain available
@@ -156,17 +177,19 @@ See `examples/` for graph files.
   memoization. A node evaluation atomically fills all of its outputs; downstream
   content keys include the selected output name and kind, so switching ports
   cannot reuse the wrong field.
-- **Graph format v2** stores typed named source ports in connections,
-  `sinkOutput`, and output-scoped mask edits. Format v1 files migrate
-  automatically and all legacy APIs continue to select a node's default output.
+- **Graph format v3** adds an optional semantic material stack to the typed
+  named ports, `sinkOutput`, and output-scoped mask edits introduced by v2.
+  Format v1/v2 files migrate automatically and all legacy APIs continue to
+  select a node's default output.
 - **Shaders** are compiled from MSL source at runtime (the offline `metal`
   compiler isn't available with Command Line Tools alone).
 
 ## Roadmap
 
 The core now has typed multi-output scalar fields, named-port persistence,
-atomic output caching, and the first terrain+analysis vertical slice. Next:
-richer material/biome layers and separately researched physical simulations.
+atomic output caching, and a four-channel derived material-weight workflow.
+Next: texture/PBR integration, researched auto-biome classification, and
+separately researched physical simulations.
 
 ## Versioning
 

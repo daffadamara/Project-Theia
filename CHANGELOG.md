@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.11.0-alpha.1
+
+- Added graph format v3 with an optional semantic material stack: one terrain
+  reference, one base layer, and up to three mask/data overlays in stable RGBA
+  channel order. Existing v1/v2 graphs continue to migrate automatically.
+- Added audited finite/clamped material-weight normalization and deterministic
+  largest-remainder RGBA8 quantization whose channel bytes sum exactly to 255.
+- Added API v4 material-stack enumeration/readback and transactional bundle
+  export for terrain, optional OBJ, linear RGBA8 weights, and JSON manifest.
+- Added CLI `export-material` and a v3 example combining slope, river, and
+  `erosionfilter.ridge` sources.
+- Separated ephemeral viewer preview selection from persisted graph output,
+  with an explicit **Set as Graph Output** action.
+- Added a global Material Layers authoring panel, semantic undo/redo,
+  mask/data-only source filtering, background evaluation with stale-result
+  dropping, and linear-light convex color blending in the Metal shader.
+- Added core and viewer coverage for migration, malformed/dangling references,
+  cache reuse, color transfer, material history, exact-sum export, CLI, and
+  offscreen visual rendering.
+
 ## 0.10.0-alpha.2
 
 - Stabilized `erosionfilter` defaults and extreme controls, and added

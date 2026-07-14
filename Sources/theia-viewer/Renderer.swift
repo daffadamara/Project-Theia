@@ -13,6 +13,11 @@ struct Uniforms {
     var terrainParams: SIMD4<Float>
     var brushParams: SIMD4<Float>
     var gridParams: SIMD4<UInt32>
+    var materialColor0: SIMD4<Float>
+    var materialColor1: SIMD4<Float>
+    var materialColor2: SIMD4<Float>
+    var materialColor3: SIMD4<Float>
+    var materialParams: SIMD4<Float>
 }
 
 struct LineVertex {
@@ -36,6 +41,7 @@ final class Renderer {
 
     private var heightBuffer: MTLBuffer?
     private var dataBuffer: MTLBuffer?
+    private var weightBuffer: MTLBuffer?
     private var indexBuffer: MTLBuffer?
     private var gridLineBuffer: MTLBuffer?
     private var axisLineBuffer: MTLBuffer?
@@ -52,6 +58,13 @@ final class Renderer {
     private var lightElevationDegrees: Float = 58.0
     private var displayMode: ViewportDisplayMode = .terrain
     private var materialPreset: MaterialPreset = .natural
+    private var materialColors: [SIMD4<Float>] = [
+        SIMD4<Float>(0.42, 0.35, 0.26, 1),
+        SIMD4<Float>(0.46, 0.45, 0.42, 1),
+        SIMD4<Float>(0.18, 0.42, 0.62, 1),
+        SIMD4<Float>(0.86, 0.88, 0.90, 1)
+    ]
+    private var usesMaterialWeights = false
     private var maskOpacity: Float = 0.65
     private var terrainBaseHeight: Float = 0
     private var surfaceHeights: [Float] = []
@@ -120,13 +133,29 @@ final class Renderer {
         setPreview(heights: heights, data: heights, width: width, height: height)
     }
 
-    func setPreview(heights: [Float], data: [Float], width: Int, height: Int) {
+    func setPreview(heights: [Float], data: [Float], weightsRGBA: [Float]? = nil,
+                    width: Int, height: Int) {
         guard width > 1, height > 1, heights.count >= width * height else { return }
         let sampledHeights = Self.viewerHeights(heights, width: width, height: height,
                                                 maxGrid: maxViewerGrid)
         let sourceData = data.count >= width * height ? data : heights
         let sampledData = Self.viewerHeights(sourceData, width: width, height: height,
                                             maxGrid: maxViewerGrid)
+        let sampledWeights = weightsRGBA.flatMap {
+            Self.viewerWeights($0, width: width, height: height,
+                               outputWidth: sampledHeights.width,
+                               outputHeight: sampledHeights.height)
+        }
+        let fallbackWeights = [Float](unsafeUninitializedCapacity:
+            sampledHeights.width * sampledHeights.height * 4) { buffer, initializedCount in
+                for index in stride(from: 0, to: buffer.count, by: 4) {
+                    buffer[index] = 1
+                    buffer[index + 1] = 0
+                    buffer[index + 2] = 0
+                    buffer[index + 3] = 0
+                }
+                initializedCount = buffer.count
+            }
         terrainBaseHeight = sampledHeights.values.min() ?? 0
         surfaceHeights = sampledHeights.values
         surfaceWidth = sampledHeights.width
@@ -139,12 +168,29 @@ final class Renderer {
         dataBuffer = device.makeBuffer(bytes: sampledData.values,
                                        length: sampledData.values.count *
                                             MemoryLayout<Float>.stride,
+                                       options: .storageModeShared)
+        let packedWeights = sampledWeights ?? fallbackWeights
+        weightBuffer = device.makeBuffer(bytes: packedWeights,
+                                         length: packedWeights.count *
+                                            MemoryLayout<Float>.stride,
                                          options: .storageModeShared)
+        usesMaterialWeights = sampledWeights != nil
         if gridW != UInt32(sampledHeights.width) || gridH != UInt32(sampledHeights.height) ||
             indexBuffer == nil {
             buildIndices(width: sampledHeights.width, height: sampledHeights.height)
             gridW = UInt32(sampledHeights.width)
             gridH = UInt32(sampledHeights.height)
+        }
+        invalidateDisplay()
+    }
+
+    func setMaterialColors(_ colorsSRGB: [[Double]]) {
+        for index in 0..<4 {
+            if index < colorsSRGB.count, colorsSRGB[index].count == 3 {
+                materialColors[index] = SIMD4<Float>(
+                    Float(colorsSRGB[index][0]), Float(colorsSRGB[index][1]),
+                    Float(colorsSRGB[index][2]), 1)
+            }
         }
         invalidateDisplay()
     }
@@ -169,6 +215,25 @@ final class Renderer {
             }
         }
         return (out, outW, outH)
+    }
+
+    private static func viewerWeights(_ weights: [Float], width: Int, height: Int,
+                                      outputWidth: Int, outputHeight: Int) -> [Float]? {
+        guard weights.count >= width * height * 4 else { return nil }
+        if width == outputWidth && height == outputHeight { return weights }
+        let xScale = Double(width - 1) / Double(outputWidth - 1)
+        let yScale = Double(height - 1) / Double(outputHeight - 1)
+        var out = [Float](repeating: 0, count: outputWidth * outputHeight * 4)
+        for y in 0..<outputHeight {
+            let sy = min(height - 1, Int((Double(y) * yScale).rounded()))
+            for x in 0..<outputWidth {
+                let sx = min(width - 1, Int((Double(x) * xScale).rounded()))
+                let source = (sy * width + sx) * 4
+                let destination = (y * outputWidth + x) * 4
+                for channel in 0..<4 { out[destination + channel] = weights[source + channel] }
+            }
+        }
+        return out
     }
 
     private func buildIndices(width: Int, height: Int) {
@@ -247,8 +312,14 @@ final class Renderer {
                          terrainParams: SIMD4<Float>(terrainBaseHeight, 0, 0, 0),
                          brushParams: SIMD4<Float>(brushCenterUV.x, brushCenterUV.y,
                                                    brushRadius, brushVisible ? 1 : 0),
-                         gridParams: SIMD4<UInt32>(gridW, gridH, 0, 0))
-        if let hb = heightBuffer, let db = dataBuffer, let ib = indexBuffer,
+                         gridParams: SIMD4<UInt32>(gridW, gridH, 0, 0),
+                         materialColor0: materialColors[0],
+                         materialColor1: materialColors[1],
+                         materialColor2: materialColors[2],
+                         materialColor3: materialColors[3],
+                         materialParams: SIMD4<Float>(usesMaterialWeights ? 1 : 0, 0, 0, 0))
+        if let hb = heightBuffer, let db = dataBuffer, let wb = weightBuffer,
+           let ib = indexBuffer,
            indexCount > 0 {
             enc.setRenderPipelineState(pipeline)
             enc.setDepthStencilState(depthState)
@@ -258,6 +329,7 @@ final class Renderer {
             enc.setVertexBuffer(hb, offset: 0, index: 0)
             enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setVertexBuffer(db, offset: 0, index: 2)
+            enc.setVertexBuffer(wb, offset: 0, index: 3)
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
                                       indexType: .uint32, indexBuffer: ib,

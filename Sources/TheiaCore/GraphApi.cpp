@@ -1,6 +1,8 @@
 #include "Theia/Theia.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +17,7 @@
 #include "GPUContext.hpp"
 #include "Graph.hpp"
 #include "Heightfield.hpp"
+#include "MaterialWeights.hpp"
 #include "Node.hpp"
 #include "io/ExportWriter.hpp"
 #include "io/ImageWriter.hpp"
@@ -25,8 +28,8 @@ using json = nlohmann::json;
 namespace theia {
 
 namespace {
-constexpr const char* kTheiaVersion = "0.10.0-alpha.2";
-constexpr std::uint32_t kTheiaAPIVersion = 3;
+constexpr const char* kTheiaVersion = "0.11.0-alpha.1";
+constexpr std::uint32_t kTheiaAPIVersion = 4;
 
 std::size_t copyOutStr(const std::string& s, char* out, std::size_t cap) {
     if (out && cap > 0) {
@@ -35,6 +38,25 @@ std::size_t copyOutStr(const std::string& s, char* out, std::size_t cap) {
         out[n] = '\0';
     }
     return s.size();
+}
+
+void fillStats(const std::vector<float>& values, GraphEvalResult& result) {
+    if (values.empty()) return;
+    float minValue = values.front();
+    float maxValue = values.front();
+    double sum = 0.0;
+    double sumSquares = 0.0;
+    for (float value : values) {
+        minValue = std::min(minValue, value);
+        maxValue = std::max(maxValue, value);
+        sum += value;
+        sumSquares += double(value) * value;
+    }
+    const double count = double(values.size());
+    result.minHeight = minValue;
+    result.maxHeight = maxValue;
+    result.mean = sum / count;
+    result.variance = std::max(0.0, sumSquares / count - result.mean * result.mean);
 }
 
 struct DiagnosticIssue {
@@ -294,29 +316,28 @@ std::string makeDiagnosticsJSON(const std::string& text) {
 
     std::set<std::string> reachable;
     std::map<std::string, int> color;
+    std::function<void(const std::string&)> markReachable = [&](const std::string& id) {
+        if (!nodeTypes.count(id) || color[id] == 2) return;
+        if (color[id] == 1) {
+            addIssue(issues, "error", "cycle",
+                     "Cycle detected while tracing graph dependencies at node '" +
+                         id + "'", id);
+            return;
+        }
+        color[id] = 1;
+        reachable.insert(id);
+        for (const auto& kv : inbound[id]) {
+            const std::string& source = kv.second.node;
+            if (nodeTypes.count(source)) markReachable(source);
+        }
+        color[id] = 2;
+    };
     if (!sink.empty()) {
         if (!nodeTypes.count(sink)) {
             addIssue(issues, "error", "missing_sink",
                      "Sink node '" + sink + "' does not exist", sink);
         } else {
-            std::function<void(const std::string&)> dfs = [&](const std::string& id) {
-                color[id] = 1;
-                reachable.insert(id);
-                for (const auto& kv : inbound[id]) {
-                    const std::string& src = kv.second.node;
-                    if (!nodeTypes.count(src)) continue;
-                    if (color[src] == 1) {
-                        addIssue(issues, "error", "cycle",
-                                 "Cycle detected while tracing sink dependencies at node '" +
-                                     src + "'",
-                                 src);
-                        continue;
-                    }
-                    if (color[src] == 0) dfs(src);
-                }
-                color[id] = 2;
-            };
-            dfs(sink);
+            markReachable(sink);
 
             const auto& ports = outputPorts[sink];
             if (sinkOutput.empty()) {
@@ -357,6 +378,136 @@ std::string makeDiagnosticsJSON(const std::string& text) {
             kindColor[key] = 2;
             return true;
         };
+
+    bool hasMaterialStack = false;
+    if (j.is_object() && j.contains("materialStack")) {
+        hasMaterialStack = true;
+        std::uint32_t materialFormatVersion = 0;
+        if (!readJsonU32(j, "formatVersion", materialFormatVersion) ||
+            materialFormatVersion != 3) {
+            addIssue(issues, "error", "material_format_version",
+                     "materialStack requires graph formatVersion 3");
+        }
+        const auto& stack = j["materialStack"];
+        if (!stack.is_object()) {
+            addIssue(issues, "error", "invalid_material_stack",
+                     "materialStack must be an object");
+        } else {
+            auto readMaterialReference = [&](const json& value,
+                                             DiagnosticSource& reference,
+                                             const std::string& label) -> bool {
+                if (!value.is_object() ||
+                    !readJsonString(value, "node", reference.node) ||
+                    !readJsonString(value, "output", reference.output) ||
+                    reference.node.empty() || reference.output.empty()) {
+                    addIssue(issues, "error", "invalid_material_reference",
+                             label + " requires non-empty node/output strings");
+                    return false;
+                }
+                return true;
+            };
+
+            DiagnosticSource terrainReference;
+            if (!stack.contains("terrain") ||
+                !readMaterialReference(stack["terrain"], terrainReference,
+                                       "materialStack terrain")) {
+                addIssue(issues, "error", "missing_material_terrain",
+                         "materialStack requires a terrain reference");
+            } else {
+                markReachable(terrainReference.node);
+                FieldKind kind = FieldKind::data;
+                if (!resolveKind(terrainReference, kind)) {
+                    addIssue(issues, "error", "invalid_material_terrain",
+                             "Material terrain output '" + terrainReference.node + "." +
+                                 terrainReference.output + "' does not exist",
+                             terrainReference.node);
+                } else if (kind != FieldKind::terrain) {
+                    addIssue(issues, "error", "incompatible_material_terrain",
+                             "Material terrain output must resolve to terrain",
+                             terrainReference.node);
+                }
+            }
+
+            if (!stack.contains("layers") || !stack["layers"].is_array()) {
+                addIssue(issues, "error", "invalid_material_layers",
+                         "materialStack layers must be an array");
+            } else {
+                const auto& layers = stack["layers"];
+                if (layers.empty() || layers.size() > 4) {
+                    addIssue(issues, "error", "invalid_material_layer_count",
+                             "materialStack requires 1 to 4 layers");
+                }
+                std::set<std::string> ids;
+                for (std::size_t index = 0; index < layers.size(); ++index) {
+                    const auto& layer = layers[index];
+                    if (!layer.is_object()) {
+                        addIssue(issues, "error", "invalid_material_layer",
+                                 "Material layer entries must be objects");
+                        continue;
+                    }
+                    std::string id;
+                    std::string name;
+                    if (!readJsonString(layer, "id", id) || id.empty() ||
+                        !readJsonString(layer, "name", name) || name.empty()) {
+                        addIssue(issues, "error", "invalid_material_layer_identity",
+                                 "Material layers require non-empty id and name");
+                    } else if (!ids.insert(id).second) {
+                        addIssue(issues, "error", "duplicate_material_layer",
+                                 "Duplicate material layer id '" + id + "'");
+                    }
+                    if (!layer.contains("previewColorSRGB") ||
+                        !layer["previewColorSRGB"].is_array() ||
+                        layer["previewColorSRGB"].size() != 3) {
+                        addIssue(issues, "error", "invalid_material_color",
+                                 "Material layer '" + id +
+                                     "' previewColorSRGB must contain 3 numbers");
+                    } else {
+                        for (const auto& component : layer["previewColorSRGB"]) {
+                            if (!component.is_number() ||
+                                !std::isfinite(component.get<double>()) ||
+                                component.get<double>() < 0.0 ||
+                                component.get<double>() > 1.0) {
+                                addIssue(issues, "error", "invalid_material_color",
+                                         "Material layer '" + id +
+                                             "' color must be finite in [0,1]");
+                                break;
+                            }
+                        }
+                    }
+                    if (index == 0) {
+                        if (layer.contains("source")) {
+                            addIssue(issues, "error", "material_base_has_source",
+                                     "Material base layer must not have a source");
+                        }
+                        continue;
+                    }
+                    DiagnosticSource source;
+                    if (!layer.contains("source") ||
+                        !readMaterialReference(layer["source"], source,
+                                               "material layer '" + id + "' source")) {
+                        addIssue(issues, "error", "missing_material_source",
+                                 "Material overlay layer '" + id +
+                                     "' requires a source");
+                        continue;
+                    }
+                    markReachable(source.node);
+                    FieldKind kind = FieldKind::terrain;
+                    if (!resolveKind(source, kind)) {
+                        addIssue(issues, "error", "invalid_material_source",
+                                 "Material layer '" + id + "' output '" +
+                                     source.node + "." + source.output +
+                                     "' does not exist",
+                                 source.node);
+                    } else if (kind != FieldKind::mask && kind != FieldKind::data) {
+                        addIssue(issues, "error", "incompatible_material_source",
+                                 "Material layer '" + id +
+                                     "' source must resolve to mask or data",
+                                 source.node);
+                    }
+                }
+            }
+        }
+    }
 
     for (const auto& target : inbound) {
         if (!inputPorts.count(target.first)) continue;
@@ -447,7 +598,8 @@ std::string makeDiagnosticsJSON(const std::string& text) {
         {"connections", connectionCount},
         {"errors", errors},
         {"warnings", warnings},
-        {"sink", sink}
+        {"sink", sink},
+        {"materialStack", hasMaterialStack}
     };
     result["issues"] = json::array();
     for (const auto& issue : issues) {
@@ -482,10 +634,14 @@ std::size_t theia_capabilities_json(char* out, std::size_t cap) {
     caps["swiftPM"] = true;
     caps["stableCABI"] = false;
     caps["multiOutputGraph"] = true;
-    caps["graphFormatVersion"] = 2;
+    caps["graphFormatVersion"] = 3;
+    caps["materialStack"] = true;
+    caps["materialWeightChannels"] = 4;
+    caps["materialBundleFormats"] = {"rgba8", "json"};
     caps["heightmapFormats"] = {"png16", "r16", "pfm32"};
     caps["meshFormats"] = {"obj"};
-    caps["commands"] = {"smoke", "demo", "run", "export", "diagnose", "nodes", "doctor", "version"};
+    caps["commands"] = {"smoke", "demo", "run", "export", "export-material",
+                        "diagnose", "nodes", "doctor", "version"};
     caps["nodes"] = registeredNodeTypes();
     const std::string text = caps.dump(2);
     return copyOutStr(text, out, cap);
@@ -615,6 +771,12 @@ std::size_t graph_diagnostics_json_text(const char* text,
     return copyOutStr(diagnostics, out, cap);
 }
 
+std::size_t graph_material_stack_json(GraphHandle* g,
+                                      char* out, std::size_t cap) {
+    return copyOutStr(g ? g->graph.materialStackJSON() : std::string("null"),
+                      out, cap);
+}
+
 GraphEvalResult graph_evaluate(GraphHandle* g, const char* sinkId,
                                std::uint32_t width, std::uint32_t height,
                                const char* pngPath, const char* pfmPath) {
@@ -739,6 +901,48 @@ GraphEvalResult graph_evaluate_heights_output(
     }
     r.ok = true;
     return r;
+}
+
+GraphEvalResult graph_evaluate_material_stack(
+    GraphHandle* g, std::uint32_t width, std::uint32_t height,
+    float* terrainDst, std::size_t terrainCapElems,
+    float* weightsRGBADst, std::size_t weightsCapElems) {
+    GraphEvalResult result;
+    if (!g) return result;
+    g->clearError();
+    if (!g->ensureGPU()) return result;
+
+    const std::uint32_t w = width ? width : g->graph.defaultWidth();
+    const std::uint32_t h = height ? height : g->graph.defaultHeight();
+    if (w < 2 || h < 2) {
+        g->setError(GraphErrorCode::validation,
+                    "material evaluation resolution must be at least 2x2");
+        return result;
+    }
+
+    std::vector<float> terrain;
+    std::vector<float> weights;
+    EvalStats stats;
+    if (!g->graph.evaluateMaterialStack(*g->ctx, w, h, terrain, weights,
+                                        stats, g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::evaluation;
+        return result;
+    }
+
+    result.width = w;
+    result.height = h;
+    result.evaluated = stats.evaluated;
+    result.reused = stats.reused;
+    fillStats(terrain, result);
+
+    if (terrainDst && terrainCapElems >= terrain.size()) {
+        std::memcpy(terrainDst, terrain.data(), terrain.size() * sizeof(float));
+    }
+    if (weightsRGBADst && weightsCapElems >= weights.size()) {
+        std::memcpy(weightsRGBADst, weights.data(), weights.size() * sizeof(float));
+    }
+    result.ok = true;
+    return result;
 }
 
 GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
@@ -993,6 +1197,271 @@ GraphEvalResult graph_export2(GraphHandle* g, const GraphExportOptions& options)
         }
     }
     return r;
+}
+
+GraphEvalResult graph_export_material_bundle(
+    GraphHandle* g, const GraphMaterialExportOptions& options) {
+    GraphEvalResult result;
+    if (!g) return result;
+    g->clearError();
+
+    if (options.heightmapFormat != HeightmapFormat::none &&
+        options.heightmapFormat != HeightmapFormat::png16 &&
+        options.heightmapFormat != HeightmapFormat::r16 &&
+        options.heightmapFormat != HeightmapFormat::pfm32) {
+        g->setError(GraphErrorCode::validation, "unknown heightmap format");
+        return result;
+    }
+    if (options.meshFormat != MeshFormat::none &&
+        options.meshFormat != MeshFormat::obj) {
+        g->setError(GraphErrorCode::validation, "unknown mesh format");
+        return result;
+    }
+    if (!options.outDir || !options.outDir[0]) {
+        g->setError(GraphErrorCode::validation, "material export outDir is required");
+        return result;
+    }
+    if (!options.basename || !options.basename[0]) {
+        g->setError(GraphErrorCode::validation, "material export basename is required");
+        return result;
+    }
+    if (options.meshStride == 0 || !(options.verticalScale > 0.0f)) {
+        g->setError(GraphErrorCode::validation,
+                    "material export requires positive scale and mesh stride");
+        return result;
+    }
+
+    const std::uint32_t width = options.width ? options.width : g->graph.defaultWidth();
+    const std::uint32_t height = options.height ? options.height : g->graph.defaultHeight();
+    if (width < 2 || height < 2) {
+        g->setError(GraphErrorCode::validation,
+                    "material export resolution must be at least 2x2");
+        return result;
+    }
+    const std::size_t texelCount = std::size_t(width) * height;
+    std::vector<float> terrain(texelCount);
+    std::vector<float> weights(texelCount * 4);
+    result = graph_evaluate_material_stack(g, width, height,
+                                           terrain.data(), terrain.size(),
+                                           weights.data(), weights.size());
+    if (!result.ok) return result;
+
+    std::vector<std::uint8_t> weightBytes;
+    if (!quantizeMaterialWeightsRGBA8(weights.data(), texelCount,
+                                      weightBytes, g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::exportError;
+        result.ok = false;
+        return result;
+    }
+    const MaterialStack* stack = g->graph.materialStack();
+    if (!stack) {
+        g->setError(GraphErrorCode::validation, "graph has no materialStack");
+        result.ok = false;
+        return result;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(options.outDir, ec);
+    if (ec) {
+        g->setError(GraphErrorCode::exportError,
+                    std::string("cannot create ") + options.outDir + ": " + ec.message());
+        result.ok = false;
+        return result;
+    }
+
+    const std::filesystem::path directory(options.outDir);
+    const std::string base(options.basename);
+    std::filesystem::path heightFinal;
+    std::string heightEncoding;
+    if (options.heightmapFormat == HeightmapFormat::png16) {
+        heightFinal = directory / (base + "_height.png");
+        heightEncoding = "png16";
+    } else if (options.heightmapFormat == HeightmapFormat::r16) {
+        heightFinal = directory / (base + "_height.r16");
+        heightEncoding = "r16-le";
+    } else if (options.heightmapFormat == HeightmapFormat::pfm32) {
+        heightFinal = directory / (base + "_height.pfm");
+        heightEncoding = "pfm32";
+    }
+    const std::filesystem::path meshFinal =
+        options.meshFormat == MeshFormat::obj
+            ? directory / (base + ".obj") : std::filesystem::path{};
+    const std::filesystem::path weightsFinal = directory / (base + "_weights.png");
+    const std::filesystem::path manifestFinal = directory / (base + "_material.json");
+
+    const auto nonce = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    struct Artifact {
+        std::filesystem::path finalPath;
+        std::filesystem::path tempPath;
+        std::filesystem::path backupPath;
+        bool backedUp = false;
+        bool published = false;
+    };
+    std::vector<Artifact> artifacts;
+    auto addArtifact = [&](const std::filesystem::path& finalPath) {
+        if (finalPath.empty()) return;
+        artifacts.push_back({finalPath,
+                             finalPath.string() + ".theia-tmp-" + nonce,
+                             finalPath.string() + ".theia-backup-" + nonce});
+    };
+    addArtifact(heightFinal);
+    addArtifact(meshFinal);
+    addArtifact(weightsFinal);
+    addArtifact(manifestFinal);
+    auto tempFor = [&](const std::filesystem::path& finalPath) {
+        auto it = std::find_if(artifacts.begin(), artifacts.end(),
+            [&](const Artifact& artifact) { return artifact.finalPath == finalPath; });
+        return it == artifacts.end() ? std::filesystem::path{} : it->tempPath;
+    };
+    auto cleanupTemps = [&] {
+        for (const Artifact& artifact : artifacts) {
+            std::error_code ignored;
+            std::filesystem::remove(artifact.tempPath, ignored);
+        }
+    };
+
+    bool writesOK = true;
+    if (!heightFinal.empty()) {
+        const std::string temp = tempFor(heightFinal).string();
+        switch (options.heightmapFormat) {
+        case HeightmapFormat::png16:
+            writesOK = writePNG16(temp.c_str(), terrain.data(), width, height,
+                                  result.minHeight, result.maxHeight, g->lastError);
+            break;
+        case HeightmapFormat::r16:
+            writesOK = writeR16(temp.c_str(), terrain.data(), width, height,
+                                result.minHeight, result.maxHeight, g->lastError);
+            break;
+        case HeightmapFormat::pfm32:
+            writesOK = writePFM(temp.c_str(), terrain.data(), width, height,
+                                g->lastError);
+            break;
+        case HeightmapFormat::none:
+            break;
+        }
+    }
+    if (writesOK && !meshFinal.empty()) {
+        const std::string temp = tempFor(meshFinal).string();
+        writesOK = writeOBJ(temp.c_str(), terrain.data(), width, height,
+                            options.verticalScale, options.meshStride, g->lastError);
+    }
+    if (writesOK) {
+        const std::string temp = tempFor(weightsFinal).string();
+        writesOK = writePNG8RGBA(temp.c_str(), weightBytes.data(), width, height,
+                                 g->lastError);
+    }
+
+    json manifest;
+    manifest["formatVersion"] = 1;
+    manifest["resolution"] = {{"width", width}, {"height", height}};
+    manifest["terrain"] = {
+        {"node", stack->terrain.node}, {"output", stack->terrain.output},
+        {"minHeight", result.minHeight}, {"maxHeight", result.maxHeight}
+    };
+    manifest["artifacts"] = {
+        {"heightmap", heightFinal.empty() ? json(nullptr)
+                                          : json(heightFinal.filename().string())},
+        {"heightmapEncoding", heightFinal.empty() ? json(nullptr)
+                                                   : json(heightEncoding)},
+        {"mesh", meshFinal.empty() ? json(nullptr)
+                                    : json(meshFinal.filename().string())},
+        {"weights", weightsFinal.filename().string()}
+    };
+    manifest["weightMap"] = {
+        {"encoding", "rgba8-unorm-linear"},
+        {"origin", "top-left"},
+        {"channelOrder", {"R", "G", "B", "A"}},
+        {"byteSum", 255}
+    };
+    manifest["channels"] = json::array();
+    for (std::size_t channel = 0; channel < 4; ++channel) {
+        if (channel < stack->layers.size()) {
+            manifest["channels"].push_back(stack->layers[channel].id);
+        } else {
+            manifest["channels"].push_back(nullptr);
+        }
+    }
+    manifest["layers"] = json::array();
+    static const char* channelNames[] = {"R", "G", "B", "A"};
+    for (std::size_t index = 0; index < stack->layers.size(); ++index) {
+        const MaterialLayer& layer = stack->layers[index];
+        json encoded = {
+            {"id", layer.id}, {"name", layer.name},
+            {"channel", channelNames[index]},
+            {"previewColorSRGB", layer.previewColorSRGB}
+        };
+        if (layer.source) {
+            encoded["source"] = {{"node", layer.source->node},
+                                 {"output", layer.source->output}};
+        }
+        manifest["layers"].push_back(std::move(encoded));
+    }
+    if (writesOK) {
+        std::ofstream stream(tempFor(manifestFinal));
+        if (!stream) {
+            g->lastError = "cannot write " + tempFor(manifestFinal).string();
+            writesOK = false;
+        } else {
+            stream << manifest.dump(2) << '\n';
+            if (!stream) {
+                g->lastError = "cannot write " + tempFor(manifestFinal).string();
+                writesOK = false;
+            }
+        }
+    }
+    if (!writesOK) {
+        cleanupTemps();
+        g->lastErrorCode = GraphErrorCode::exportError;
+        result.ok = false;
+        return result;
+    }
+
+    auto restoreBackups = [&] {
+        for (Artifact& artifact : artifacts) {
+            std::error_code ignored;
+            if (artifact.published) std::filesystem::remove(artifact.finalPath, ignored);
+        }
+        for (Artifact& artifact : artifacts) {
+            if (!artifact.backedUp) continue;
+            std::error_code ignored;
+            std::filesystem::rename(artifact.backupPath, artifact.finalPath, ignored);
+        }
+        cleanupTemps();
+    };
+
+    for (Artifact& artifact : artifacts) {
+        if (!std::filesystem::exists(artifact.finalPath)) continue;
+        std::filesystem::rename(artifact.finalPath, artifact.backupPath, ec);
+        if (ec) {
+            g->lastError = "cannot stage existing artifact '" +
+                           artifact.finalPath.string() + "': " + ec.message();
+            restoreBackups();
+            g->lastErrorCode = GraphErrorCode::exportError;
+            result.ok = false;
+            return result;
+        }
+        artifact.backedUp = true;
+    }
+    for (Artifact& artifact : artifacts) {
+        std::filesystem::rename(artifact.tempPath, artifact.finalPath, ec);
+        if (ec) {
+            g->lastError = "cannot publish material artifact '" +
+                           artifact.finalPath.string() + "': " + ec.message();
+            restoreBackups();
+            g->lastErrorCode = GraphErrorCode::exportError;
+            result.ok = false;
+            return result;
+        }
+        artifact.published = true;
+    }
+    for (const Artifact& artifact : artifacts) {
+        if (!artifact.backedUp) continue;
+        std::error_code ignored;
+        std::filesystem::remove(artifact.backupPath, ignored);
+    }
+    result.ok = true;
+    return result;
 }
 
 std::uint32_t graph_node_count(GraphHandle* g) {

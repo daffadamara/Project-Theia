@@ -779,6 +779,12 @@ struct InspectorPanel: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
+                    MaterialLayersPanel(model: model, viewport: viewport)
+                        .padding(.horizontal, 14)
+
+                    Divider()
+                        .padding(.horizontal, 14)
+
                     if selectedNodeType == "export" {
                         ExportControls(model: model)
                             .padding(.horizontal, 14)

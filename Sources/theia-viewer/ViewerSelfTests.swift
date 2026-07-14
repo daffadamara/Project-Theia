@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import simd
 
 @MainActor
@@ -78,8 +79,8 @@ func runViewerSelfTests() -> Int32 {
         var decoded = try JSONDecoder().decode(GraphDocument.self,
                                                from: Data(encoded.utf8))
         decoded.ensureLayout()
-        expect(decoded.formatVersion == 2 && decoded.sinkOutput == "ridge",
-               "v2 round-trip should preserve selected output")
+        expect(decoded.formatVersion == 3 && decoded.sinkOutput == "ridge",
+               "v3 round-trip should preserve selected output")
         expect(decoded.connections.first?.output == "height",
                "v2 round-trip should preserve edge source port")
     } catch {
@@ -103,7 +104,7 @@ func runViewerSelfTests() -> Int32 {
         }
         """.utf8))
         migrated.ensureLayout()
-        expect(migrated.formatVersion == 2 && migrated.sinkOutput == "mask",
+        expect(migrated.formatVersion == 3 && migrated.sinkOutput == "mask",
                "v1 sink should migrate to its default named output")
         expect(migrated.connections.first?.output == "height",
                "v1 edge should migrate to source default output")
@@ -112,7 +113,62 @@ func runViewerSelfTests() -> Int32 {
     } catch {
         expect(false, "v1 multi-output migration failed: \(error)")
     }
-    print("✓ graph v1 to v2 named-output migration")
+    print("✓ graph v1 to v3 named-output migration")
+
+    do {
+        var material = try GraphDocument.load(path: "examples/material-stack.json")
+        expect(material.formatVersion == 3, "material example should load as graph v3")
+        expect(material.materialStack?.layers.map(\.id) ==
+               ["ground", "rock", "water", "ridge"],
+               "material channel order should survive load")
+        expect(material.materialStackValidationMessage() == nil,
+               "material example should be semantically valid")
+        expect(material.materialSourceCandidates().contains(
+            GraphOutputReference(node: "gullies", output: "ridge")),
+            "data outputs should appear in material source candidates")
+        expect(material.materialSourceCandidates().contains(
+            GraphOutputReference(node: "river", output: "mask")),
+            "mask outputs should appear in material source candidates")
+        expect(!material.materialSourceCandidates().contains(
+            GraphOutputReference(node: "gullies", output: "height")),
+            "terrain outputs must be filtered from material sources")
+
+        var materialHistory = GraphDocumentHistory(limit: 4)
+        materialHistory.record(material)
+        material.setMaterialLayerColor(index: 0, color: [0.1, 0.2, 0.3])
+        material.moveMaterialLayer(from: 3, offset: -1)
+        expect(material.materialStack?.layers.map(\.id) ==
+               ["ground", "rock", "ridge", "water"],
+               "overlay reorder should change RGBA channel order")
+        if let restored = materialHistory.undo(current: material) {
+            expect(restored.materialStack?.layers.first?.previewColorSRGB ==
+                   [0.22, 0.39, 0.18],
+                   "material color change should participate in undo")
+            expect(restored.materialStack?.layers.map(\.id) ==
+                   ["ground", "rock", "water", "ridge"],
+                   "material reorder should participate in undo")
+        } else {
+            expect(false, "material history snapshot missing")
+        }
+
+        let encoded = try material.encodedString()
+        let decoded = try JSONDecoder().decode(GraphDocument.self,
+                                                from: Data(encoded.utf8))
+        expect(decoded.materialStack == material.materialStack,
+               "material stack should round-trip colors, sources and order")
+
+        material.deleteNode(id: "river")
+        expect(material.materialStack?.layers.contains(where: {
+            $0.source?.node == "river"
+        }) == false, "deleting a source node should clear its material overlay")
+        material.deleteNode(id: "gullies")
+        expect(material.materialStack?.terrain.node == "gullies" &&
+               material.materialStackValidationMessage() != nil,
+               "deleted terrain reference should remain visible as invalid")
+        print("✓ material stack persistence, filtering, history and deletion semantics")
+    } catch {
+        expect(false, "material stack viewer semantics failed: \(error)")
+    }
 
     var history = GraphDocumentHistory(limit: 4)
     history.record(document)
@@ -223,6 +279,68 @@ func runViewerSelfTests() -> Int32 {
            "brush sampler should discard redundant high-frequency events")
     print("✓ realtime bounded mask brush rasterization")
 
+    expect(abs(MaterialPreviewMath.srgbToLinear(0.04045) -
+               (0.04045 / 12.92)) < 1e-12,
+           "sRGB decode breakpoint should use the linear branch")
+    expect(abs(MaterialPreviewMath.linearToSRGB(0.0031308) -
+               (0.0031308 * 12.92)) < 1e-12,
+           "sRGB encode breakpoint should use the linear branch")
+    let midpoint = MaterialPreviewMath.blend(
+        colorsSRGB: [[0, 0, 0], [1, 1, 1]], weights: [0.5, 0.5])
+    expect(midpoint.allSatisfy { abs($0 - 0.735356983) < 1e-6 },
+           "material colors must blend in linear light, not sRGB space")
+    print("✓ audited sRGB transfer and linear-light material blend")
+
+    if let device = MTLCreateSystemDefaultDevice(),
+       let renderer = Renderer(device: device, colorFormat: .bgra8Unorm),
+       let engine = TerrainEngine(graphPath: "examples/erosion-filter.json") {
+        let model = TerrainModel(engine: engine, renderer: renderer, size: 32)
+        let originalSink = GraphOutputReference(node: model.document.sink,
+                                                output: model.document.sinkOutput)
+        expect(!model.isDirty, "loading a graph should begin clean")
+        model.selectOutput(nodeId: "gullies", output: "ridge")
+        expect(model.previewReference == GraphOutputReference(node: "gullies",
+                                                              output: "ridge"),
+               "port selection should change only previewReference")
+        expect(GraphOutputReference(node: model.document.sink,
+                                    output: model.document.sinkOutput) == originalSink,
+               "preview selection must not mutate graph output")
+        expect(!model.isDirty, "preview selection must not dirty the document")
+        model.setPreviewAsGraphOutput()
+        expect(model.document.sink == "gullies" && model.document.sinkOutput == "ridge",
+               "explicit Set as Graph Output should persist the preview port")
+        expect(model.isDirty, "explicit graph output change should dirty the document")
+        print("✓ ephemeral preview and explicit graph-output authoring")
+    } else {
+        expect(false, "Metal renderer unavailable for preview/output separation test")
+    }
+
+    if let device = MTLCreateSystemDefaultDevice(),
+       let renderer = Renderer(device: device, colorFormat: .bgra8Unorm),
+       let engine = TerrainEngine(graphPath: "examples/material-stack.json") {
+        let model = TerrainModel(engine: engine, renderer: renderer, size: 32)
+        let deadline = Date().addingTimeInterval(15)
+        while model.lastStats.hasPrefix("evaluating") && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        expect(model.lastStats.hasPrefix("nodes "),
+               "material model preview should finish in background")
+        let evaluationStatus = model.lastStats
+        model.setMaterialLayerColor(index: 0, color: [0.2, 0.3, 0.4])
+        expect(model.lastStats == evaluationStatus,
+               "color-only material edits must not evaluate the graph again")
+        model.inspectMaterialLayerSource(index: 2)
+        expect(model.displayMode == .auto &&
+               model.previewReference == GraphOutputReference(node: "river",
+                                                               output: "mask"),
+               "inspect-source should leave composite mode and preview the scalar mask")
+        expect(model.canEditActiveMask,
+               "inspected material mask source should expose the mask eraser")
+        print("✓ material color uniforms update without graph evaluation")
+    } else {
+        expect(false, "Metal renderer unavailable for material color test")
+    }
+
     let previewWorker = TerrainPreviewWorker()
     let previewJSON: (Int) -> String = { seed in
         """
@@ -265,6 +383,48 @@ func runViewerSelfTests() -> Int32 {
     expect(previewFinished, "preview worker timed out")
     expect(previewCompletions == 1, "stale preview result should be discarded")
     print("✓ asynchronous latest-snapshot preview worker")
+
+    do {
+        let materialText = try String(contentsOfFile: "examples/material-stack.json",
+                                      encoding: .utf8)
+        let materialWorker = TerrainPreviewWorker()
+        var materialFinished = false
+        var materialCompletions = 0
+        materialWorker.submitMaterial(jsonText: materialText, size: 32) { _ in
+            materialCompletions += 1
+        }
+        materialWorker.submitMaterial(jsonText: materialText, size: 32) { outcome in
+            materialCompletions += 1
+            if case .success(let preview) = outcome {
+                expect(preview.geometry.count == 32 * 32,
+                       "material worker terrain geometry count")
+                expect(preview.weightsRGBA?.count == 32 * 32 * 4,
+                       "material worker packed weight count")
+                if let weights = preview.weightsRGBA {
+                    var normalized = true
+                    for texel in stride(from: 0, to: 32 * 32, by: 17) {
+                        let start = texel * 4
+                        let sum = weights[start..<(start + 4)].reduce(0, +)
+                        normalized = normalized && abs(sum - 1) < 2e-6
+                    }
+                    expect(normalized, "material preview weights must sum to one")
+                }
+            } else {
+                expect(false, "latest material preview snapshot failed")
+            }
+            materialFinished = true
+        }
+        let materialDeadline = Date().addingTimeInterval(15)
+        while !materialFinished && Date() < materialDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        expect(materialFinished, "material preview worker timed out")
+        expect(materialCompletions == 1,
+               "stale material preview result should be discarded")
+        print("✓ asynchronous material preview and stale-result dropping")
+    } catch {
+        expect(false, "material worker fixture failed: \(error)")
+    }
 
     print("\n\(checks) viewer checks, \(failures) failure(s)")
     return failures == 0 ? 0 : 1

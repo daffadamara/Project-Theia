@@ -74,6 +74,10 @@ let package = Package(
             path: "Tests/theia-tests",
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
+            ],
+            linkerSettings: [
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("ImageIO"),
             ]
         ),
     ],

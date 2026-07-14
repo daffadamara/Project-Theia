@@ -93,6 +93,32 @@ struct NodeParameterInspector: View {
                         }
                     }
 
+                    Button {
+                        model.setPreviewAsGraphOutput()
+                    } label: {
+                        HStack {
+                            Image(systemName: "target")
+                            Text(model.document.sink == model.previewReference.node &&
+                                 model.document.sinkOutput == model.previewReference.output
+                                 ? "Graph Output" : "Set as Graph Output")
+                            Spacer()
+                            Text("\(model.previewReference.node).\(model.previewReference.output)")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .frame(height: 32)
+                    }
+                    .buttonStyle(.plain)
+                    .background(inspectorControlFill,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(inspectorControlStroke())
+                    .disabled(model.previewReference.node != node.id ||
+                              (model.document.sink == model.previewReference.node &&
+                               model.document.sinkOutput == model.previewReference.output))
+                    .help("Persist the previewed port as the CLI and export graph output")
+
                     if node.params.isEmpty {
                         NoNodeParametersCard()
                     } else {

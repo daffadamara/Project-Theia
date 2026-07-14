@@ -4,6 +4,7 @@ import TheiaCore
 struct TerrainPreviewEvaluation: Sendable {
     let geometry: [Float]
     let data: [Float]
+    let weightsRGBA: [Float]?
     let width: Int
     let height: Int
     let evaluated: UInt32
@@ -81,12 +82,66 @@ final class TerrainPreviewWorker: @unchecked Sendable {
             let result = TerrainPreviewEvaluation(
                 geometry: geometryResult.values,
                 data: dataResult.values,
+                weightsRGBA: nil,
                 width: Int(geometryResult.result.width),
                 height: Int(geometryResult.result.height),
                 evaluated: geometryResult.result.evaluated +
                     (geometry == data ? 0 : dataResult.result.evaluated),
                 reused: geometryResult.result.reused +
                     (geometry == data ? 0 : dataResult.result.reused))
+            self.finish(.success(result), revision: revision, completion: completion)
+        }
+    }
+
+    func submitMaterial(jsonText: String,
+                        size: UInt32,
+                        completion: @escaping @MainActor @Sendable (TerrainPreviewOutcome) -> Void) {
+        revisionLock.lock()
+        latestRevision &+= 1
+        let revision = latestRevision
+        revisionLock.unlock()
+
+        queue.async { [weak self] in
+            guard let self, self.isLatest(revision) else { return }
+            guard let graph = self.graphHandle() else {
+                self.finish(.failure("preview graph creation failed"),
+                            revision: revision, completion: completion)
+                return
+            }
+            guard theia.graph_load_json_text(graph, jsonText) else {
+                let message = readCxxString { theia.graph_last_error(graph, $0, $1) }
+                self.finish(.failure(message), revision: revision, completion: completion)
+                return
+            }
+            let count = Int(size) * Int(size)
+            guard size > 1, count > 0 else {
+                self.finish(.failure("material preview size must be at least 2"),
+                            revision: revision, completion: completion)
+                return
+            }
+            var terrain = [Float](repeating: 0, count: count)
+            var weights = [Float](repeating: 0, count: count * 4)
+            let evaluation = terrain.withUnsafeMutableBufferPointer { terrainBuffer in
+                weights.withUnsafeMutableBufferPointer { weightBuffer in
+                    theia.graph_evaluate_material_stack(
+                        graph, size, size,
+                        terrainBuffer.baseAddress, terrainBuffer.count,
+                        weightBuffer.baseAddress, weightBuffer.count)
+                }
+            }
+            guard evaluation.ok else {
+                let message = readCxxString { theia.graph_last_error(graph, $0, $1) }
+                self.finish(.failure(message), revision: revision, completion: completion)
+                return
+            }
+            let result = TerrainPreviewEvaluation(
+                geometry: terrain,
+                data: terrain,
+                weightsRGBA: weights,
+                width: Int(evaluation.width),
+                height: Int(evaluation.height),
+                evaluated: evaluation.evaluated,
+                reused: evaluation.reused)
             self.finish(.success(result), revision: revision, completion: completion)
         }
     }

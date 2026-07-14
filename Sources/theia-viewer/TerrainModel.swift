@@ -54,6 +54,7 @@ final class TerrainModel: ObservableObject {
     @Published private(set) var isExporting = false
     @Published private(set) var diagnostics = GraphDiagnostics.empty
     @Published private(set) var recentNodeTypes: [String] = []
+    @Published private(set) var previewReference = GraphOutputReference(node: "", output: "")
 
     let engine: TerrainEngine
     let renderer: Renderer
@@ -71,12 +72,13 @@ final class TerrainModel: ObservableObject {
     private var pendingMaskEraseStrokes: [GraphMaskEraseStroke] = []
     private var currentPreviewGeometry: [Float] = []
     private var currentPreviewData: [Float] = []
+    private var currentPreviewWeights: [Float]?
     private var currentPreviewWidth = 0
     private var currentPreviewHeight = 0
     private let previewWorker = TerrainPreviewWorker()
 
     private var activeOutputReference: GraphOutputReference {
-        GraphOutputReference(node: document.sink, output: document.sinkOutput)
+        previewReference
     }
 
     var activeOutputSupportsMesh: Bool {
@@ -100,6 +102,8 @@ final class TerrainModel: ObservableObject {
             document = GraphDocument.defaultDocument()
         }
         exportSettings.size = size == 0 ? document.resolution.width : size
+        previewReference = GraphOutputReference(node: document.sink,
+                                                output: document.sinkOutput)
         loadPreviewSettingsFromDocument()
         reloadInspector()
         syncPreviewWithDocument(markDirty: false)
@@ -313,6 +317,125 @@ final class TerrainModel: ObservableObject {
         }
     }
 
+    func runMaterialExport() {
+        guard !isExporting else { return }
+        guard document.materialStack != nil else {
+            exportStatus = "create a material stack first"
+            return
+        }
+        if let issue = document.materialStackValidationMessage() {
+            exportStatus = "export failed: \(issue)"
+            return
+        }
+        guard exportSettings.size >= 2, exportSettings.meshStride > 0,
+              exportSettings.verticalScale > 0 else {
+            exportStatus = "export failed: invalid size or scale"
+            return
+        }
+        guard !exportSettings.exportMesh || exportSettings.meshFormat.isSupported else {
+            exportStatus = "export failed: FBX is not available yet"
+            return
+        }
+        let text: String
+        do { text = try document.encodedString() } catch {
+            exportStatus = "export failed: \(error.localizedDescription)"
+            return
+        }
+        let settings = exportSettings
+        isExporting = true
+        exportStatus = "exporting material bundle..."
+        DispatchQueue.global(qos: .userInitiated).async { [text, settings] in
+            let result = TerrainExporter.performMaterial(text: text, settings: settings)
+            Task { @MainActor [weak self] in
+                self?.isExporting = false
+                self?.exportStatus = result
+            }
+        }
+    }
+
+    func createMaterialStack() {
+        let selected = document.resolvedOutputKind(
+            nodeId: previewReference.node, output: previewReference.output) == .terrain
+            ? previewReference : document.materialTerrainCandidates().first
+        guard let terrain = selected else {
+            exportStatus = "material stack needs a terrain output"
+            return
+        }
+        pushUndo()
+        document.createMaterialStack(terrain: terrain)
+        displayMode = .material
+        document.setPreviewSettings(GraphPreviewSettings(
+            displayMode: displayMode, materialPreset: materialPreset,
+            maskOpacity: maskOpacity))
+        syncPreviewWithDocument(markDirty: true)
+    }
+
+    func setMaterialTerrain(_ reference: GraphOutputReference) {
+        guard document.resolvedOutputKind(nodeId: reference.node,
+                                          output: reference.output) == .terrain else { return }
+        pushUndo()
+        document.setMaterialTerrain(reference)
+        syncPreviewWithDocument(markDirty: true)
+    }
+
+    func setMaterialLayerName(index: Int, name: String) {
+        pushUndo()
+        document.setMaterialLayerName(index: index, name: name)
+        documentCanSave = true
+        markDirty()
+        refreshDiagnostics()
+    }
+
+    func setMaterialLayerColor(index: Int, color: [Double]) {
+        pushUndo()
+        document.setMaterialLayerColor(index: index, color: color)
+        documentCanSave = true
+        markDirty()
+        if let layers = document.materialStack?.layers {
+            renderer.setMaterialColors(layers.map(\.previewColorSRGB))
+        }
+        refreshDiagnostics()
+    }
+
+    func setMaterialLayerSource(index: Int, source: GraphOutputReference) {
+        guard let kind = document.resolvedOutputKind(nodeId: source.node,
+                                                     output: source.output),
+              kind == .mask || kind == .data else { return }
+        pushUndo()
+        document.setMaterialLayerSource(index: index, source: source)
+        syncPreviewWithDocument(markDirty: true)
+    }
+
+    func addMaterialLayer() {
+        guard let source = document.materialSourceCandidates().first else {
+            exportStatus = "add a mask or data output first"
+            return
+        }
+        pushUndo()
+        guard document.addMaterialLayer(source: source) else { return }
+        syncPreviewWithDocument(markDirty: true)
+    }
+
+    func removeMaterialLayer(index: Int) {
+        pushUndo()
+        document.removeMaterialLayer(index: index)
+        syncPreviewWithDocument(markDirty: true)
+    }
+
+    func moveMaterialLayer(index: Int, offset: Int) {
+        pushUndo()
+        document.moveMaterialLayer(from: index, offset: offset)
+        syncPreviewWithDocument(markDirty: true)
+    }
+
+    func inspectMaterialLayerSource(index: Int) {
+        guard let layers = document.materialStack?.layers,
+              layers.indices.contains(index),
+              let source = layers[index].source else { return }
+        if displayMode == .material { setDisplayMode(.auto) }
+        selectOutput(nodeId: source.node, output: source.output)
+    }
+
     func reloadInspector() {
         nodes = document.nodes.map { node in
             let params = node.params.keys.sorted().map {
@@ -360,12 +483,41 @@ final class TerrainModel: ObservableObject {
     @discardableResult
     func refreshTerrain() -> Bool {
         let dataReference = activeOutputReference
+        let mode = effectiveDisplayMode(for: dataReference)
+        if mode == .material,
+           let stack = document.materialStack,
+           document.materialStackValidationMessage() == nil {
+            let text: String
+            do { text = try document.encodedString() } catch {
+                lastStats = error.localizedDescription
+                return false
+            }
+            renderer.setMaterialColors(stack.layers.map(\.previewColorSRGB))
+            lastStats = "evaluating material layers..."
+            previewWorker.submitMaterial(jsonText: text, size: size) { [weak self] outcome in
+                guard let self else { return }
+                switch outcome {
+                case .success(let preview):
+                    self.currentPreviewGeometry = preview.geometry
+                    self.currentPreviewData = preview.data
+                    self.currentPreviewWeights = preview.weightsRGBA
+                    self.currentPreviewWidth = preview.width
+                    self.currentPreviewHeight = preview.height
+                    self.renderCachedPreview()
+                    self.applyViewportSettings(displayMode: .material)
+                    self.lastStats = "nodes \(preview.evaluated), reused \(preview.reused)"
+                case .failure(let message):
+                    self.lastStats = message
+                    self.setFlatPreview(status: "invalid material stack")
+                }
+            }
+            return true
+        }
         guard !dataReference.node.isEmpty else {
             setFlatPreview(status: document.nodes.isEmpty ? "empty graph" : "no output")
             return true
         }
 
-        let mode = effectiveDisplayMode(for: dataReference)
         let geometryReference = document.terrainReference(for: dataReference) ?? dataReference
         let text: String
         do {
@@ -384,6 +536,7 @@ final class TerrainModel: ObservableObject {
             case .success(let preview):
                 self.currentPreviewGeometry = preview.geometry
                 self.currentPreviewData = preview.data
+                self.currentPreviewWeights = nil
                 self.currentPreviewWidth = preview.width
                 self.currentPreviewHeight = preview.height
                 self.renderCachedPreview()
@@ -400,11 +553,50 @@ final class TerrainModel: ObservableObject {
     func refreshTerrainSynchronously() -> Bool {
         previewWorker.cancelPending()
         let dataReference = activeOutputReference
+        let mode = effectiveDisplayMode(for: dataReference)
+        if mode == .material,
+           let stack = document.materialStack,
+           document.materialStackValidationMessage() == nil {
+            guard let graph = theia.graph_create() else {
+                lastStats = "material preview graph creation failed"
+                return false
+            }
+            defer { theia.graph_destroy(graph) }
+            guard let text = try? document.encodedString(),
+                  theia.graph_load_json_text(graph, text) else {
+                lastStats = readCxxString { theia.graph_last_error(graph, $0, $1) }
+                return false
+            }
+            let dimension = Int(size)
+            var terrain = [Float](repeating: 0, count: dimension * dimension)
+            var weights = [Float](repeating: 0, count: dimension * dimension * 4)
+            let result = terrain.withUnsafeMutableBufferPointer { terrainBuffer in
+                weights.withUnsafeMutableBufferPointer { weightBuffer in
+                    theia.graph_evaluate_material_stack(
+                        graph, size, size,
+                        terrainBuffer.baseAddress, terrainBuffer.count,
+                        weightBuffer.baseAddress, weightBuffer.count)
+                }
+            }
+            guard result.ok else {
+                lastStats = readCxxString { theia.graph_last_error(graph, $0, $1) }
+                return false
+            }
+            currentPreviewGeometry = terrain
+            currentPreviewData = terrain
+            currentPreviewWeights = weights
+            currentPreviewWidth = Int(result.width)
+            currentPreviewHeight = Int(result.height)
+            renderer.setMaterialColors(stack.layers.map(\.previewColorSRGB))
+            renderCachedPreview()
+            applyViewportSettings(displayMode: .material)
+            lastStats = "nodes \(result.evaluated), reused \(result.reused)"
+            return true
+        }
         guard !dataReference.node.isEmpty else {
             setFlatPreview(status: document.nodes.isEmpty ? "empty graph" : "no output")
             return true
         }
-        let mode = effectiveDisplayMode(for: dataReference)
         let geometryReference = document.terrainReference(for: dataReference) ?? dataReference
         guard let geometry = engine.evaluate(size: size,
                                              sink: geometryReference.node,
@@ -429,6 +621,7 @@ final class TerrainModel: ObservableObject {
         let h = Int(geometry.result.height)
         currentPreviewGeometry = geometry.heights
         currentPreviewData = data.heights
+        currentPreviewWeights = nil
         currentPreviewWidth = w
         currentPreviewHeight = h
         renderCachedPreview()
@@ -448,9 +641,11 @@ final class TerrainModel: ObservableObject {
         let flat = [Float](repeating: 0, count: dim * dim)
         currentPreviewGeometry = flat
         currentPreviewData = flat
+        currentPreviewWeights = nil
         currentPreviewWidth = dim
         currentPreviewHeight = dim
-        renderer.setPreview(heights: flat, data: flat, width: dim, height: dim)
+        renderer.setPreview(heights: flat, data: flat, weightsRGBA: nil,
+                            width: dim, height: dim)
         applyViewportSettings(displayMode: .terrain)
         lastStats = status
     }
@@ -460,6 +655,8 @@ final class TerrainModel: ObservableObject {
         guard engine.reloadIfChanged() else { return false }
         if let loaded = try? GraphDocument.load(path: path) {
             document = loaded
+            previewReference = GraphOutputReference(node: document.sink,
+                                                    output: document.sinkOutput)
             loadPreviewSettingsFromDocument()
             isDirty = false
             saveStatus = "reloaded"
@@ -488,23 +685,19 @@ final class TerrainModel: ObservableObject {
     }
 
     func isActiveOutput(nodeId: String, output: String) -> Bool {
-        document.sink == nodeId && document.sinkOutput == output
+        previewReference.node == nodeId && previewReference.output == output
     }
 
     func selectOutput(nodeId: String, output: String) {
         guard document.node(id: nodeId) != nil,
               outputPorts(for: nodeId).contains(where: { $0.name == output }),
               !isActiveOutput(nodeId: nodeId, output: output) else { return }
-        pushUndo()
-        document.setSink(nodeId: nodeId, output: output)
-        if !activeOutputSupportsMesh {
-            exportSettings.exportMesh = false
-        }
+        previewReference = GraphOutputReference(node: nodeId, output: output)
         selectedNodeId = nodeId
         selectedNodeIds = [nodeId]
         selectedConnectionId = nil
         setMaskBrushEnabled(false)
-        syncPreviewWithDocument(markDirty: true)
+        _ = refreshTerrain()
     }
 
     func selectNode(_ id: String?, extending: Bool = false) {
@@ -520,28 +713,31 @@ final class TerrainModel: ObservableObject {
         } else {
             selectedNodeIds = [id]
         }
-        guard document.sink != id else { return }
-        pushUndo()
-        document.setSink(nodeId: id)
-        syncPreviewWithDocument(markDirty: true)
+        guard let node = document.node(id: id) else { return }
+        previewReference = GraphOutputReference(
+            node: id, output: GraphDocument.defaultOutputName(for: node.type))
+        setMaskBrushEnabled(false)
+        _ = refreshTerrain()
     }
 
     func selectNodes(_ ids: Set<String>) {
         selectedConnectionId = nil
         selectedNodeIds = ids
         selectedNodeId = ids.sorted().last
-        if let selectedNodeId, document.sink != selectedNodeId {
-            pushUndo()
-            document.setSink(nodeId: selectedNodeId)
-            syncPreviewWithDocument(markDirty: true)
+        if let selectedNodeId, let node = document.node(id: selectedNodeId) {
+            previewReference = GraphOutputReference(
+                node: selectedNodeId,
+                output: GraphDocument.defaultOutputName(for: node.type))
+            _ = refreshTerrain()
         }
     }
 
     func previewSelectedNode() {
-        guard let selectedNodeId, document.sink != selectedNodeId else { return }
-        pushUndo()
-        document.setSink(nodeId: selectedNodeId)
-        syncPreviewWithDocument(markDirty: true)
+        guard let selectedNodeId, let node = document.node(id: selectedNodeId) else { return }
+        previewReference = GraphOutputReference(
+            node: selectedNodeId,
+            output: GraphDocument.defaultOutputName(for: node.type))
+        _ = refreshTerrain()
     }
 
     func selectNodesForMarquee(_ ids: Set<String>) {
@@ -559,16 +755,24 @@ final class TerrainModel: ObservableObject {
         selectedConnectionId = nil
         selectedNodeId = nil
         selectedNodeIds = []
-        guard !document.sink.isEmpty else {
-            setFlatPreview(status: document.nodes.isEmpty ? "empty graph" : "no selection")
-            return
-        }
-        if recordUndo { pushUndo() }
-        document.sink = ""
-        document.sinkOutput = ""
-        markDirty()
-        documentCanSave = true
+        _ = recordUndo
+        previewReference = GraphOutputReference(node: "", output: "")
+        setMaskBrushEnabled(false)
         setFlatPreview(status: document.nodes.isEmpty ? "empty graph" : "no selection")
+    }
+
+    func setPreviewAsGraphOutput() {
+        guard !previewReference.node.isEmpty,
+              document.node(id: previewReference.node) != nil else { return }
+        if document.sink == previewReference.node &&
+            document.sinkOutput == previewReference.output { return }
+        pushUndo()
+        document.setSink(nodeId: previewReference.node,
+                         output: previewReference.output)
+        if !activeOutputSupportsMesh { exportSettings.exportMesh = false }
+        documentCanSave = true
+        markDirty()
+        refreshDiagnostics()
     }
 
     func selectConnection(_ id: String?) {
@@ -632,7 +836,8 @@ final class TerrainModel: ObservableObject {
                   document.inputCount(for: type) > 0 {
             document.connect(from: previous, to: id, input: 0)
         }
-        document.setSink(nodeId: id)
+        previewReference = GraphOutputReference(
+            node: id, output: GraphDocument.defaultOutputName(for: type))
         selectedNodeId = id
         selectedNodeIds = [id]
         selectedConnectionId = nil
@@ -711,11 +916,13 @@ final class TerrainModel: ObservableObject {
         document.deleteNodes(ids: ids)
         selectedNodeId = fallback
         selectedNodeIds = selectedNodeId.map { Set([$0]) } ?? []
-        if let selectedNodeId {
-            document.setSink(nodeId: selectedNodeId)
+        if let selectedNodeId, let node = document.node(id: selectedNodeId) {
+            previewReference = GraphOutputReference(
+                node: selectedNodeId,
+                output: GraphDocument.defaultOutputName(for: node.type))
         } else {
-            document.sink = ""
-            document.sinkOutput = ""
+            previewReference = GraphOutputReference(node: document.sink,
+                                                    output: document.sinkOutput)
         }
         syncPreviewWithDocument(markDirty: true)
         reloadInspector()
@@ -732,7 +939,11 @@ final class TerrainModel: ObservableObject {
         selectedNodeId = duplicated.last
         selectedNodeIds = Set(duplicated)
         selectedConnectionId = nil
-        if let selectedNodeId { document.setSink(nodeId: selectedNodeId) }
+        if let selectedNodeId, let node = document.node(id: selectedNodeId) {
+            previewReference = GraphOutputReference(
+                node: selectedNodeId,
+                output: GraphDocument.defaultOutputName(for: node.type))
+        }
         syncPreviewWithDocument(markDirty: true)
         reloadInspector()
     }
@@ -813,7 +1024,8 @@ final class TerrainModel: ObservableObject {
             document.connect(from: from, output: output, to: to, input: input)
             document.repairRiverCarveConnections()
         }
-        document.setSink(nodeId: to)
+        previewReference = GraphOutputReference(
+            node: to, output: GraphDocument.defaultOutputName(for: target.type))
         selectedNodeId = to
         selectedNodeIds = [to]
         selectedConnectionId = nil
@@ -899,6 +1111,8 @@ final class TerrainModel: ObservableObject {
             loadPreviewSettingsFromDocument()
             selectedNodeId = document.sink.isEmpty ? document.nodes.last?.id : document.sink
             selectedNodeIds = selectedNodeId.map { Set([$0]) } ?? []
+            previewReference = GraphOutputReference(node: document.sink,
+                                                    output: document.sinkOutput)
             selectedConnectionId = nil
             graphPath = path
             engine.setGraphPath(path)
@@ -950,6 +1164,8 @@ final class TerrainModel: ObservableObject {
         loadPreviewSettingsFromDocument()
         selectedNodeId = document.sink.isEmpty ? document.nodes.last?.id : document.sink
         selectedNodeIds = selectedNodeId.map { Set([$0]) } ?? []
+        previewReference = GraphOutputReference(node: document.sink,
+                                                output: document.sinkOutput)
         selectedConnectionId = nil
         reloadInspector()
         syncPreviewWithDocument(markDirty: true)
@@ -1078,6 +1294,7 @@ final class TerrainModel: ObservableObject {
               !currentPreviewGeometry.isEmpty,
               !currentPreviewData.isEmpty else { return }
         renderer.setPreview(heights: currentPreviewGeometry, data: currentPreviewData,
+                            weightsRGBA: currentPreviewWeights,
                             width: currentPreviewWidth, height: currentPreviewHeight)
     }
 
