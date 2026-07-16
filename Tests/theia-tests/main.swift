@@ -60,7 +60,16 @@ let h = Harness()
 
 h.test("Version and capabilities API are parseable") {
     let version = readCxxString { theia.theia_version_string($0, $1) }
-    h.expect(version == "0.11.0-alpha.1", "unexpected version: \(version)")
+    let versionFile = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("VERSION")
+    let releaseVersion = (try? String(contentsOf: versionFile, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    h.expect(releaseVersion != nil, "could not read VERSION at \(versionFile.path)")
+    h.expect(version == releaseVersion,
+             "core version \(version) does not match VERSION \(releaseVersion ?? "<missing>")")
     h.expect(theia.theia_api_version() >= 4, "api version should be >= 4")
     let capsText = readCxxLongString { theia.theia_capabilities_json($0, $1) }
     guard let data = capsText.data(using: .utf8),
@@ -80,6 +89,8 @@ h.test("Version and capabilities API are parseable") {
              "material stack capability missing")
     h.expect(caps["materialWeightChannels"] as? Int == 4,
              "material weight channel capability should be four")
+    h.expect(caps["materialMaxDimension"] as? Int == 4096,
+             "material dimension capability should be 4096")
 }
 
 h.test("GPU fill produces a uniform buffer") {
@@ -920,6 +931,21 @@ h.test("Graph diagnostics JSON reports health and authoring issues") {
     h.expect(brokenCodes.contains("orphan_node"), "orphan node not reported")
     h.expect(brokenCodes.contains("heavy_simulation"), "heavy simulation not reported")
 
+    let riskyHydraulic = """
+    {
+      "sink": "h",
+      "nodes": [
+        { "id": "base", "type": "perlin", "params": {} },
+        { "id": "h", "type": "hydraulic", "params": {
+          "dt": 0.1, "minTilt": 1.0, "heightScale": 200.0
+        } }
+      ],
+      "connections": [ { "from": "base", "to": "h", "input": 0 } ]
+    }
+    """
+    h.expect(diagnosticCodes(riskyHydraulic).contains("hydraulic_authoring_envelope"),
+             "risky hydraulic authoring range should be diagnosed")
+
     let invalid = "{"
     let invalidObj = diagnosticsObject(invalid)
     h.expect(invalidObj["ok"] as? Bool == false, "invalid JSON should not be ok")
@@ -1173,6 +1199,14 @@ h.test("Default node parameter enumeration supports node creation") {
              "slopemask default low")
     h.expect(theia.graph_default_param_value("slopemask", "high", -1) == 50.0,
              "slopemask default high")
+    h.expect(theia.graph_default_param_value("hydraulic", "rain", -1) == 0.010,
+             "hydraulic default rain")
+    h.expect(theia.graph_default_param_value("hydraulic", "sedimentCapacity", -1) == 0.65,
+             "hydraulic default sediment capacity")
+    h.expect(theia.graph_default_param_value("hydraulic", "suspension", -1) == 0.60,
+             "hydraulic default erosion rate")
+    h.expect(theia.graph_default_param_value("hydraulic", "minTilt", -1) == 0.005,
+             "hydraulic default slope floor")
 }
 
 h.test("Export node is a valid passthrough graph terminal") {
@@ -1277,6 +1311,43 @@ func maxNeighborDelta(_ values: [Float], size: Int) -> Float {
     return maxDelta
 }
 
+func curvaturePercentile(_ values: [Float], size: Int,
+                         percentile: Double) -> Float {
+    guard values.count == size * size, size >= 3 else { return .infinity }
+    var samples: [Float] = []
+    samples.reserveCapacity((size - 2) * (size - 2))
+    for y in 1..<(size - 1) {
+        for x in 1..<(size - 1) {
+            let i = y * size + x
+            let mean = 0.25 * (values[i - 1] + values[i + 1] +
+                               values[i - size] + values[i + size])
+            samples.append(abs(values[i] - mean))
+        }
+    }
+    samples.sort()
+    let p = min(1.0, max(0.0, percentile))
+    return samples[min(samples.count - 1,
+                       Int(Double(samples.count - 1) * p))]
+}
+
+func isolatedExtremaCount(_ values: [Float], size: Int,
+                          threshold: Float) -> Int {
+    guard values.count == size * size, size >= 3 else { return .max }
+    var count = 0
+    for y in 1..<(size - 1) {
+        for x in 1..<(size - 1) {
+            let i = y * size + x
+            let neighbors = [values[i - 1], values[i + 1],
+                             values[i - size], values[i + size]]
+            let isExtremum = values[i] > (neighbors.max() ?? values[i]) ||
+                             values[i] < (neighbors.min() ?? values[i])
+            let separated = neighbors.allSatisfy { abs(values[i] - $0) > threshold }
+            if isExtremum && separated { count += 1 }
+        }
+    }
+    return count
+}
+
 func meanAbsoluteDifference(_ a: [Float], _ b: [Float]) -> Float {
     guard a.count == b.count, !a.isEmpty else { return 0 }
     var sum: Float = 0
@@ -1296,23 +1367,161 @@ h.test("Hydraulic erosion default profile avoids spike striping") {
           "seed": 1337, "frequency": 4.0, "octaves": 7,
           "lacunarity": 2.0, "gain": 0.45, "heightScale": 1.0
         } },
-        { "id": "h", "type": "hydraulic", "params": {
-          "iterations": 200, "rain": 0.012, "evaporation": 0.015,
-          "sedimentCapacity": 0.35, "suspension": 0.25,
-          "deposition": 0.30, "gravity": 9.81, "dt": 0.015,
-          "minTilt": 0.03, "heightScale": 80.0,
-          "pipeArea": 1.0, "pipeLength": 1.0, "cellSize": 1.0
-        } }
+        { "id": "h", "type": "hydraulic", "params": {} }
       ],
       "connections": [
         { "from": "p", "to": "h", "input": 0 }
       ]
     }
     """
-    let values = evalGraphHeightsJSON(json, size: 96)
+    let base = evalGraphHeightsJSON(json, sink: "p", size: 96)
+    let values = evalGraphHeightsJSON(json, sink: "h", size: 96)
+    let repeated = evalGraphHeightsJSON(json, sink: "h", size: 96)
+    h.expect(values == repeated, "default hydraulic profile must be deterministic")
+    h.expect(values.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 },
+             "default hydraulic profile contains invalid terrain")
+    h.expect(meanAbsoluteDifference(base, values) > 0.0005,
+             "default hydraulic profile should visibly alter terrain")
+
+    let baseDelta = maxNeighborDelta(base, size: 96)
     let maxDelta = maxNeighborDelta(values, size: 96)
-    h.expect(maxDelta < 0.20,
-             "hydraulic produced spike-like neighbor delta \(maxDelta)")
+    h.expect(maxDelta <= baseDelta * 1.15 + 0.002,
+             "default hydraulic profile amplified neighbor delta \(baseDelta) -> \(maxDelta)")
+    let baseCurvature = curvaturePercentile(base, size: 96, percentile: 0.999)
+    let curvature = curvaturePercentile(values, size: 96, percentile: 0.999)
+    h.expect(curvature <= baseCurvature * 1.35 + 0.001,
+             "default hydraulic profile amplified curvature \(baseCurvature) -> \(curvature)")
+    let baseExtrema = isolatedExtremaCount(base, size: 96, threshold: 0.003)
+    let extrema = isolatedExtremaCount(values, size: 96, threshold: 0.003)
+    h.expect(extrema <= baseExtrema + 8,
+             "default hydraulic profile created isolated extrema \(baseExtrema) -> \(extrema)")
+}
+
+h.test("Hydraulic screenshot-risk profile does not create one-cell artifacts") {
+    let json = """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "h",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 1337, "frequency": 4.0, "octaves": 7,
+          "lacunarity": 2.0, "gain": 0.45, "heightScale": 1.0
+        } },
+        { "id": "h", "type": "hydraulic", "params": {
+          "iterations": 200, "rain": 0.012, "evaporation": 0.265,
+          "sedimentCapacity": 0.35, "suspension": 0.25,
+          "deposition": 0.60, "gravity": 9.81, "dt": 0.10,
+          "minTilt": 1.0, "heightScale": 200.0,
+          "pipeArea": 1.0, "pipeLength": 1.0, "cellSize": 1.0
+        } }
+      ],
+      "connections": [ { "from": "p", "to": "h", "input": 0 } ]
+    }
+    """
+    let base = evalGraphHeightsJSON(json, sink: "p", size: 96)
+    let eroded = evalGraphHeightsJSON(json, sink: "h", size: 96)
+    let repeated = evalGraphHeightsJSON(json, sink: "h", size: 96)
+    h.expect(eroded == repeated, "risk profile must remain bitwise deterministic")
+    h.expect(eroded.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 },
+             "risk profile contains non-finite or out-of-range terrain")
+    h.expect(meanAbsoluteDifference(base, eroded) > 0.0001,
+             "stability guards must not turn hydraulic erosion into an identity")
+
+    let baseDelta = maxNeighborDelta(base, size: 96)
+    let erodedDelta = maxNeighborDelta(eroded, size: 96)
+    h.expect(erodedDelta <= baseDelta * 1.15 + 0.002,
+             "risk profile amplified neighbor delta \(baseDelta) -> \(erodedDelta)")
+
+    let baseCurvature = curvaturePercentile(base, size: 96, percentile: 0.999)
+    let erodedCurvature = curvaturePercentile(eroded, size: 96, percentile: 0.999)
+    h.expect(erodedCurvature <= baseCurvature * 1.30 + 0.001,
+             "risk profile amplified p99.9 curvature \(baseCurvature) -> \(erodedCurvature)")
+
+    let baseExtrema = isolatedExtremaCount(base, size: 96, threshold: 0.003)
+    let erodedExtrema = isolatedExtremaCount(eroded, size: 96, threshold: 0.003)
+    h.expect(erodedExtrema <= baseExtrema + 8,
+             "risk profile created isolated extrema \(baseExtrema) -> \(erodedExtrema)")
+}
+
+h.test("Hydraulic curvature limiter never reverses erosion exchange") {
+    let json = """
+    {
+      "resolution": { "width": 96, "height": 96 },
+      "sink": "h",
+      "nodes": [
+        { "id": "p", "type": "perlin", "params": {
+          "seed": 4049, "frequency": 5.0, "octaves": 7,
+          "lacunarity": 2.0, "gain": 0.48, "heightScale": 1.0
+        } },
+        { "id": "h", "type": "hydraulic", "params": {
+          "iterations": 240, "rain": 0.03, "evaporation": 0.02,
+          "sedimentCapacity": 2.0, "suspension": 2.0,
+          "deposition": 0.0, "gravity": 9.81, "dt": 0.025,
+          "minTilt": 0.005, "heightScale": 80.0,
+          "pipeArea": 1.0, "pipeLength": 1.0, "cellSize": 1.0
+        } }
+      ],
+      "connections": [ { "from": "p", "to": "h", "input": 0 } ]
+    }
+    """
+    let base = evalGraphHeightsJSON(json, sink: "p", size: 96)
+    let eroded = evalGraphHeightsJSON(json, sink: "h", size: 96)
+    let baseMass = base.reduce(0.0) { $0 + Double($1) }
+    let erodedMass = eroded.reduce(0.0) { $0 + Double($1) }
+    h.expect(meanAbsoluteDifference(base, eroded) > 0.0001,
+             "erosion-only profile should alter terrain")
+    h.expect(erodedMass <= baseMass + 1e-5,
+             "erosion-only profile created bed mass \(baseMass) -> \(erodedMass)")
+}
+
+h.test("Hydraulic flat closed basin remains an exact equilibrium") {
+    let json = """
+    {
+      "resolution": { "width": 48, "height": 48 },
+      "sink": "h",
+      "nodes": [
+        { "id": "flat", "type": "perlin", "params": {
+          "seed": 1, "heightScale": 0.0
+        } },
+        { "id": "h", "type": "hydraulic", "params": {
+          "iterations": 80, "rain": 0.5, "evaporation": 0.0,
+          "sedimentCapacity": 4.0, "suspension": 4.0,
+          "deposition": 4.0, "gravity": 20.0, "dt": 0.1,
+          "minTilt": 1.0, "heightScale": 300.0,
+          "pipeArea": 4.0, "pipeLength": 0.05, "cellSize": 0.05
+        } }
+      ],
+      "connections": [ { "from": "flat", "to": "h", "input": 0 } ]
+    }
+    """
+    let base = evalGraphHeightsJSON(json, sink: "flat", size: 48)
+    let eroded = evalGraphHeightsJSON(json, sink: "h", size: 48)
+    h.expect(base == eroded, "uniform closed basin should not erode or deposit")
+}
+
+h.test("Hydraulic rejects non-finite parameters and guards extreme API values") {
+    guard let g = theia.graph_create() else { h.expect(false, "create"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_add_node(g, "p", "perlin"), "add source")
+    h.expect(theia.graph_add_node(g, "h", "hydraulic"), "add hydraulic")
+    h.expect(theia.graph_connect(g, "p", "h", 0), "connect hydraulic")
+    h.expect(theia.graph_set_param(g, "h", "dt", Double.infinity),
+             "set non-finite timestep")
+    let rejected = theia.graph_evaluate(g, "h", 48, 48, nil, nil)
+    h.expect(!rejected.ok && graphError(g).contains("must be finite"),
+             "non-finite hydraulic parameter must fail cleanly: \(graphError(g))")
+
+    h.expect(theia.graph_set_param(g, "h", "dt", 1_000_000), "set extreme dt")
+    h.expect(theia.graph_set_param(g, "h", "cellSize", -1_000_000),
+             "set extreme cell size")
+    h.expect(theia.graph_set_param(g, "h", "heightScale", 1_000_000),
+             "set extreme vertical scale")
+    h.expect(theia.graph_set_param(g, "h", "iterations", 1e300),
+             "set extreme iteration count")
+    let guarded = theia.graph_evaluate(g, "h", 48, 48, nil, nil)
+    h.expect(guarded.ok && guarded.minHeight.isFinite && guarded.maxHeight.isFinite &&
+             guarded.minHeight >= 0 && guarded.maxHeight <= 1,
+             "finite extreme parameters should be safely bounded: \(graphError(g))")
 }
 
 func p4JSON(type: String, params: String = "{}", inputCount: Int = 1) -> String {
@@ -1479,7 +1688,8 @@ func materialStackGraphJSON(overlayCount: Int = 3,
                             terrainNode: String = "e",
                             terrainOutput: String = "height",
                             sourceNode: String = "e",
-                            sourceOutput: String = "ridge") -> String {
+                            sourceOutput: String = "ridge",
+                            overlaySources: [(node: String, output: String)]? = nil) -> String {
     let overlayNames = ["rock", "soil", "snow"]
     let colors = ["[0.46, 0.45, 0.42]", "[0.58, 0.42, 0.25]", "[0.9, 0.93, 0.96]"]
     var layers = [
@@ -1488,11 +1698,17 @@ func materialStackGraphJSON(overlayCount: Int = 3,
         """
     ]
     for index in 0..<max(0, min(overlayCount, 3)) {
+        let selectedSource: (node: String, output: String)
+        if let overlaySources, index < overlaySources.count {
+            selectedSource = overlaySources[index]
+        } else {
+            selectedSource = (sourceNode, sourceOutput)
+        }
         layers.append(
             """
             { "id": "\(overlayNames[index])", "name": "\(overlayNames[index].capitalized)",
               "previewColorSRGB": \(colors[index]),
-              "source": { "node": "\(sourceNode)", "output": "\(sourceOutput)" } }
+              "source": { "node": "\(selectedSource.node)", "output": "\(selectedSource.output)" } }
             """
         )
     }
@@ -1858,6 +2074,76 @@ h.test("Material stack rejects malformed schema but keeps dangling semantics edi
              "incompatible overlay diagnostic missing")
 }
 
+h.test("Material overlays without a source round-trip as repairable invalid state") {
+    let valid = materialStackGraphJSON(overlayCount: 1)
+    guard let validData = valid.data(using: .utf8),
+          var root = try? JSONSerialization.jsonObject(with: validData) as? [String: Any],
+          var stack = root["materialStack"] as? [String: Any],
+          var layers = stack["layers"] as? [[String: Any]],
+          layers.count == 2 else {
+        h.expect(false, "could not construct missing-source material graph")
+        return
+    }
+    layers[1].removeValue(forKey: "source")
+    stack["layers"] = layers
+    root["materialStack"] = stack
+    guard let missingData = try? JSONSerialization.data(withJSONObject: root,
+                                                         options: [.sortedKeys]),
+          let missing = String(data: missingData, encoding: .utf8) else {
+        h.expect(false, "could not encode missing-source material graph")
+        return
+    }
+
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, missing),
+             "missing overlay source must remain loadable for repair: \(graphError(g))")
+    let canonical = readCxxLongString { theia.graph_material_stack_json(g, $0, $1) }
+    guard let canonicalData = canonical.data(using: .utf8),
+          let canonicalStack = try? JSONSerialization.jsonObject(
+              with: canonicalData) as? [String: Any],
+          let canonicalLayers = canonicalStack["layers"] as? [[String: Any]] else {
+        h.expect(false, "canonical missing-source stack did not parse")
+        return
+    }
+    h.expect(canonicalLayers.count == 2 && canonicalLayers[1]["source"] == nil,
+             "canonical serializer must preserve the absent overlay source")
+    h.expect(diagnosticCodes(missing).contains("missing_material_source"),
+             "missing overlay source diagnostic missing")
+
+    let evaluation = theia.graph_evaluate_material_stack(g, 16, 16,
+                                                           nil, 0, nil, 0)
+    h.expect(!evaluation.ok && graphError(g).contains("has no source"),
+             "missing-source evaluation must fail semantically: \(graphError(g))")
+
+    let dir = NSTemporaryDirectory() + "theia_missing_source_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let exported = dir.withCString { dirPtr in
+        "missing".withCString { basePtr in
+            var options = theia.GraphMaterialExportOptions()
+            options.width = 16
+            options.height = 16
+            options.outDir = dirPtr
+            options.basename = basePtr
+            options.heightmapFormat = theia.HeightmapFormat.none
+            options.meshFormat = theia.MeshFormat.none
+            options.verticalScale = 1
+            options.meshStride = 1
+            return theia.graph_export_material_bundle(g, options)
+        }
+    }
+    h.expect(!exported.ok && !FileManager.default.fileExists(atPath: dir),
+             "missing-source export must fail before publishing artifacts")
+
+    layers[1]["source"] = NSNull()
+    stack["layers"] = layers
+    root["materialStack"] = stack
+    let malformedData = try? JSONSerialization.data(withJSONObject: root)
+    let malformed = malformedData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    h.expect(!theia.graph_load_json_text(g, malformed),
+             "a present null overlay source must remain a structural error")
+}
+
 h.test("Material weights are finite normalized deterministic and deduplicate sources") {
     let source = materialStackGraphJSON()
     guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
@@ -1874,6 +2160,8 @@ h.test("Material weights are finite normalized deterministic and deduplicate sou
         }
     }
     h.expect(cold.ok, "material evaluation failed: \(graphError(g))")
+    h.expect(theia.graph_material_weights_build_count(g) == 1,
+             "cold material evaluation should build packed weights once")
     h.expect(cold.evaluated == 2 && cold.reused == 2,
              "height/ridge should share an atomic node evaluation: \(cold.evaluated)/\(cold.reused)")
     h.expect(terrain.allSatisfy(\.isFinite), "terrain readback contains non-finite values")
@@ -1909,6 +2197,231 @@ h.test("Material weights are finite normalized deterministic and deduplicate sou
     h.expect(warm.ok && warm.evaluated == 0 && warm.reused == 4,
              "duplicate source references should be evaluated once: \(warm.evaluated)/\(warm.reused)")
     h.expect(warmWeights == weights, "warm material evaluation must be deterministic")
+    h.expect(theia.graph_material_weights_build_count(g) == 1,
+             "warm material evaluation should reuse packed weights")
+}
+
+h.test("Material weight cache survives cosmetic reloads and tracks ordered source content") {
+    let sourcesA: [(node: String, output: String)] = [
+        ("e", "ridge"), ("d", "field"), ("e", "ridge")
+    ]
+    let original = materialStackGraphJSON(overlaySources: sourcesA)
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, original),
+             "load ordered material graph: \(graphError(g))")
+
+    let count = 32 * 32
+    var firstWeights = [Float](repeating: 0, count: count * 4)
+    let first = firstWeights.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 32, 32, nil, 0,
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(first.ok && theia.graph_material_weights_build_count(g) == 1,
+             "initial ordered material weights should build once: \(graphError(g))")
+
+    let cosmetic = original
+        .replacingOccurrences(of: "\"name\": \"Rock\"",
+                              with: "\"name\": \"Stone\"")
+        .replacingOccurrences(of: "[0.46, 0.45, 0.42]",
+                              with: "[0.2, 0.3, 0.4]")
+    h.expect(theia.graph_load_json_text(g, cosmetic),
+             "reload cosmetic material edit: \(graphError(g))")
+    var cosmeticWeights = [Float](repeating: 0, count: count * 4)
+    let cosmeticResult = cosmeticWeights.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 32, 32, nil, 0,
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(cosmeticResult.ok && cosmeticResult.evaluated == 0,
+             "cosmetic reload should preserve graph output cache")
+    h.expect(theia.graph_material_weights_build_count(g) == 1,
+             "names/colors must not rebuild packed weights")
+    h.expect(cosmeticWeights == firstWeights,
+             "names/colors must not alter packed weights")
+
+    let sourcesB: [(node: String, output: String)] = [
+        ("d", "field"), ("e", "ridge"), ("e", "ridge")
+    ]
+    let reordered = materialStackGraphJSON(overlaySources: sourcesB)
+    h.expect(theia.graph_load_json_text(g, reordered),
+             "reload reordered material sources: \(graphError(g))")
+    var reorderedWeights = [Float](repeating: 0, count: count * 4)
+    let reorderedResult = reorderedWeights.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 32, 32, nil, 0,
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(reorderedResult.ok && reorderedResult.evaluated == 0,
+             "source reorder should reuse scalar graph outputs")
+    h.expect(theia.graph_material_weights_build_count(g) == 2,
+             "ordered source keys must invalidate packed weights")
+    h.expect(reorderedWeights != firstWeights,
+             "reordering distinct sources should reorder weight channels")
+
+    h.expect(theia.graph_set_param(g, "d", "bias", -0.5),
+             "change material source content")
+    let changedContent = theia.graph_evaluate_material_stack(g, 32, 32,
+                                                              nil, 0, nil, 0)
+    h.expect(changedContent.ok && changedContent.evaluated == 1,
+             "one changed source should recompute only its scalar node")
+    h.expect(theia.graph_material_weights_build_count(g) == 3,
+             "changed source content key must rebuild packed weights")
+
+    let changedResolution = theia.graph_evaluate_material_stack(g, 48, 48,
+                                                                 nil, 0, nil, 0)
+    h.expect(changedResolution.ok &&
+             theia.graph_material_weights_build_count(g) == 4,
+             "resolution must participate in the material weight cache key")
+
+    let twoLayers = materialStackGraphJSON(
+        overlayCount: 2,
+        overlaySources: Array(sourcesB.prefix(2)))
+    h.expect(theia.graph_load_json_text(g, twoLayers),
+             "reload material layer count: \(graphError(g))")
+    let changedLayerCount = theia.graph_evaluate_material_stack(g, 48, 48,
+                                                                 nil, 0, nil, 0)
+    h.expect(changedLayerCount.ok &&
+             theia.graph_material_weights_build_count(g) == 5,
+             "layer count must participate in the material weight cache key")
+}
+
+h.test("Material weight cache follows mask erases but ignores unrelated UI metadata") {
+    func graph(_ ui: String) -> String {
+        """
+        {
+          "formatVersion": 3,
+          "resolution": { "width": 48, "height": 48 },
+          "sink": "p", "sinkOutput": "height",
+          "nodes": [
+            { "id": "p", "type": "perlin", "params": {
+              "seed": 7331, "frequency": 2.4, "octaves": 4
+            } },
+            { "id": "river", "type": "river", "params": {
+              "headwaters": 20, "seed": 99, "water": 1.0, "width": 3.0
+            } }
+          ],
+          "connections": [
+            { "from": "p", "output": "height", "to": "river", "input": 0 }
+          ],
+          "materialStack": {
+            "terrain": { "node": "p", "output": "height" },
+            "layers": [
+              { "id": "base", "name": "Ground",
+                "previewColorSRGB": [0.4, 0.3, 0.2] },
+              { "id": "water", "name": "Water",
+                "previewColorSRGB": [0.1, 0.3, 0.8],
+                "source": { "node": "river", "output": "mask" } }
+            ]
+          },
+          "ui": \(ui)
+        }
+        """
+    }
+
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    let original = graph("{ \"positions\": { \"p\": { \"x\": 0, \"y\": 0 } } }")
+    h.expect(theia.graph_load_json_text(g, original),
+             "load mask material graph: \(graphError(g))")
+    let count = 48 * 48
+    var before = [Float](repeating: 0, count: count * 4)
+    let first = before.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 48, 48, nil, 0,
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(first.ok && theia.graph_material_weights_build_count(g) == 1,
+             "initial mask material weights should build once: \(graphError(g))")
+    let waterBefore = stride(from: 1, to: before.count, by: 4)
+        .reduce(Float(0)) { $0 + before[$1] }
+    h.expect(waterBefore > 0, "river material source should contain coverage")
+
+    let moved = graph("{ \"positions\": { \"p\": { \"x\": 300, \"y\": 120 } } }")
+    h.expect(theia.graph_load_json_text(g, moved),
+             "reload UI-only material edit: \(graphError(g))")
+    var movedWeights = [Float](repeating: 0, count: count * 4)
+    let movedResult = movedWeights.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 48, 48, nil, 0,
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(movedResult.ok && movedResult.evaluated == 0 &&
+             theia.graph_material_weights_build_count(g) == 1,
+             "unrelated UI positions must preserve scalar and packed caches")
+    h.expect(movedWeights == before,
+             "unrelated UI positions must not alter material weights")
+
+    let erased = graph(
+        """
+        {
+          "positions": { "p": { "x": 300, "y": 120 } },
+          "maskErases": { "river": { "mask": [
+            { "x": 0.5, "y": 0.5, "radius": 1.0, "strength": 1.0 }
+          ] } }
+        }
+        """)
+    h.expect(theia.graph_load_json_text(g, erased),
+             "reload mask erase material edit: \(graphError(g))")
+    var after = [Float](repeating: 0, count: count * 4)
+    let erasedResult = after.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 48, 48, nil, 0,
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(erasedResult.ok && erasedResult.evaluated == 1,
+             "mask erase should recompute only the edited mask node")
+    h.expect(theia.graph_material_weights_build_count(g) == 2,
+             "mask erase content key must invalidate packed material weights")
+    let waterAfter = stride(from: 1, to: after.count, by: 4)
+        .reduce(Float(0)) { $0 + after[$1] }
+    h.expect(waterAfter < waterBefore && after != before,
+             "mask erase must reduce material coverage")
+}
+
+h.test("Material example remaps centered ridge data and preserves distinct regions") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_file(g, "examples/material-stack.json"),
+             "load material example: \(graphError(g))")
+    let size = 128
+    let count = size * size
+    var ridge = [Float](repeating: 0, count: count)
+    var coverage = [Float](repeating: 0, count: count)
+    let ridgeResult = ridge.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights_output(g, "gullies", "ridge",
+                                             UInt32(size), UInt32(size),
+                                             $0.baseAddress, $0.count)
+    }
+    let coverageResult = coverage.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_heights_output(g, "ridgecoverage", "field",
+                                             UInt32(size), UInt32(size),
+                                             $0.baseAddress, $0.count)
+    }
+    h.expect(ridgeResult.ok && coverageResult.ok,
+             "ridge coverage evaluation: \(graphError(g))")
+    for index in stride(from: 0, to: count, by: 13) {
+        let expected = min(max((ridge[index] - 0.55) / 0.30, 0), 1)
+        h.expect(abs(coverage[index] - expected) < 2e-5,
+                 "ridge coverage remap mismatch at \(index)")
+        if ridge[index] <= 0.55 {
+            h.expect(coverage[index] == 0,
+                     "neutral/crease ridge data must not consume material coverage")
+        }
+    }
+
+    var weights = [Float](repeating: 0, count: count * 4)
+    let materialResult = weights.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, UInt32(size), UInt32(size),
+                                             nil, 0, $0.baseAddress, $0.count)
+    }
+    h.expect(materialResult.ok, "material example evaluation: \(graphError(g))")
+    var visible = [Int](repeating: 0, count: 4)
+    for texel in 0..<count {
+        for channel in 0..<4 where weights[texel * 4 + channel] >= 0.10 {
+            visible[channel] += 1
+        }
+    }
+    h.expect(visible[0] > count / 20,
+             "example base layer should remain visible: \(visible)")
+    h.expect(visible[1] > count / 100 && visible[2] > count / 1000 &&
+             visible[3] > count / 100,
+             "example should contain slope, river, and ridge regions: \(visible)")
 }
 
 h.test("Material weights clamp extreme data and reject non-finite source samples") {
@@ -1992,12 +2505,111 @@ func decodedRGBA8(_ path: String) -> (width: Int, height: Int, bytesPerRow: Int,
             Array(Data(referencing: data)))
 }
 
+h.test("Material APIs reject unsafe dimensions and non-finite mesh scale") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer { theia.graph_destroy(g) }
+    h.expect(theia.graph_load_json_text(g, materialStackGraphJSON(overlayCount: 1)),
+             "load material bounds graph: \(graphError(g))")
+
+    for dimension in [UInt32(4097), UInt32.max] {
+        let result = theia.graph_evaluate_material_stack(
+            g, dimension, 2, nil, 0, nil, 0)
+        h.expect(!result.ok && graphError(g).contains("4096x4096"),
+                 "dimension \(dimension) must fail before allocation/Metal dispatch")
+    }
+
+    let dir = NSTemporaryDirectory() + "theia_material_bounds_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    func export(width: UInt32, scale: Float) -> theia.GraphEvalResult {
+        dir.withCString { dirPtr in
+            "bounds".withCString { basePtr in
+                var options = theia.GraphMaterialExportOptions()
+                options.width = width
+                options.height = 16
+                options.outDir = dirPtr
+                options.basename = basePtr
+                options.heightmapFormat = theia.HeightmapFormat.none
+                options.meshFormat = theia.MeshFormat.obj
+                options.verticalScale = scale
+                options.meshStride = 1
+                return theia.graph_export_material_bundle(g, options)
+            }
+        }
+    }
+    h.expect(!export(width: 4097, scale: 1).ok &&
+             graphError(g).contains("4096x4096"),
+             "material export must reject dimensions above its public capability")
+    for scale in [Float.infinity, -Float.infinity, Float.nan] {
+        h.expect(!export(width: 16, scale: scale).ok &&
+                 graphError(g).contains("finite positive"),
+                 "material OBJ export must reject non-finite scale \(scale)")
+    }
+    h.expect(!FileManager.default.fileExists(atPath: dir),
+             "invalid material requests must fail before creating an output directory")
+}
+
+h.test("Material evaluation rejects non-finite terrain before readback or export") {
+    guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
+    defer {
+        _ = unsetenv("THEIA_TEST_INJECT_NONFINITE_MATERIAL_TERRAIN")
+        theia.graph_destroy(g)
+    }
+    h.expect(theia.graph_load_json_text(g, materialStackGraphJSON(overlayCount: 0)),
+             "load base-only material graph: \(graphError(g))")
+
+    let count = 16 * 16
+    var terrain = [Float](repeating: 7, count: count)
+    _ = setenv("THEIA_TEST_INJECT_NONFINITE_MATERIAL_TERRAIN", "1", 1)
+    let evaluation = terrain.withUnsafeMutableBufferPointer {
+        theia.graph_evaluate_material_stack(g, 16, 16,
+                                             $0.baseAddress, $0.count,
+                                             nil, 0)
+    }
+    h.expect(!evaluation.ok && graphError(g).contains("non-finite value at texel 0"),
+             "non-finite material terrain must fail evaluation: \(graphError(g))")
+    h.expect(terrain.allSatisfy { $0 == 7 },
+             "failed finite validation must happen before caller readback")
+
+    let dir = NSTemporaryDirectory() + "theia_nonfinite_material_\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let exported = dir.withCString { dirPtr in
+        "terrain".withCString { basePtr in
+            var options = theia.GraphMaterialExportOptions()
+            options.width = 16
+            options.height = 16
+            options.outDir = dirPtr
+            options.basename = basePtr
+            options.heightmapFormat = theia.HeightmapFormat.png16
+            options.meshFormat = theia.MeshFormat.obj
+            options.verticalScale = 1
+            options.meshStride = 1
+            return theia.graph_export_material_bundle(g, options)
+        }
+    }
+    _ = unsetenv("THEIA_TEST_INJECT_NONFINITE_MATERIAL_TERRAIN")
+    h.expect(!exported.ok && graphError(g).contains("non-finite"),
+             "non-finite material terrain must fail bundle export")
+    h.expect(!FileManager.default.fileExists(atPath: dir),
+             "non-finite terrain must fail before creating export artifacts")
+}
+
 h.test("Material bundle export writes exact-sum RGBA8 and canonical manifest transactionally") {
     let quarterWeights = materialStackGraphJSON(sourceNode: "d", sourceOutput: "field")
         .replacingOccurrences(of: "\"scale\": 4.0, \"bias\": -1.0",
                               with: "\"scale\": 0.0, \"bias\": 0.25")
     guard let g = theia.graph_create() else { h.expect(false, "create failed"); return }
-    defer { theia.graph_destroy(g) }
+    defer {
+        for variable in [
+            "THEIA_TEST_FAIL_MATERIAL_PUBLISH_AT",
+            "THEIA_TEST_FAIL_MATERIAL_WRITE_AT",
+            "THEIA_TEST_THROW_MATERIAL_WRITE_AT",
+            "THEIA_TEST_THROW_MATERIAL_PUBLISH_AT",
+            "THEIA_TEST_FAIL_DURABLE_CLOSE"
+        ] {
+            _ = unsetenv(variable)
+        }
+        theia.graph_destroy(g)
+    }
     h.expect(theia.graph_load_json_text(g, quarterWeights),
              "load quarter-weight graph: \(graphError(g))")
 
@@ -2063,6 +2675,147 @@ h.test("Material bundle export writes exact-sum RGBA8 and canonical manifest tra
              "manifest must identify linear exact-sum RGBA8")
     h.expect((manifest["channels"] as? [Any])?.count == 4,
              "manifest channel mapping must contain RGBA")
+
+    let publishedPaths = [heightPath, meshPath, weightPath, manifestPath]
+    let publishedBeforeFailure = publishedPaths.map {
+        try? Data(contentsOf: URL(fileURLWithPath: $0))
+    }
+    for failureStep in [2, 3] {
+        _ = setenv("THEIA_TEST_FAIL_MATERIAL_PUBLISH_AT",
+                   String(failureStep), 1)
+        h.expect(theia.graph_set_param(g, "d", "bias",
+                                       failureStep == 2 ? 0.4 : 0.6),
+                 "prepare changed material output for rollback test")
+        let interrupted = dir.withCString { dirPtr in
+            "terrain".withCString { basenamePtr in
+                var options = theia.GraphMaterialExportOptions()
+                options.width = 32
+                options.height = 32
+                options.outDir = dirPtr
+                options.basename = basenamePtr
+                options.heightmapFormat = theia.HeightmapFormat.r16
+                options.meshFormat = theia.MeshFormat.obj
+                options.verticalScale = 2
+                options.meshStride = 2
+                return theia.graph_export_material_bundle(g, options)
+            }
+        }
+        _ = unsetenv("THEIA_TEST_FAIL_MATERIAL_PUBLISH_AT")
+        h.expect(!interrupted.ok && graphError(g).contains("cannot publish"),
+                 "injected publish failure \(failureStep) should fail export")
+        let restored = publishedPaths.map {
+            try? Data(contentsOf: URL(fileURLWithPath: $0))
+        }
+        h.expect(restored.elementsEqual(publishedBeforeFailure, by: { $0 == $1 }),
+                 "rollback must restore every previous artifact at publish step \(failureStep)")
+        let debris = (try? FileManager.default.contentsOfDirectory(atPath: dir))?
+            .filter { $0.contains(".theia-tmp-") || $0.contains(".theia-backup-") } ?? []
+        h.expect(debris.isEmpty,
+                 "rollback must remove all staging files at publish step \(failureStep): \(debris)")
+    }
+    _ = unsetenv("THEIA_TEST_FAIL_MATERIAL_PUBLISH_AT")
+
+    @MainActor
+    func verifyInterruptedTransaction(variable: String, step: Int,
+                                      bias: Double, expected: String) {
+        _ = setenv(variable, String(step), 1)
+        h.expect(theia.graph_set_param(g, "d", "bias", bias),
+                 "prepare changed material output for \(variable)")
+        let interrupted = dir.withCString { dirPtr in
+            "terrain".withCString { basenamePtr in
+                var options = theia.GraphMaterialExportOptions()
+                options.width = 32
+                options.height = 32
+                options.outDir = dirPtr
+                options.basename = basenamePtr
+                options.heightmapFormat = theia.HeightmapFormat.r16
+                options.meshFormat = theia.MeshFormat.obj
+                options.verticalScale = 2
+                options.meshStride = 2
+                return theia.graph_export_material_bundle(g, options)
+            }
+        }
+        _ = unsetenv(variable)
+        h.expect(!interrupted.ok && graphError(g).contains(expected),
+                 "\(variable) should fail transactionally: \(graphError(g))")
+        let restored = publishedPaths.map {
+            try? Data(contentsOf: URL(fileURLWithPath: $0))
+        }
+        h.expect(restored.elementsEqual(publishedBeforeFailure, by: { $0 == $1 }),
+                 "\(variable) must preserve every previously published artifact")
+        let debris = (try? FileManager.default.contentsOfDirectory(atPath: dir))?
+            .filter { $0.contains(".theia-tmp-") || $0.contains(".theia-backup-") } ?? []
+        h.expect(debris.isEmpty,
+                 "\(variable) rollback must remove all staging debris: \(debris)")
+    }
+
+    verifyInterruptedTransaction(
+        variable: "THEIA_TEST_FAIL_MATERIAL_WRITE_AT", step: 2,
+        bias: 0.15, expected: "temporary-write failure")
+    verifyInterruptedTransaction(
+        variable: "THEIA_TEST_THROW_MATERIAL_WRITE_AT", step: 3,
+        bias: 0.35, expected: "temporary-write exception")
+    verifyInterruptedTransaction(
+        variable: "THEIA_TEST_THROW_MATERIAL_PUBLISH_AT", step: 3,
+        bias: 0.55, expected: "publish exception")
+
+    @MainActor
+    func verifyDurableCloseFailure(name: String,
+                                   heightmap: theia.HeightmapFormat,
+                                   mesh: theia.MeshFormat,
+                                   expectedWriter: String) {
+        let durableDir = dir + "/" + name
+        _ = setenv("THEIA_TEST_FAIL_DURABLE_CLOSE", "1", 1)
+        let interrupted = durableDir.withCString { dirPtr in
+            "durable".withCString { basenamePtr in
+                var options = theia.GraphMaterialExportOptions()
+                options.width = 16
+                options.height = 16
+                options.outDir = dirPtr
+                options.basename = basenamePtr
+                options.heightmapFormat = heightmap
+                options.meshFormat = mesh
+                options.verticalScale = 1
+                options.meshStride = 1
+                return theia.graph_export_material_bundle(g, options)
+            }
+        }
+        _ = unsetenv("THEIA_TEST_FAIL_DURABLE_CLOSE")
+        h.expect(!interrupted.ok && graphError(g).contains(expectedWriter) &&
+                 graphError(g).contains("durable-close failure"),
+                 "\(expectedWriter) must propagate flush/close failure: \(graphError(g))")
+        let remaining = (try? FileManager.default.contentsOfDirectory(
+            atPath: durableDir)) ?? []
+        h.expect(remaining.isEmpty,
+                 "durable writer failure must not leave artifacts: \(remaining)")
+    }
+
+    verifyDurableCloseFailure(
+        name: "durable-r16", heightmap: theia.HeightmapFormat.r16,
+        mesh: theia.MeshFormat.none, expectedWriter: "writeR16")
+    verifyDurableCloseFailure(
+        name: "durable-obj", heightmap: theia.HeightmapFormat.none,
+        mesh: theia.MeshFormat.obj, expectedWriter: "writeOBJ")
+    verifyDurableCloseFailure(
+        name: "durable-rgba", heightmap: theia.HeightmapFormat.none,
+        mesh: theia.MeshFormat.none, expectedWriter: "writePNG8RGBA")
+
+    let unsafeBase = dir.withCString { dirPtr in
+        "../escaped".withCString { basenamePtr in
+            var options = theia.GraphMaterialExportOptions()
+            options.width = 16
+            options.height = 16
+            options.outDir = dirPtr
+            options.basename = basenamePtr
+            options.heightmapFormat = theia.HeightmapFormat.none
+            options.meshFormat = theia.MeshFormat.none
+            options.verticalScale = 1
+            options.meshStride = 1
+            return theia.graph_export_material_bundle(g, options)
+        }
+    }
+    h.expect(!unsafeBase.ok && graphError(g).contains("filename component"),
+             "material basename must not escape the selected output directory")
 
     guard let invalid = theia.graph_create() else { h.expect(false, "create invalid graph failed"); return }
     defer { theia.graph_destroy(invalid) }

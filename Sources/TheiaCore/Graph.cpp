@@ -381,12 +381,17 @@ bool Graph::validateMaterialStack(std::string& error) const {
 bool Graph::evaluateMaterialStack(GPUContext& ctx, std::uint32_t w,
                                   std::uint32_t h,
                                   std::vector<float>& terrain,
-                                  std::vector<float>& weightsRGBA,
+                                  const std::vector<float>*& weightsRGBA,
                                   EvalStats& stats, std::string& error) {
     stats = {};
+    weightsRGBA = nullptr;
     if (!validateMaterialStack(error)) return false;
     const MaterialStack& stack = *materialStack_;
     const std::size_t count = std::size_t(w) * h;
+    if (count > std::numeric_limits<std::size_t>::max() / 4) {
+        error = "material resolution overflows the RGBA element count";
+        return false;
+    }
 
     EvalStats passStats;
     const Heightfield* terrainField = evaluate(ctx, stack.terrain.node,
@@ -397,29 +402,76 @@ bool Graph::evaluateMaterialStack(GPUContext& ctx, std::uint32_t w,
     stats.reused += passStats.reused;
     terrain.assign(terrainField->data(), terrainField->data() + count);
 
-    std::map<std::string, std::vector<float>> sourceValues;
+    struct SourceView {
+        const Heightfield* field = nullptr;
+        std::uint64_t outputKey = 0;
+    };
+    std::map<std::string, SourceView> sourceViews;
     std::array<const float*, 3> overlayPointers{};
     std::array<std::string, 3> layerIds{};
+    std::vector<std::uint64_t> orderedSourceKeys;
+    if (stack.layers.size() > 1) {
+        orderedSourceKeys.reserve(stack.layers.size() - 1);
+    }
     for (std::size_t layerIndex = 1; layerIndex < stack.layers.size(); ++layerIndex) {
         const MaterialLayer& layer = stack.layers[layerIndex];
         const GraphOutputReference& source = *layer.source;
         const std::string key = source.node + "\n" + source.output;
-        auto valuesIt = sourceValues.find(key);
-        if (valuesIt == sourceValues.end()) {
+        auto viewIt = sourceViews.find(key);
+        if (viewIt == sourceViews.end()) {
             const Heightfield* field = evaluate(ctx, source.node, source.output,
                                                 w, h, passStats, error);
             if (!field) return false;
             stats.evaluated += passStats.evaluated;
             stats.reused += passStats.reused;
-            std::vector<float> values(field->data(), field->data() + count);
-            valuesIt = sourceValues.emplace(key, std::move(values)).first;
+
+            // evaluate() owns the returned field through cache_. The graph is
+            // immutable for this call and every source uses the same
+            // resolution, so evaluating later sinks cannot replace a
+            // previously returned source entry with a different key. The
+            // pointers remain valid until packing finishes.
+            auto nodeIt = nodes_.find(source.node);
+            auto cacheIt = cache_.find(source.node);
+            std::size_t sourceOutputIndex = 0;
+            if (nodeIt == nodes_.end() || cacheIt == cache_.end() ||
+                !outputIndex(*nodeIt->second, source.output,
+                             sourceOutputIndex, error) ||
+                sourceOutputIndex >= cacheIt->second.outputKeys.size()) {
+                error = "internal: material source output key is unavailable for '" +
+                        source.node + "." + source.output + "'";
+                return false;
+            }
+            viewIt = sourceViews.emplace(
+                key, SourceView{field,
+                                cacheIt->second.outputKeys[sourceOutputIndex]}).first;
         }
-        overlayPointers[layerIndex - 1] = valuesIt->second.data();
+        overlayPointers[layerIndex - 1] = viewIt->second.field->data();
         layerIds[layerIndex - 1] = layer.id;
+        orderedSourceKeys.push_back(viewIt->second.outputKey);
     }
 
-    return buildMaterialWeights(overlayPointers, layerIds, count,
-                                weightsRGBA, error);
+    const bool cacheHit = materialWeightsCache_.valid &&
+        materialWeightsCache_.width == w &&
+        materialWeightsCache_.height == h &&
+        materialWeightsCache_.layerCount == stack.layers.size() &&
+        materialWeightsCache_.sourceOutputKeys == orderedSourceKeys &&
+        materialWeightsCache_.weightsRGBA.size() == count * 4;
+    if (!cacheHit) {
+        std::vector<float> builtWeights;
+        if (!buildMaterialWeights(overlayPointers, layerIds, count,
+                                  builtWeights, error)) {
+            return false;
+        }
+        materialWeightsCache_.valid = true;
+        materialWeightsCache_.width = w;
+        materialWeightsCache_.height = h;
+        materialWeightsCache_.layerCount = stack.layers.size();
+        materialWeightsCache_.sourceOutputKeys = std::move(orderedSourceKeys);
+        materialWeightsCache_.weightsRGBA = std::move(builtWeights);
+        ++materialWeightsBuildCount_;
+    }
+    weightsRGBA = &materialWeightsCache_.weightsRGBA;
+    return true;
 }
 
 std::uint64_t Graph::maskEditSignature(const std::string& id,
@@ -948,11 +1000,11 @@ bool Graph::fromJSON(const std::string& text, std::string& error) {
                     error = "materialStack base layer must not have a source";
                     return false;
                 }
-            } else {
-                if (!encodedLayer.contains("source")) {
-                    error = context + " requires a source";
-                    return false;
-                }
+            } else if (encodedLayer.contains("source")) {
+                // A missing overlay source is a repairable semantic state
+                // produced when authoring removes the referenced node. If a
+                // source field is present, however, it remains structurally
+                // strict and must contain a valid reference object.
                 GraphOutputReference source;
                 if (!readReference(encodedLayer["source"], source,
                                    context + " source")) {

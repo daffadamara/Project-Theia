@@ -108,8 +108,11 @@ public:
     bool evaluateMaterialStack(GPUContext& ctx, std::uint32_t w,
                                std::uint32_t h,
                                std::vector<float>& terrain,
-                               std::vector<float>& weightsRGBA,
+                               const std::vector<float>*& weightsRGBA,
                                EvalStats& stats, std::string& error);
+    std::uint64_t materialWeightsBuildCount() const {
+        return materialWeightsBuildCount_;
+    }
 
 private:
     // Post-order DFS from `sinkId` over connected inputs => topological order
@@ -137,6 +140,18 @@ private:
         std::vector<FieldKind> outputKinds;
     };
 
+    // Material weights are derived solely from the ordered scalar source
+    // contents. Names and preview colors deliberately do not participate so a
+    // semantic-only graph reload can reuse the packed result.
+    struct MaterialWeightsCacheEntry {
+        bool valid = false;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::size_t layerCount = 0;
+        std::vector<std::uint64_t> sourceOutputKeys;
+        std::vector<float> weightsRGBA;
+    };
+
     struct MaskEraseStroke {
         double x = 0.0;
         double y = 0.0;
@@ -152,6 +167,8 @@ private:
     std::map<std::string, std::unique_ptr<Node>> nodes_;
     std::map<std::string, std::vector<SourceRef>> inputs_;  // id -> src per port
     std::map<std::string, CacheEntry> cache_;
+    MaterialWeightsCacheEntry materialWeightsCache_;
+    std::uint64_t materialWeightsBuildCount_ = 0;
     std::map<std::string,
              std::map<std::string, std::vector<MaskEraseStroke>>> maskErases_;
     std::optional<MaterialStack> materialStack_;

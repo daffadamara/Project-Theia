@@ -178,7 +178,8 @@ struct ViewportSurface: View {
                 .padding(.top, topToolbarHeight + 10)
                 .padding(.leading, 12)
 
-            AxisGizmo(model: model, viewport: viewport)
+            AxisGizmo(model: model, cameraSignal: model.cameraSignal,
+                      viewport: viewport)
                 .frame(width: 76, height: 76)
                 .padding(.top, topToolbarHeight + 8)
                 .padding(.trailing, 14)
@@ -578,12 +579,13 @@ private struct FloppyDiskIcon: View {
 }
 
 struct AxisGizmo: View {
-    @ObservedObject var model: TerrainModel
+    let model: TerrainModel
+    @ObservedObject var cameraSignal: ViewportCameraSignal
     let viewport: TerrainMTKView
     private let center = CGPoint(x: 38, y: 40)
 
     var body: some View {
-        let revision = model.viewportCameraRevision
+        let revision = cameraSignal.revision
         let xAxis = axisLayout(axis: SIMD3<Float>(1, 0, 0), revision: revision)
         let yAxis = axisLayout(axis: SIMD3<Float>(0, 0, 1), revision: revision)
         let zAxis = axisLayout(axis: SIMD3<Float>(0, 1, 0), revision: revision)

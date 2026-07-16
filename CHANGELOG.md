@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.11.0-alpha.2
+
+- Repaired the GPU hydraulic erosion solver with wet/dry velocity handling, a
+  half-cell Courant cap, bounded bed/sediment exchange, input-relative
+  curvature limiting, and conservative high-talus settling. Retuned defaults
+  now produce flow-selective erosion without the former needle/checkerboard
+  artifacts, while extreme legacy/API values remain finite and bounded.
+- Reorganized hydraulic authoring around rainfall, duration, capacity, erosion,
+  and deposition; numerical timestep, slope floor, vertical scale, and virtual
+  pipe geometry now use documented Advanced controls and safe slider ranges.
+- Hardened material evaluation and export with finite/dimension guards,
+  reusable packed-weight caching, durable checked writes, and transactional
+  rollback that preserves existing bundles after write or publish failures.
+- Refined material-layer authoring with explicit overlay sources, stable channel
+  identity, repairable dangling sources, coalesced background previews, and
+  color-only shader updates that avoid graph reevaluation.
+- Prevented composite material preview from exposing the scalar mask eraser and
+  reduced high-frequency camera and layer edits from invalidating unrelated
+  inspector or renderer state.
+
 ## 0.11.0-alpha.1
 
 - Added graph format v3 with an optional semantic material stack: one terrain

@@ -10,7 +10,7 @@
     {
       "id": "ero",
       "type": "hydraulic",
-      "params": { "iterations": 200, "rain": 0.012, "evaporation": 0.015, "sedimentCapacity": 0.35, "suspension": 0.25, "deposition": 0.3, "dt": 0.015, "minTilt": 0.03, "heightScale": 80.0 }
+      "params": { "iterations": 200, "rain": 0.010, "evaporation": 0.020, "sedimentCapacity": 0.65, "suspension": 0.60, "deposition": 0.45, "dt": 0.015, "minTilt": 0.005, "heightScale": 80.0 }
     },
     {
       "id": "thermal",

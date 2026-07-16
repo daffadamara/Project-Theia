@@ -94,7 +94,10 @@ std::size_t generate_error(const GenerateResult& r, char* out, std::size_t cap);
 // "thermal", "terrace", "normalize", "slopemask"), and binary combiners
 // ("combine", "blend").
 
-struct GraphHandle;  // opaque; defined in the implementation
+// Opaque graph state. A handle is intentionally not internally synchronized:
+// callers must serialize every load/mutation/evaluation/export operation that
+// targets the same handle. Independent handles may be used concurrently.
+struct GraphHandle;
 
 GraphHandle* graph_create();
 void graph_destroy(GraphHandle* g);
@@ -172,11 +175,17 @@ std::size_t graph_material_stack_json(GraphHandle* g,
 
 // Evaluate the semantic material stack. `terrainDst` receives width*height
 // floats and `weightsRGBADst` receives width*height*4 interleaved normalized
-// floats when the corresponding destination and capacity are provided.
+// floats when the corresponding destination and capacity are provided. Each
+// requested dimension is limited to 4096 texels.
 GraphEvalResult graph_evaluate_material_stack(
     GraphHandle* g, std::uint32_t width, std::uint32_t height,
     float* terrainDst, std::size_t terrainCapElems,
     float* weightsRGBADst, std::size_t weightsCapElems);
+
+// Diagnostic/test API; application behavior must not depend on this counter.
+// It increments only when normalized material weights are rebuilt, not when
+// the derived-weight cache is reused.
+std::uint64_t graph_material_weights_build_count(GraphHandle* g);
 
 // Production export helper. Any path may be nullptr/"" to skip that output.
 // `maskPngPath` writes the selected sink normalized over [0,1], intended for
@@ -236,7 +245,8 @@ struct GraphMaterialExportOptions {
 GraphEvalResult graph_export2(GraphHandle* g, const GraphExportOptions& options);
 
 // Transactional material bundle export. Writes the stack terrain artifact(s),
-// `<basename>_weights.png`, and `<basename>_material.json`.
+// `<basename>_weights.png`, and `<basename>_material.json`. Each requested
+// dimension is limited to 4096 texels.
 GraphEvalResult graph_export_material_bundle(
     GraphHandle* g, const GraphMaterialExportOptions& options);
 

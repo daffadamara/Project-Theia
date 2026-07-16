@@ -1,7 +1,7 @@
 # Material Layer Stack Reference Audit
 
 Status: **approved for Phase 9 implementation**
-Reviewed: 2026-07-14
+Reviewed: 2026-07-15 (Phase 9 stabilization audit)
 Scope: scalar terrain/mask/data inputs, four-channel material weights, RGBA8
 packing, and solid-color viewer preview. This note does not authorize automatic
 biome classification, texture synthesis, PBR, or a new physical simulation.
@@ -164,6 +164,38 @@ not exported as an albedo texture.
 - Bundle export validates and computes all artifacts before publishing final
   filenames. A failure may not be reported as a partial success.
 
+## Centered analysis data used as coverage
+
+`erosionfilter.ridge` is an analysis field, not a ready-made material mask. Its
+Phase 8 encoding is `0 = crease`, `0.5 = neutral`, and `1 = ridge`, following
+the audited parallel-fade interpretation in the erosion-filter research. Using
+that field directly as an overlay would assign 50% coverage to neutral terrain.
+That is mathematically valid under the weight equations, but semantically wrong
+for an example intended to demonstrate localized ridge material.
+
+The Phase 9 example therefore passes the ridge output through the existing
+`remap` node before assigning it to a material layer:
+
+```
+ridgeCoverage = clamp((ridge - 0.55) / (0.85 - 0.55), 0, 1)
+```
+
+The thresholds are an illustrative authoring mapping, not a physical or
+ecological classification. They deliberately leave a `0.05` dead band above
+the encoded neutral value so rounding/noise around neutral does not consume the
+base layer. Required example invariants are:
+
+- `ridge <= 0.55` maps to zero overlay coverage;
+- `ridge >= 0.85` maps to full overlay coverage;
+- values between the thresholds map monotonically into `[0,1]`;
+- neutral `ridge = 0.5` leaves the base weight unchanged;
+- the rendered/exported example retains non-trivial base, slope, river, and
+  ridge regions rather than saturating one color globally.
+
+This uses the already-audited affine `remap` utility and introduces no new
+simulation. A different terrain may require different thresholds or a custom
+remap node chosen by the author.
+
 ## Parameter and file mapping
 
 - `materialStack.terrain` selects the terrain heightfield used for geometry and
@@ -191,6 +223,7 @@ not exported as an albedo texture.
 | Raster contract | PNG color type 6, 8-bit samples, RGBA order, top-row-first |
 | Persistence | v1/v2 unchanged; v3 round-trip and stable channel ordering |
 | Transactionality | failed bundle leaves no final material artifacts |
+| Centered data mapping | neutral ridge maps to zero; coverage is monotonic and localized |
 
 ## Limitations
 

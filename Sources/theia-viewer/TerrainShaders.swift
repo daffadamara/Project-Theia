@@ -15,7 +15,7 @@ struct Uniforms {
     float4 terrainParams;  // x=base height offset for geometry
     float4 brushParams;    // xy=center UV, z=radius UV, w=visible
     uint4  gridParams;     // x=gridW, y=gridH
-    float4 materialColor0; // sRGB preview colors
+    float4 materialColor0; // linear-light preview colors (decoded once on CPU)
     float4 materialColor1;
     float4 materialColor2;
     float4 materialColor3;
@@ -137,12 +137,6 @@ float3 materialRamp(float h, float slope, float mask, uint preset) {
     return mix(col, float3(0.24, 0.24, 0.23), mask * 0.55);
 }
 
-float3 srgbToLinear(float3 value) {
-    return select(value / 12.92,
-                  pow((value + 0.055) / 1.055, float3(2.4)),
-                  value > 0.04045);
-}
-
 float3 linearToSrgb(float3 value) {
     value = max(value, 0.0);
     return select(value * 12.92,
@@ -217,10 +211,10 @@ fragment float4 terrain_fragment(VOut in [[stage_in]],
             float sum = max(dot(weights, float4(1.0)), 0.000001);
             weights /= sum;
             float3 linearColor =
-                srgbToLinear(U.materialColor0.rgb) * weights.r +
-                srgbToLinear(U.materialColor1.rgb) * weights.g +
-                srgbToLinear(U.materialColor2.rgb) * weights.b +
-                srgbToLinear(U.materialColor3.rgb) * weights.a;
+                U.materialColor0.rgb * weights.r +
+                U.materialColor1.rgb * weights.g +
+                U.materialColor2.rgb * weights.b +
+                U.materialColor3.rgb * weights.a;
             float3 col = clamp(linearToSrgb(linearColor * lit), 0.0, 1.0);
             return applyBrushDecal(float4(col, 1.0), in.uv, U);
         }

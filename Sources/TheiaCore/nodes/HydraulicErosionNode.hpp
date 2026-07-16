@@ -10,14 +10,14 @@ public:
     explicit HydraulicErosionNode(std::string id)
         : Node(std::move(id), "hydraulic") {
         params.set("iterations", 200);
-        params.set("rain", 0.012);
-        params.set("evaporation", 0.015);
-        params.set("sedimentCapacity", 0.35);
-        params.set("suspension", 0.25);
-        params.set("deposition", 0.3);
+        params.set("rain", 0.010);
+        params.set("evaporation", 0.020);
+        params.set("sedimentCapacity", 0.65);
+        params.set("suspension", 0.60);
+        params.set("deposition", 0.45);
         params.set("gravity", 9.81);
         params.set("dt", 0.015);
-        params.set("minTilt", 0.03);
+        params.set("minTilt", 0.005);
         params.set("heightScale", 80.0);
         params.set("pipeArea", 1.0);
         params.set("pipeLength", 1.0);

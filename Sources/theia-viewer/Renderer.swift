@@ -58,13 +58,25 @@ final class Renderer {
     private var lightElevationDegrees: Float = 58.0
     private var displayMode: ViewportDisplayMode = .terrain
     private var materialPreset: MaterialPreset = .natural
+    // Material colors cross the CPU/GPU boundary in linear light. The document
+    // retains its public sRGB values; converting once here avoids four transfer
+    // function `pow` calls for every rendered fragment.
     private var materialColors: [SIMD4<Float>] = [
-        SIMD4<Float>(0.42, 0.35, 0.26, 1),
-        SIMD4<Float>(0.46, 0.45, 0.42, 1),
-        SIMD4<Float>(0.18, 0.42, 0.62, 1),
-        SIMD4<Float>(0.86, 0.88, 0.90, 1)
+        SIMD4<Float>(Float(MaterialPreviewMath.srgbToLinear(0.42)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.35)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.26)), 1),
+        SIMD4<Float>(Float(MaterialPreviewMath.srgbToLinear(0.46)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.45)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.42)), 1),
+        SIMD4<Float>(Float(MaterialPreviewMath.srgbToLinear(0.18)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.42)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.62)), 1),
+        SIMD4<Float>(Float(MaterialPreviewMath.srgbToLinear(0.86)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.88)),
+                     Float(MaterialPreviewMath.srgbToLinear(0.90)), 1)
     ]
     private var usesMaterialWeights = false
+    private(set) var previewUploadCount: UInt64 = 0
     private var maskOpacity: Float = 0.65
     private var terrainBaseHeight: Float = 0
     private var surfaceHeights: [Float] = []
@@ -130,32 +142,29 @@ final class Renderer {
     }
 
     func setHeights(_ heights: [Float], width: Int, height: Int) {
-        setPreview(heights: heights, data: heights, width: width, height: height)
+        setPreview(heights: heights, data: heights, width: width, height: height,
+                   dataMatchesHeights: true)
     }
 
     func setPreview(heights: [Float], data: [Float], weightsRGBA: [Float]? = nil,
-                    width: Int, height: Int) {
+                    width: Int, height: Int, dataMatchesHeights: Bool = false) {
         guard width > 1, height > 1, heights.count >= width * height else { return }
+        previewUploadCount &+= 1
         let sampledHeights = Self.viewerHeights(heights, width: width, height: height,
                                                 maxGrid: maxViewerGrid)
-        let sourceData = data.count >= width * height ? data : heights
-        let sampledData = Self.viewerHeights(sourceData, width: width, height: height,
-                                            maxGrid: maxViewerGrid)
+        let sampledData: (values: [Float], width: Int, height: Int)
+        if dataMatchesHeights {
+            sampledData = sampledHeights
+        } else {
+            let sourceData = data.count >= width * height ? data : heights
+            sampledData = Self.viewerHeights(sourceData, width: width, height: height,
+                                             maxGrid: maxViewerGrid)
+        }
         let sampledWeights = weightsRGBA.flatMap {
             Self.viewerWeights($0, width: width, height: height,
                                outputWidth: sampledHeights.width,
                                outputHeight: sampledHeights.height)
         }
-        let fallbackWeights = [Float](unsafeUninitializedCapacity:
-            sampledHeights.width * sampledHeights.height * 4) { buffer, initializedCount in
-                for index in stride(from: 0, to: buffer.count, by: 4) {
-                    buffer[index] = 1
-                    buffer[index + 1] = 0
-                    buffer[index + 2] = 0
-                    buffer[index + 3] = 0
-                }
-                initializedCount = buffer.count
-            }
         terrainBaseHeight = sampledHeights.values.min() ?? 0
         surfaceHeights = sampledHeights.values
         surfaceWidth = sampledHeights.width
@@ -165,16 +174,32 @@ final class Renderer {
                                          length: sampledHeights.values.count *
                                             MemoryLayout<Float>.stride,
                                          options: .storageModeShared)
-        dataBuffer = device.makeBuffer(bytes: sampledData.values,
-                                       length: sampledData.values.count *
-                                            MemoryLayout<Float>.stride,
-                                       options: .storageModeShared)
-        let packedWeights = sampledWeights ?? fallbackWeights
-        weightBuffer = device.makeBuffer(bytes: packedWeights,
-                                         length: packedWeights.count *
-                                            MemoryLayout<Float>.stride,
-                                         options: .storageModeShared)
-        usesMaterialWeights = sampledWeights != nil
+        if dataMatchesHeights {
+            dataBuffer = heightBuffer
+        } else {
+            dataBuffer = device.makeBuffer(bytes: sampledData.values,
+                                           length: sampledData.values.count *
+                                                MemoryLayout<Float>.stride,
+                                           options: .storageModeShared)
+        }
+        if let sampledWeights {
+            weightBuffer = device.makeBuffer(bytes: sampledWeights,
+                                             length: sampledWeights.count *
+                                                MemoryLayout<Float>.stride,
+                                             options: .storageModeShared)
+            usesMaterialWeights = true
+        } else {
+            // Allocate the base-only buffer only for scalar previews. Material
+            // previews already own packed weights, so they no longer pay for a
+            // second throwaway RGBA allocation and fill.
+            let fallbackWeights = Self.materialFallbackWeights(
+                texelCount: sampledHeights.width * sampledHeights.height)
+            weightBuffer = device.makeBuffer(bytes: fallbackWeights,
+                                             length: fallbackWeights.count *
+                                                MemoryLayout<Float>.stride,
+                                             options: .storageModeShared)
+            usesMaterialWeights = false
+        }
         if gridW != UInt32(sampledHeights.width) || gridH != UInt32(sampledHeights.height) ||
             indexBuffer == nil {
             buildIndices(width: sampledHeights.width, height: sampledHeights.height)
@@ -187,12 +212,25 @@ final class Renderer {
     func setMaterialColors(_ colorsSRGB: [[Double]]) {
         for index in 0..<4 {
             if index < colorsSRGB.count, colorsSRGB[index].count == 3 {
+                let linear = MaterialPreviewMath.srgbToLinear(colorsSRGB[index])
                 materialColors[index] = SIMD4<Float>(
-                    Float(colorsSRGB[index][0]), Float(colorsSRGB[index][1]),
-                    Float(colorsSRGB[index][2]), 1)
+                    Float(linear[0]), Float(linear[1]), Float(linear[2]), 1)
             }
         }
         invalidateDisplay()
+    }
+
+    static func materialFallbackWeights(texelCount: Int) -> [Float] {
+        [Float](unsafeUninitializedCapacity: max(0, texelCount) * 4) {
+            buffer, initializedCount in
+            for index in stride(from: 0, to: buffer.count, by: 4) {
+                buffer[index] = 1
+                buffer[index + 1] = 0
+                buffer[index + 2] = 0
+                buffer[index + 3] = 0
+            }
+            initializedCount = buffer.count
+        }
     }
 
     private static func viewerHeights(_ heights: [Float], width: Int, height: Int,
@@ -472,6 +510,49 @@ final class Renderer {
         let el = lightElevationDegrees * .pi / 180
         let ce = cos(el)
         return SIMD4<Float>(sin(az) * ce, sin(el), cos(az) * ce, 0)
+    }
+
+    // Deterministic offscreen timing hook used by the viewer performance test.
+    func benchmarkFrameTimes(width: Int, height: Int,
+                             warmupFrames: Int = 3,
+                             measuredFrames: Int = 10) -> [Double] {
+        guard heightBuffer != nil, dataBuffer != nil,
+              indexBuffer != nil, indexCount > 0,
+              width > 0, height > 0, measuredFrames > 0 else { return [] }
+        let cd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: colorFormat, width: width, height: height, mipmapped: false)
+        cd.usage = [.renderTarget]
+        cd.storageMode = .private
+        let dd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: depthFormat, width: width, height: height, mipmapped: false)
+        dd.usage = [.renderTarget]
+        dd.storageMode = .private
+        guard let color = device.makeTexture(descriptor: cd),
+              let depth = device.makeTexture(descriptor: dd) else { return [] }
+
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = color
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = clear
+        rpd.colorAttachments[0].storeAction = .dontCare
+        rpd.depthAttachment.texture = depth
+        rpd.depthAttachment.loadAction = .clear
+        rpd.depthAttachment.clearDepth = 1.0
+        rpd.depthAttachment.storeAction = .dontCare
+
+        var times: [Double] = []
+        for frame in 0..<(max(0, warmupFrames) + measuredFrames) {
+            guard let cb = queue.makeCommandBuffer() else { return [] }
+            let start = CFAbsoluteTimeGetCurrent()
+            encode(commandBuffer: cb, passDescriptor: rpd,
+                   viewportSize: CGSize(width: width, height: height))
+            cb.commit()
+            cb.waitUntilCompleted()
+            if frame >= warmupFrames {
+                times.append((CFAbsoluteTimeGetCurrent() - start) * 1_000)
+            }
+        }
+        return times
     }
 
     // Offscreen render of a single frame to a PNG. No window required.

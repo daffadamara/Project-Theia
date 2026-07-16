@@ -49,12 +49,25 @@
         "water": 0.72,
         "width": 2.25
       }
+    },
+    {
+      "id": "ridgecoverage",
+      "type": "remap",
+      "params": {
+        "inLow": 0.55,
+        "inHigh": 0.85,
+        "outLow": 0.0,
+        "outHigh": 1.0,
+        "gamma": 1.0,
+        "clamp": 1.0
+      }
     }
   ],
   "connections": [
     { "from": "base", "output": "height", "to": "gullies", "input": 0 },
     { "from": "gullies", "output": "height", "to": "steep", "input": 0 },
-    { "from": "gullies", "output": "height", "to": "river", "input": 0 }
+    { "from": "gullies", "output": "height", "to": "river", "input": 0 },
+    { "from": "gullies", "output": "ridge", "to": "ridgecoverage", "input": 0 }
   ],
   "materialStack": {
     "terrain": { "node": "gullies", "output": "height" },
@@ -80,7 +93,7 @@
         "id": "ridge",
         "name": "Ridge Analysis",
         "previewColorSRGB": [0.78, 0.43, 0.12],
-        "source": { "node": "gullies", "output": "ridge" }
+        "source": { "node": "ridgecoverage", "output": "field" }
       }
     ]
   },
@@ -94,7 +107,8 @@
       "base": { "x": 80, "y": 180 },
       "gullies": { "x": 330, "y": 180 },
       "steep": { "x": 590, "y": 70 },
-      "river": { "x": 590, "y": 290 }
+      "river": { "x": 590, "y": 290 },
+      "ridgecoverage": { "x": 820, "y": 180 }
     }
   }
 }

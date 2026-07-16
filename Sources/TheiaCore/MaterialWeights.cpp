@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace theia {
@@ -12,6 +13,11 @@ bool buildMaterialWeights(const std::array<const float*, 3>& overlays,
                           std::size_t count,
                           std::vector<float>& weightsRGBA,
                           std::string& error) {
+    if (count > std::numeric_limits<std::size_t>::max() / 4) {
+        error = "material weight element count overflow";
+        weightsRGBA.clear();
+        return false;
+    }
     weightsRGBA.assign(count * 4, 0.0f);
     for (std::size_t texel = 0; texel < count; ++texel) {
         std::array<float, 3> mask{};
@@ -53,6 +59,11 @@ bool quantizeMaterialWeightsRGBA8(const float* weightsRGBA,
                                   std::string& error) {
     if (!weightsRGBA && texelCount > 0) {
         error = "material weight quantization received null data";
+        return false;
+    }
+    if (texelCount > std::numeric_limits<std::size_t>::max() / 4) {
+        error = "material weight byte count overflow";
+        bytes.clear();
         return false;
     }
     bytes.assign(texelCount * 4, 0);

@@ -10,6 +10,10 @@ enum MaterialPreviewMath {
             : pow((value + 0.055) / 1.055, 2.4)
     }
 
+    static func srgbToLinear(_ values: [Double]) -> [Double] {
+        values.map(srgbToLinear)
+    }
+
     static func linearToSRGB(_ value: Double) -> Double {
         value <= 0.0031308
             ? value * 12.92

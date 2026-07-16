@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "io/CheckedFileWriter.hpp"
 #include "io/ImageWriter.hpp"
 
 namespace theia {
@@ -175,12 +176,8 @@ bool writeOBJ(const char* path, const float* data,
         }
     }
 
-    std::fclose(f);
-    if (!ok) {
-        error = "writeOBJ: short write";
-        return false;
-    }
-    return true;
+    return io_detail::finishFileWrite(f, ok, "writeOBJ", "short write",
+                                      error);
 }
 
 } // namespace theia

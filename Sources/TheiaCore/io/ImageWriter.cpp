@@ -10,9 +10,50 @@
 #include <cstdio>
 #include <vector>
 
+#include "io/CheckedFileWriter.hpp"
+
 namespace theia {
 
 namespace {
+struct CheckedSTBWriteContext {
+    FILE* file = nullptr;
+    bool complete = true;
+};
+
+void checkedSTBWrite(void* opaque, void* data, int size) {
+    auto* context = static_cast<CheckedSTBWriteContext*>(opaque);
+    if (!context || !context->file || !context->complete || size < 0) {
+        if (context) context->complete = false;
+        return;
+    }
+    context->complete =
+        std::fwrite(data, 1, static_cast<std::size_t>(size), context->file) ==
+        static_cast<std::size_t>(size);
+}
+
+bool writePNG8Components(const char* path, const unsigned char* pixels,
+                         std::uint32_t width, std::uint32_t height,
+                         int components, int stride,
+                         const char* label, std::string& error) {
+    if (!path || !path[0]) {
+        error = std::string(label) + ": empty path";
+        return false;
+    }
+    FILE* file = std::fopen(path, "wb");
+    if (!file) {
+        error = std::string(label) + ": cannot open " + path;
+        return false;
+    }
+    CheckedSTBWriteContext context{file, true};
+    const int encoded = stbi_write_png_to_func(
+        checkedSTBWrite, &context, int(width), int(height), components,
+        pixels, stride);
+    const bool payloadWritten = encoded != 0 && context.complete;
+    const char* failure = encoded == 0 ? "PNG encoding failed" : "short write";
+    return io_detail::finishFileWrite(file, payloadWritten, label, failure,
+                                      error);
+}
+
 // --- minimal PNG-16 support (CRC32 + Adler32 + stored-block DEFLATE) ---------
 std::uint32_t crc32Of(const unsigned char* p, std::size_t n, std::uint32_t crc) {
     crc = ~crc;
@@ -81,17 +122,15 @@ bool writePFM(const char* path, const float* data,
         return false;
     }
     // Grayscale PFM header; scale -1.0 => little-endian samples (x86/ARM native).
-    std::fprintf(f, "Pf\n%u %u\n-1.0\n", width, height);
+    bool ok = std::fprintf(f, "Pf\n%u %u\n-1.0\n", width, height) > 0;
 
     // PFM stores rows bottom-to-top; our data is top-to-bottom. Flip on write.
-    bool ok = true;
     for (std::uint32_t y = 0; y < height && ok; ++y) {
         const float* row = data + std::size_t(height - 1 - y) * width;
         ok = std::fwrite(row, sizeof(float), width, f) == width;
     }
-    std::fclose(f);
-    if (!ok) error = "writePFM: short write";
-    return ok;
+    return io_detail::finishFileWrite(f, ok, "writePFM", "short write",
+                                      error);
 }
 
 bool writePNG8(const char* path, const float* data,
@@ -108,14 +147,10 @@ bool writePNG8(const char* path, const float* data,
         t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
         px[i] = static_cast<unsigned char>(t * 255.0f + 0.5f);
     }
-    // stb writes top row first, matching our row-major layout.
-    int rc = stbi_write_png(path, int(width), int(height), 1,
-                            px.data(), int(width));
-    if (rc == 0) {
-        error = std::string("writePNG8: stbi_write_png failed for ") + path;
-        return false;
-    }
-    return true;
+    // stb writes top row first, matching our row-major layout. Use its callback
+    // encoder so stdio failures are observable instead of silently discarded.
+    return writePNG8Components(path, px.data(), width, height, 1, int(width),
+                               "writePNG8", error);
 }
 
 bool writePNG16(const char* path, const float* data,
@@ -162,9 +197,8 @@ bool writePNG16(const char* path, const float* data,
         return false;
     }
     const bool ok = std::fwrite(png.data(), 1, png.size(), f) == png.size();
-    std::fclose(f);
-    if (!ok) error = "writePNG16: short write";
-    return ok;
+    return io_detail::finishFileWrite(f, ok, "writePNG16", "short write",
+                                      error);
 }
 
 bool writeR16(const char* path, const float* data,
@@ -191,9 +225,8 @@ bool writeR16(const char* path, const float* data,
     }
 
     const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
-    std::fclose(f);
-    if (!ok) error = "writeR16: short write";
-    return ok;
+    return io_detail::finishFileWrite(f, ok, "writeR16", "short write",
+                                      error);
 }
 
 bool writePNG8RGB(const char* path, const unsigned char* rgb,
@@ -204,12 +237,8 @@ bool writePNG8RGB(const char* path, const unsigned char* rgb,
         return false;
     }
     const int stride = int(width) * 3;
-    const int rc = stbi_write_png(path, int(width), int(height), 3, rgb, stride);
-    if (rc == 0) {
-        error = std::string("writePNG8RGB: stbi_write_png failed for ") + path;
-        return false;
-    }
-    return true;
+    return writePNG8Components(path, rgb, width, height, 3, stride,
+                               "writePNG8RGB", error);
 }
 
 bool writePNG8RGBA(const char* path, const unsigned char* rgba,
@@ -220,12 +249,8 @@ bool writePNG8RGBA(const char* path, const unsigned char* rgba,
         return false;
     }
     const int stride = int(width) * 4;
-    const int rc = stbi_write_png(path, int(width), int(height), 4, rgba, stride);
-    if (rc == 0) {
-        error = std::string("writePNG8RGBA: stbi_write_png failed for ") + path;
-        return false;
-    }
-    return true;
+    return writePNG8Components(path, rgba, width, height, 4, stride,
+                               "writePNG8RGBA", error);
 }
 
 } // namespace theia

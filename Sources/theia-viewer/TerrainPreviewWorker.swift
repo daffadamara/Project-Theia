@@ -4,11 +4,20 @@ import TheiaCore
 struct TerrainPreviewEvaluation: Sendable {
     let geometry: [Float]
     let data: [Float]
+    let dataMatchesGeometry: Bool
     let weightsRGBA: [Float]?
+    let materialColorsSRGB: [[Double]]?
     let width: Int
     let height: Int
     let evaluated: UInt32
     let reused: UInt32
+}
+
+struct TerrainPreviewWorkerActivity: Equatable, Sendable {
+    var submitted = 0
+    var started = 0
+    var skippedBeforeStart = 0
+    var delivered = 0
 }
 
 enum TerrainPreviewOutcome: Sendable {
@@ -23,7 +32,9 @@ final class TerrainPreviewWorker: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.theia.preview", qos: .userInitiated)
     private let revisionLock = NSLock()
     private var latestRevision: UInt64 = 0
+    private var activity = TerrainPreviewWorkerActivity()
     private var handle: OpaquePointer?
+    private let coalescingDelay: DispatchTimeInterval = .milliseconds(60)
 
     deinit {
         if let handle { theia.graph_destroy(handle) }
@@ -35,6 +46,12 @@ final class TerrainPreviewWorker: @unchecked Sendable {
         revisionLock.unlock()
     }
 
+    func activitySnapshot() -> TerrainPreviewWorkerActivity {
+        revisionLock.lock()
+        defer { revisionLock.unlock() }
+        return activity
+    }
+
     func submit(jsonText: String,
                 geometry: GraphOutputReference,
                 data: GraphOutputReference,
@@ -43,10 +60,12 @@ final class TerrainPreviewWorker: @unchecked Sendable {
         revisionLock.lock()
         latestRevision &+= 1
         let revision = latestRevision
+        activity.submitted += 1
         revisionLock.unlock()
 
-        queue.async { [weak self] in
-            guard let self, self.isLatest(revision) else { return }
+        queue.asyncAfter(deadline: .now() + coalescingDelay) { [weak self] in
+            guard let self else { return }
+            guard self.beginIfLatest(revision) else { return }
             guard let graph = self.graphHandle() else {
                 self.finish(.failure("preview graph creation failed"),
                             revision: revision, completion: completion)
@@ -82,7 +101,9 @@ final class TerrainPreviewWorker: @unchecked Sendable {
             let result = TerrainPreviewEvaluation(
                 geometry: geometryResult.values,
                 data: dataResult.values,
+                dataMatchesGeometry: geometry == data,
                 weightsRGBA: nil,
+                materialColorsSRGB: nil,
                 width: Int(geometryResult.result.width),
                 height: Int(geometryResult.result.height),
                 evaluated: geometryResult.result.evaluated +
@@ -94,15 +115,18 @@ final class TerrainPreviewWorker: @unchecked Sendable {
     }
 
     func submitMaterial(jsonText: String,
+                        colorsSRGB: [[Double]],
                         size: UInt32,
                         completion: @escaping @MainActor @Sendable (TerrainPreviewOutcome) -> Void) {
         revisionLock.lock()
         latestRevision &+= 1
         let revision = latestRevision
+        activity.submitted += 1
         revisionLock.unlock()
 
-        queue.async { [weak self] in
-            guard let self, self.isLatest(revision) else { return }
+        queue.asyncAfter(deadline: .now() + coalescingDelay) { [weak self] in
+            guard let self else { return }
+            guard self.beginIfLatest(revision) else { return }
             guard let graph = self.graphHandle() else {
                 self.finish(.failure("preview graph creation failed"),
                             revision: revision, completion: completion)
@@ -137,7 +161,9 @@ final class TerrainPreviewWorker: @unchecked Sendable {
             let result = TerrainPreviewEvaluation(
                 geometry: terrain,
                 data: terrain,
+                dataMatchesGeometry: true,
                 weightsRGBA: weights,
+                materialColorsSRGB: colorsSRGB,
                 width: Int(evaluation.width),
                 height: Int(evaluation.height),
                 evaluated: evaluation.evaluated,
@@ -172,13 +198,31 @@ final class TerrainPreviewWorker: @unchecked Sendable {
         return revision == latestRevision
     }
 
+    private func beginIfLatest(_ revision: UInt64) -> Bool {
+        revisionLock.lock()
+        defer { revisionLock.unlock() }
+        guard revision == latestRevision else {
+            activity.skippedBeforeStart += 1
+            return false
+        }
+        activity.started += 1
+        return true
+    }
+
     private func finish(_ outcome: TerrainPreviewOutcome,
                         revision: UInt64,
                         completion: @escaping @MainActor @Sendable (TerrainPreviewOutcome) -> Void) {
         guard isLatest(revision) else { return }
         Task { @MainActor [weak self] in
             guard let self, self.isLatest(revision) else { return }
+            self.recordDelivered()
             completion(outcome)
         }
+    }
+
+    private func recordDelivered() {
+        revisionLock.lock()
+        activity.delivered += 1
+        revisionLock.unlock()
     }
 }

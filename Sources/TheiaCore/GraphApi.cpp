@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -12,6 +14,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include "GPUContext.hpp"
@@ -28,8 +31,198 @@ using json = nlohmann::json;
 namespace theia {
 
 namespace {
-constexpr const char* kTheiaVersion = "0.11.0-alpha.1";
+constexpr const char* kTheiaVersion = "0.11.0-alpha.2";
 constexpr std::uint32_t kTheiaAPIVersion = 4;
+constexpr std::uint32_t kMaxMaterialDimension = 4096;
+
+bool checkedMaterialDimensions(std::uint32_t width, std::uint32_t height,
+                               std::size_t& texelCount,
+                               std::size_t& weightElementCount,
+                               std::string& error) {
+    texelCount = 0;
+    weightElementCount = 0;
+    if (width < 2 || height < 2) {
+        error = "material resolution must be at least 2x2";
+        return false;
+    }
+    if (width > kMaxMaterialDimension || height > kMaxMaterialDimension) {
+        error = "material resolution exceeds the supported 4096x4096 limit";
+        return false;
+    }
+    if (std::size_t(width) >
+        std::numeric_limits<std::size_t>::max() / std::size_t(height)) {
+        error = "material resolution overflows the texel count";
+        return false;
+    }
+    texelCount = std::size_t(width) * std::size_t(height);
+    if (texelCount > std::numeric_limits<std::size_t>::max() / 4) {
+        error = "material resolution overflows the RGBA element count";
+        return false;
+    }
+    weightElementCount = texelCount * 4;
+    if (texelCount > std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+        weightElementCount >
+            std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+        error = "material resolution overflows the byte count";
+        return false;
+    }
+    return true;
+}
+
+std::size_t materialTestStep(const char* variable) {
+#ifndef NDEBUG
+    if (const char* encoded = std::getenv(variable)) {
+        try {
+            std::size_t consumed = 0;
+            const unsigned long value = std::stoul(encoded, &consumed);
+            if (consumed == std::strlen(encoded)) {
+                return static_cast<std::size_t>(value);
+            }
+        } catch (...) {
+        }
+    }
+#else
+    (void)variable;
+#endif
+    return 0;
+}
+
+bool validateFiniteMaterialTerrain(std::vector<float>& terrain,
+                                   std::string& error) {
+#ifndef NDEBUG
+    if (!terrain.empty() &&
+        std::getenv("THEIA_TEST_INJECT_NONFINITE_MATERIAL_TERRAIN")) {
+        terrain.front() = std::numeric_limits<float>::quiet_NaN();
+    }
+#endif
+    for (std::size_t index = 0; index < terrain.size(); ++index) {
+        if (!std::isfinite(terrain[index])) {
+            error = "material terrain contains non-finite value at texel " +
+                    std::to_string(index);
+            return false;
+        }
+    }
+    return true;
+}
+
+struct MaterialExportArtifact {
+    std::filesystem::path finalPath;
+    std::filesystem::path tempPath;
+    std::filesystem::path backupPath;
+    bool existed = false;
+    bool backedUp = false;
+    bool published = false;
+};
+
+class MaterialExportTransaction {
+public:
+    ~MaterialExportTransaction() {
+        if (active_) (void)rollback();
+    }
+
+    void addArtifact(const std::filesystem::path& finalPath,
+                     const std::string& nonce) {
+        if (finalPath.empty()) return;
+        artifacts_.push_back({finalPath,
+                              finalPath.string() + ".theia-tmp-" + nonce,
+                              finalPath.string() + ".theia-backup-" + nonce});
+    }
+
+    std::vector<MaterialExportArtifact>& artifacts() { return artifacts_; }
+    const std::vector<MaterialExportArtifact>& artifacts() const {
+        return artifacts_;
+    }
+
+    void arm() { active_ = true; }
+    void commit() { active_ = false; }
+
+    std::filesystem::path tempFor(
+        const std::filesystem::path& finalPath) const {
+        auto it = std::find_if(artifacts_.begin(), artifacts_.end(),
+            [&](const MaterialExportArtifact& artifact) {
+                return artifact.finalPath == finalPath;
+            });
+        return it == artifacts_.end() ? std::filesystem::path{} : it->tempPath;
+    }
+
+    std::string rollback() noexcept {
+        if (!active_) return {};
+        std::string issues;
+        try {
+            for (MaterialExportArtifact& artifact : artifacts_) {
+                if (!artifact.published) continue;
+                removePath(artifact.finalPath, "published artifact", issues);
+                artifact.published = false;
+            }
+            for (MaterialExportArtifact& artifact : artifacts_) {
+                if (!artifact.backedUp) continue;
+                std::error_code restoreError;
+                std::filesystem::rename(artifact.backupPath,
+                                        artifact.finalPath, restoreError);
+                if (restoreError) {
+                    appendIssue(issues,
+                        "cannot restore previous artifact '" +
+                        artifact.finalPath.string() + "': " +
+                        restoreError.message());
+                } else {
+                    artifact.backedUp = false;
+                }
+            }
+            for (const MaterialExportArtifact& artifact : artifacts_) {
+                removePath(artifact.tempPath, "temporary artifact", issues);
+            }
+        } catch (const std::exception& exception) {
+            try {
+                appendIssue(issues, std::string("rollback exception: ") +
+                                    exception.what());
+            } catch (...) {
+            }
+        } catch (...) {
+            try {
+                appendIssue(issues, "rollback exception: unknown error");
+            } catch (...) {
+            }
+        }
+        active_ = false;
+        return issues;
+    }
+
+    std::string removeBackups() {
+        std::string issues;
+        for (MaterialExportArtifact& artifact : artifacts_) {
+            if (!artifact.backedUp) continue;
+            std::error_code removeError;
+            (void)std::filesystem::remove(artifact.backupPath, removeError);
+            if (removeError) {
+                appendIssue(issues, "cannot remove material backup '" +
+                    artifact.backupPath.string() + "': " +
+                    removeError.message());
+            } else {
+                artifact.backedUp = false;
+            }
+        }
+        return issues;
+    }
+
+private:
+    static void appendIssue(std::string& issues, const std::string& issue) {
+        if (!issues.empty()) issues += "; ";
+        issues += issue;
+    }
+
+    static void removePath(const std::filesystem::path& path,
+                           const char* purpose, std::string& issues) {
+        std::error_code removeError;
+        (void)std::filesystem::remove(path, removeError);
+        if (removeError) {
+            appendIssue(issues, std::string("cannot remove ") + purpose +
+                " '" + path.string() + "': " + removeError.message());
+        }
+    }
+
+    std::vector<MaterialExportArtifact> artifacts_;
+    bool active_ = false;
+};
 
 std::size_t copyOutStr(const std::string& s, char* out, std::size_t cap) {
     if (out && cap > 0) {
@@ -574,11 +767,26 @@ std::string makeDiagnosticsJSON(const std::string& text) {
                              id);
                 }
             } else if (type == "hydraulic") {
-                const double iterations = jsonParamValue(params, "iterations", 80.0);
-                if (iterations >= 180.0) {
+                const double iterations = jsonParamValue(params, "iterations", 200.0);
+                if (iterations >= 260.0) {
                     addIssue(issues, "warning", "heavy_simulation",
                              "Hydraulic node '" + id +
                                  "' may slow live preview with current iteration count",
+                             id);
+                }
+                const double dt = jsonParamValue(params, "dt", 0.015);
+                const double minTilt = jsonParamValue(params, "minTilt", 0.005);
+                const double rain = jsonParamValue(params, "rain", 0.010);
+                const double evaporation =
+                    jsonParamValue(params, "evaporation", 0.020);
+                const double heightScale =
+                    jsonParamValue(params, "heightScale", 80.0);
+                if (dt > 0.025 || minTilt > 0.15 || rain > 0.05 ||
+                    evaporation > 0.10 || heightScale > 150.0) {
+                    addIssue(issues, "warning", "hydraulic_authoring_envelope",
+                             "Hydraulic node '" + id +
+                                 "' uses advanced values outside the recommended authoring envelope; "
+                                 "the core will stabilize them but slope selectivity may be reduced",
                              id);
                 }
             }
@@ -637,6 +845,7 @@ std::size_t theia_capabilities_json(char* out, std::size_t cap) {
     caps["graphFormatVersion"] = 3;
     caps["materialStack"] = true;
     caps["materialWeightChannels"] = 4;
+    caps["materialMaxDimension"] = kMaxMaterialDimension;
     caps["materialBundleFormats"] = {"rgba8", "json"};
     caps["heightmapFormats"] = {"png16", "r16", "pfm32"};
     caps["meshFormats"] = {"obj"};
@@ -910,39 +1119,67 @@ GraphEvalResult graph_evaluate_material_stack(
     GraphEvalResult result;
     if (!g) return result;
     g->clearError();
-    if (!g->ensureGPU()) return result;
+    try {
+        const std::uint32_t w = width ? width : g->graph.defaultWidth();
+        const std::uint32_t h = height ? height : g->graph.defaultHeight();
+        std::size_t texelCount = 0;
+        std::size_t weightElementCount = 0;
+        if (!checkedMaterialDimensions(w, h, texelCount,
+                                       weightElementCount, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::validation;
+            return result;
+        }
+        // Validate the request before creating Metal resources. Invalid public
+        // API input must fail deterministically even on a machine without a
+        // Metal device.
+        if (!g->ensureGPU()) return result;
 
-    const std::uint32_t w = width ? width : g->graph.defaultWidth();
-    const std::uint32_t h = height ? height : g->graph.defaultHeight();
-    if (w < 2 || h < 2) {
-        g->setError(GraphErrorCode::validation,
-                    "material evaluation resolution must be at least 2x2");
+        std::vector<float> terrain;
+        const std::vector<float>* weights = nullptr;
+        EvalStats stats;
+        if (!g->graph.evaluateMaterialStack(*g->ctx, w, h, terrain, weights,
+                                            stats, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::evaluation;
+            return result;
+        }
+        if (terrain.size() != texelCount || !weights ||
+            weights->size() != weightElementCount) {
+            g->setError(GraphErrorCode::evaluation,
+                        "material evaluation returned an unexpected buffer size");
+            return result;
+        }
+        if (!validateFiniteMaterialTerrain(terrain, g->lastError)) {
+            g->lastErrorCode = GraphErrorCode::evaluation;
+            return result;
+        }
+
+        result.width = w;
+        result.height = h;
+        result.evaluated = stats.evaluated;
+        result.reused = stats.reused;
+        fillStats(terrain, result);
+
+        if (terrainDst && terrainCapElems >= terrain.size()) {
+            std::memcpy(terrainDst, terrain.data(), terrain.size() * sizeof(float));
+        }
+        if (weightsRGBADst && weightsCapElems >= weights->size()) {
+            std::memcpy(weightsRGBADst, weights->data(),
+                        weights->size() * sizeof(float));
+        }
+        result.ok = true;
         return result;
+    } catch (const std::exception& exception) {
+        g->setError(GraphErrorCode::evaluation,
+                    std::string("material evaluation failed: ") + exception.what());
+    } catch (...) {
+        g->setError(GraphErrorCode::evaluation,
+                    "material evaluation failed with an unknown exception");
     }
+    return GraphEvalResult{};
+}
 
-    std::vector<float> terrain;
-    std::vector<float> weights;
-    EvalStats stats;
-    if (!g->graph.evaluateMaterialStack(*g->ctx, w, h, terrain, weights,
-                                        stats, g->lastError)) {
-        g->lastErrorCode = GraphErrorCode::evaluation;
-        return result;
-    }
-
-    result.width = w;
-    result.height = h;
-    result.evaluated = stats.evaluated;
-    result.reused = stats.reused;
-    fillStats(terrain, result);
-
-    if (terrainDst && terrainCapElems >= terrain.size()) {
-        std::memcpy(terrainDst, terrain.data(), terrain.size() * sizeof(float));
-    }
-    if (weightsRGBADst && weightsCapElems >= weights.size()) {
-        std::memcpy(weightsRGBADst, weights.data(), weights.size() * sizeof(float));
-    }
-    result.ok = true;
-    return result;
+std::uint64_t graph_material_weights_build_count(GraphHandle* g) {
+    return g ? g->graph.materialWeightsBuildCount() : 0;
 }
 
 GraphEvalResult graph_export(GraphHandle* g, const char* sinkId,
@@ -1204,6 +1441,8 @@ GraphEvalResult graph_export_material_bundle(
     GraphEvalResult result;
     if (!g) return result;
     g->clearError();
+    MaterialExportTransaction transaction;
+    try {
 
     if (options.heightmapFormat != HeightmapFormat::none &&
         options.heightmapFormat != HeightmapFormat::png16 &&
@@ -1225,22 +1464,34 @@ GraphEvalResult graph_export_material_bundle(
         g->setError(GraphErrorCode::validation, "material export basename is required");
         return result;
     }
-    if (options.meshStride == 0 || !(options.verticalScale > 0.0f)) {
+    const std::string requestedBase(options.basename);
+    const std::filesystem::path requestedBasePath(requestedBase);
+    if (requestedBase == "." || requestedBase == ".." ||
+        requestedBasePath.is_absolute() || requestedBasePath.has_parent_path() ||
+        requestedBase.find('/') != std::string::npos ||
+        requestedBase.find('\\') != std::string::npos) {
         g->setError(GraphErrorCode::validation,
-                    "material export requires positive scale and mesh stride");
+                    "material export basename must be a filename component");
+        return result;
+    }
+    if (options.meshStride == 0 || !std::isfinite(options.verticalScale) ||
+        !(options.verticalScale > 0.0f)) {
+        g->setError(GraphErrorCode::validation,
+                    "material export requires finite positive scale and mesh stride");
         return result;
     }
 
     const std::uint32_t width = options.width ? options.width : g->graph.defaultWidth();
     const std::uint32_t height = options.height ? options.height : g->graph.defaultHeight();
-    if (width < 2 || height < 2) {
-        g->setError(GraphErrorCode::validation,
-                    "material export resolution must be at least 2x2");
+    std::size_t texelCount = 0;
+    std::size_t weightElementCount = 0;
+    if (!checkedMaterialDimensions(width, height, texelCount,
+                                   weightElementCount, g->lastError)) {
+        g->lastErrorCode = GraphErrorCode::validation;
         return result;
     }
-    const std::size_t texelCount = std::size_t(width) * height;
     std::vector<float> terrain(texelCount);
-    std::vector<float> weights(texelCount * 4);
+    std::vector<float> weights(weightElementCount);
     result = graph_evaluate_material_stack(g, width, height,
                                            terrain.data(), terrain.size(),
                                            weights.data(), weights.size());
@@ -1291,67 +1542,75 @@ GraphEvalResult graph_export_material_bundle(
 
     const auto nonce = std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count());
-    struct Artifact {
-        std::filesystem::path finalPath;
-        std::filesystem::path tempPath;
-        std::filesystem::path backupPath;
-        bool backedUp = false;
-        bool published = false;
-    };
-    std::vector<Artifact> artifacts;
-    auto addArtifact = [&](const std::filesystem::path& finalPath) {
-        if (finalPath.empty()) return;
-        artifacts.push_back({finalPath,
-                             finalPath.string() + ".theia-tmp-" + nonce,
-                             finalPath.string() + ".theia-backup-" + nonce});
-    };
-    addArtifact(heightFinal);
-    addArtifact(meshFinal);
-    addArtifact(weightsFinal);
-    addArtifact(manifestFinal);
-    auto tempFor = [&](const std::filesystem::path& finalPath) {
-        auto it = std::find_if(artifacts.begin(), artifacts.end(),
-            [&](const Artifact& artifact) { return artifact.finalPath == finalPath; });
-        return it == artifacts.end() ? std::filesystem::path{} : it->tempPath;
-    };
-    auto cleanupTemps = [&] {
-        for (const Artifact& artifact : artifacts) {
-            std::error_code ignored;
-            std::filesystem::remove(artifact.tempPath, ignored);
+    transaction.addArtifact(heightFinal, nonce);
+    transaction.addArtifact(meshFinal, nonce);
+    transaction.addArtifact(weightsFinal, nonce);
+    transaction.addArtifact(manifestFinal, nonce);
+    auto& artifacts = transaction.artifacts();
+    auto readSymlinkStatus = [](const std::filesystem::path& path,
+                                std::filesystem::file_status& status,
+                                std::error_code& error) {
+        error.clear();
+        status = std::filesystem::symlink_status(path, error);
+        if (error == std::errc::no_such_file_or_directory) {
+            // A new bundle normally targets files that do not exist yet.
+            // libc++ reports that state through the error_code overload on
+            // macOS, so normalize it to file_type::not_found.
+            error.clear();
+            status = std::filesystem::file_status(
+                std::filesystem::file_type::not_found);
         }
     };
 
-    bool writesOK = true;
-    if (!heightFinal.empty()) {
-        const std::string temp = tempFor(heightFinal).string();
-        switch (options.heightmapFormat) {
-        case HeightmapFormat::png16:
-            writesOK = writePNG16(temp.c_str(), terrain.data(), width, height,
-                                  result.minHeight, result.maxHeight, g->lastError);
-            break;
-        case HeightmapFormat::r16:
-            writesOK = writeR16(temp.c_str(), terrain.data(), width, height,
-                                result.minHeight, result.maxHeight, g->lastError);
-            break;
-        case HeightmapFormat::pfm32:
-            writesOK = writePFM(temp.c_str(), terrain.data(), width, height,
-                                g->lastError);
-            break;
-        case HeightmapFormat::none:
-            break;
+    // Only regular files and symlinks are valid replaceable artifacts. This
+    // prevents directories/devices from being moved aside as if they were a
+    // previous bundle and keeps every filesystem query on the error_code path.
+    for (MaterialExportArtifact& artifact : artifacts) {
+        std::error_code statusError;
+        std::filesystem::file_status status;
+        readSymlinkStatus(artifact.finalPath, status, statusError);
+        if (statusError) {
+            g->lastError = "cannot inspect existing material artifact '" +
+                           artifact.finalPath.string() + "': " +
+                           statusError.message();
+            g->lastErrorCode = GraphErrorCode::exportError;
+            result.ok = false;
+            return result;
+        }
+        artifact.existed = std::filesystem::exists(status);
+        if (artifact.existed &&
+            !std::filesystem::is_regular_file(status) &&
+            !std::filesystem::is_symlink(status)) {
+            g->lastError = "existing material artifact is not a replaceable file: '" +
+                           artifact.finalPath.string() + "'";
+            g->lastErrorCode = GraphErrorCode::exportError;
+            result.ok = false;
+            return result;
+        }
+        for (const auto& stagingPath : {artifact.tempPath, artifact.backupPath}) {
+            std::error_code stagingError;
+            std::filesystem::file_status stagingStatus;
+            readSymlinkStatus(stagingPath, stagingStatus, stagingError);
+            if (stagingError) {
+                g->lastError = "cannot inspect material staging path '" +
+                               stagingPath.string() + "': " +
+                               stagingError.message();
+                g->lastErrorCode = GraphErrorCode::exportError;
+                result.ok = false;
+                return result;
+            }
+            if (std::filesystem::exists(stagingStatus)) {
+                g->lastError = "material staging path already exists: '" +
+                               stagingPath.string() + "'";
+                g->lastErrorCode = GraphErrorCode::exportError;
+                result.ok = false;
+                return result;
+            }
         }
     }
-    if (writesOK && !meshFinal.empty()) {
-        const std::string temp = tempFor(meshFinal).string();
-        writesOK = writeOBJ(temp.c_str(), terrain.data(), width, height,
-                            options.verticalScale, options.meshStride, g->lastError);
-    }
-    if (writesOK) {
-        const std::string temp = tempFor(weightsFinal).string();
-        writesOK = writePNG8RGBA(temp.c_str(), weightBytes.data(), width, height,
-                                 g->lastError);
-    }
 
+    // Build the manifest before the first filesystem write. The transaction
+    // guard below owns every temporary/backup path once staging begins.
     json manifest;
     manifest["formatVersion"] = 1;
     manifest["resolution"] = {{"width", width}, {"height", height}};
@@ -1397,70 +1656,185 @@ GraphEvalResult graph_export_material_bundle(
         }
         manifest["layers"].push_back(std::move(encoded));
     }
+
+    transaction.arm();
+    const std::size_t injectedWriteFailure =
+        materialTestStep("THEIA_TEST_FAIL_MATERIAL_WRITE_AT");
+    const std::size_t injectedWriteException =
+        materialTestStep("THEIA_TEST_THROW_MATERIAL_WRITE_AT");
+    std::size_t writeStep = 0;
+    auto beginTemporaryWrite = [&]() {
+        ++writeStep;
+        if (injectedWriteException == writeStep) {
+            throw std::runtime_error(
+                "injected material temporary-write exception at step " +
+                std::to_string(writeStep));
+        }
+        if (injectedWriteFailure == writeStep) {
+            g->lastError =
+                "injected material temporary-write failure at step " +
+                std::to_string(writeStep);
+            return false;
+        }
+        return true;
+    };
+
+    bool writesOK = true;
+    if (!heightFinal.empty()) {
+        writesOK = beginTemporaryWrite();
+        if (writesOK) {
+            const std::string temp = transaction.tempFor(heightFinal).string();
+            switch (options.heightmapFormat) {
+            case HeightmapFormat::png16:
+                writesOK = writePNG16(temp.c_str(), terrain.data(), width, height,
+                                      result.minHeight, result.maxHeight,
+                                      g->lastError);
+                break;
+            case HeightmapFormat::r16:
+                writesOK = writeR16(temp.c_str(), terrain.data(), width, height,
+                                    result.minHeight, result.maxHeight,
+                                    g->lastError);
+                break;
+            case HeightmapFormat::pfm32:
+                writesOK = writePFM(temp.c_str(), terrain.data(), width, height,
+                                    g->lastError);
+                break;
+            case HeightmapFormat::none:
+                break;
+            }
+        }
+    }
+    if (writesOK && !meshFinal.empty()) {
+        writesOK = beginTemporaryWrite();
+        if (writesOK) {
+            const std::string temp = transaction.tempFor(meshFinal).string();
+            writesOK = writeOBJ(temp.c_str(), terrain.data(), width, height,
+                                options.verticalScale, options.meshStride,
+                                g->lastError);
+        }
+    }
     if (writesOK) {
-        std::ofstream stream(tempFor(manifestFinal));
-        if (!stream) {
-            g->lastError = "cannot write " + tempFor(manifestFinal).string();
-            writesOK = false;
-        } else {
-            stream << manifest.dump(2) << '\n';
+        writesOK = beginTemporaryWrite();
+        if (writesOK) {
+            const std::string temp = transaction.tempFor(weightsFinal).string();
+            writesOK = writePNG8RGBA(temp.c_str(), weightBytes.data(), width,
+                                     height, g->lastError);
+        }
+    }
+
+    if (writesOK) {
+        writesOK = beginTemporaryWrite();
+        if (writesOK) {
+            const auto manifestTemp = transaction.tempFor(manifestFinal);
+            std::ofstream stream(manifestTemp);
             if (!stream) {
-                g->lastError = "cannot write " + tempFor(manifestFinal).string();
+                g->lastError = "cannot write " + manifestTemp.string();
                 writesOK = false;
+            } else {
+                stream << manifest.dump(2) << '\n';
+                stream.flush();
+                if (!stream) {
+                    g->lastError = "cannot write " + manifestTemp.string();
+                    writesOK = false;
+                }
+                stream.close();
+                if (!stream && writesOK) {
+                    g->lastError = "cannot close " + manifestTemp.string();
+                    writesOK = false;
+                }
             }
         }
     }
     if (!writesOK) {
-        cleanupTemps();
+        const std::string rollbackError = transaction.rollback();
+        if (!rollbackError.empty()) {
+            g->lastError += "; rollback failed: " + rollbackError;
+        }
         g->lastErrorCode = GraphErrorCode::exportError;
         result.ok = false;
         return result;
     }
 
-    auto restoreBackups = [&] {
-        for (Artifact& artifact : artifacts) {
-            std::error_code ignored;
-            if (artifact.published) std::filesystem::remove(artifact.finalPath, ignored);
-        }
-        for (Artifact& artifact : artifacts) {
-            if (!artifact.backedUp) continue;
-            std::error_code ignored;
-            std::filesystem::rename(artifact.backupPath, artifact.finalPath, ignored);
-        }
-        cleanupTemps();
-    };
-
-    for (Artifact& artifact : artifacts) {
-        if (!std::filesystem::exists(artifact.finalPath)) continue;
+    for (MaterialExportArtifact& artifact : artifacts) {
+        if (!artifact.existed) continue;
+        ec.clear();
         std::filesystem::rename(artifact.finalPath, artifact.backupPath, ec);
         if (ec) {
             g->lastError = "cannot stage existing artifact '" +
                            artifact.finalPath.string() + "': " + ec.message();
-            restoreBackups();
+            const std::string rollbackError = transaction.rollback();
+            if (!rollbackError.empty()) {
+                g->lastError += "; rollback failed: " + rollbackError;
+            }
             g->lastErrorCode = GraphErrorCode::exportError;
             result.ok = false;
             return result;
         }
         artifact.backedUp = true;
     }
-    for (Artifact& artifact : artifacts) {
-        std::filesystem::rename(artifact.tempPath, artifact.finalPath, ec);
+    std::size_t publishStep = 0;
+    const std::size_t injectedPublishFailure =
+        materialTestStep("THEIA_TEST_FAIL_MATERIAL_PUBLISH_AT");
+    const std::size_t injectedPublishException =
+        materialTestStep("THEIA_TEST_THROW_MATERIAL_PUBLISH_AT");
+    for (MaterialExportArtifact& artifact : artifacts) {
+        ++publishStep;
+        if (injectedPublishException == publishStep) {
+            throw std::runtime_error(
+                "injected material publish exception at step " +
+                std::to_string(publishStep));
+        }
+        ec.clear();
+        if (injectedPublishFailure == publishStep) {
+            ec = std::make_error_code(std::errc::io_error);
+        } else {
+            std::filesystem::rename(artifact.tempPath, artifact.finalPath, ec);
+        }
         if (ec) {
             g->lastError = "cannot publish material artifact '" +
                            artifact.finalPath.string() + "': " + ec.message();
-            restoreBackups();
+            const std::string rollbackError = transaction.rollback();
+            if (!rollbackError.empty()) {
+                g->lastError += "; rollback failed: " + rollbackError;
+            }
             g->lastErrorCode = GraphErrorCode::exportError;
             result.ok = false;
             return result;
         }
         artifact.published = true;
     }
-    for (const Artifact& artifact : artifacts) {
-        if (!artifact.backedUp) continue;
-        std::error_code ignored;
-        std::filesystem::remove(artifact.backupPath, ignored);
+    // The new bundle is complete at this point. Disarm rollback before deleting
+    // backups: a cleanup failure must not remove an otherwise complete bundle
+    // after some previous-version backups have already been deleted.
+    transaction.commit();
+    const std::string cleanupErrors = transaction.removeBackups();
+    if (!cleanupErrors.empty()) {
+        g->setError(GraphErrorCode::exportError,
+                    "material artifacts were published but cleanup failed: " +
+                    cleanupErrors);
+        result.ok = false;
+        return result;
     }
     result.ok = true;
+    return result;
+    } catch (const std::exception& exception) {
+        std::string message =
+            std::string("material export failed: ") + exception.what();
+        const std::string rollbackError = transaction.rollback();
+        if (!rollbackError.empty()) {
+            message += "; rollback failed: " + rollbackError;
+        }
+        g->setError(GraphErrorCode::exportError, std::move(message));
+    } catch (...) {
+        std::string message =
+            "material export failed with an unknown exception";
+        const std::string rollbackError = transaction.rollback();
+        if (!rollbackError.empty()) {
+            message += "; rollback failed: " + rollbackError;
+        }
+        g->setError(GraphErrorCode::exportError, std::move(message));
+    }
+    result.ok = false;
     return result;
 }
 

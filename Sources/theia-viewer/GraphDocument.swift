@@ -81,6 +81,10 @@ struct GraphMaterialLayer: Codable, Identifiable, Equatable, Sendable {
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
         previewColorSRGB = try c.decode([Double].self, forKey: .previewColorSRGB)
+        if c.contains(.source), try c.decodeNil(forKey: .source) {
+            throw DecodingError.dataCorruptedError(forKey: .source, in: c,
+                debugDescription: "material source must be an object when present")
+        }
         source = try c.decodeIfPresent(GraphOutputReference.self, forKey: .source)
         guard !id.isEmpty, !name.isEmpty else {
             throw DecodingError.dataCorruptedError(forKey: .id, in: c,
@@ -90,6 +94,10 @@ struct GraphMaterialLayer: Codable, Identifiable, Equatable, Sendable {
               previewColorSRGB.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1 }) else {
             throw DecodingError.dataCorruptedError(forKey: .previewColorSRGB, in: c,
                 debugDescription: "previewColorSRGB must contain three finite values in [0,1]")
+        }
+        if let source, source.node.isEmpty || source.output.isEmpty {
+            throw DecodingError.dataCorruptedError(forKey: .source, in: c,
+                debugDescription: "material source node/output must not be empty")
         }
     }
 }
@@ -121,10 +129,9 @@ struct GraphMaterialStack: Codable, Equatable, Sendable {
             throw DecodingError.dataCorruptedError(forKey: .layers, in: c,
                 debugDescription: "material base layer must not have a source")
         }
-        guard layers.dropFirst().allSatisfy({ $0.source != nil }) else {
-            throw DecodingError.dataCorruptedError(forKey: .layers, in: c,
-                debugDescription: "material overlay layers require a source")
-        }
+        // A missing overlay source is a repairable semantic state. Viewer node
+        // deletion clears the reference without deleting/reordering the layer,
+        // while material validation still blocks preview and export.
         guard Set(layers.map(\.id)).count == layers.count else {
             throw DecodingError.dataCorruptedError(forKey: .layers, in: c,
                 debugDescription: "material layer ids must be unique")
@@ -539,7 +546,10 @@ struct GraphDocument: Codable {
         ui?.positions.removeValue(forKey: id)
         ui?.maskErases.removeValue(forKey: id)
         if var stack = materialStack {
-            stack.layers.removeAll { $0.source?.node == id }
+            for index in stack.layers.indices where
+                stack.layers[index].source?.node == id {
+                stack.layers[index].source = nil
+            }
             materialStack = stack
         }
         if sink == id {
@@ -556,9 +566,9 @@ struct GraphDocument: Codable {
             ui?.maskErases.removeValue(forKey: id)
         }
         if var stack = materialStack {
-            stack.layers.removeAll { layer in
-                guard let source = layer.source else { return false }
-                return ids.contains(source.node)
+            for index in stack.layers.indices where
+                stack.layers[index].source.map({ ids.contains($0.node) }) == true {
+                stack.layers[index].source = nil
             }
             materialStack = stack
         }
@@ -680,7 +690,7 @@ struct GraphDocument: Codable {
     }
 
     func upstreamNodeId(to nodeId: String, input: UInt32) -> String? {
-        connections.first { $0.to == nodeId && $0.input == input }?.from
+        connections.last { $0.to == nodeId && $0.input == input }?.from
     }
 
     func outputPorts(nodeId: String) -> [GraphOutputPort] {
@@ -697,7 +707,7 @@ struct GraphDocument: Codable {
               let port = Self.outputPorts(for: graphNode.type)
                 .first(where: { $0.name == selected }) else { return nil }
         guard let inheritedInput = port.inheritInput else { return port.declaredKind }
-        guard let edge = connections.first(where: {
+        guard let edge = connections.last(where: {
             $0.to == nodeId && $0.input == UInt32(inheritedInput)
         }) else { return port.declaredKind }
         var nextVisited = visited
@@ -717,8 +727,11 @@ struct GraphDocument: Codable {
         }
         var nextVisited = visited
         nextVisited.insert(reference.node)
-        for edge in connections.filter({ $0.to == reference.node })
-            .sorted(by: { $0.input < $1.input }) {
+        var effectiveInputs: [UInt32: GraphDocumentConnection] = [:]
+        for edge in connections where edge.to == reference.node {
+            effectiveInputs[edge.input] = edge
+        }
+        for edge in effectiveInputs.values.sorted(by: { $0.input < $1.input }) {
             let upstream = GraphOutputReference(node: edge.from, output: edge.output)
             if let terrain = terrainReference(for: upstream, visited: nextVisited) {
                 return terrain
@@ -730,8 +743,11 @@ struct GraphDocument: Codable {
     func materialTerrainCandidates() -> [GraphOutputReference] {
         nodes.flatMap { graphNode in
             Self.outputPorts(for: graphNode.type).compactMap { port in
-                resolvedOutputKind(nodeId: graphNode.id, output: port.name) == .terrain
-                    ? GraphOutputReference(node: graphNode.id, output: port.name) : nil
+                let reference = GraphOutputReference(node: graphNode.id,
+                                                     output: port.name)
+                return resolvedOutputKind(nodeId: graphNode.id,
+                                          output: port.name) == .terrain &&
+                    isOutputEvaluable(reference) ? reference : nil
             }
         }
     }
@@ -739,18 +755,88 @@ struct GraphDocument: Codable {
     func materialSourceCandidates() -> [GraphOutputReference] {
         nodes.flatMap { graphNode in
             Self.outputPorts(for: graphNode.type).compactMap { port in
+                let reference = GraphOutputReference(node: graphNode.id,
+                                                     output: port.name)
                 guard let kind = resolvedOutputKind(nodeId: graphNode.id,
                                                     output: port.name),
-                      kind == .mask || kind == .data else { return nil }
-                return GraphOutputReference(node: graphNode.id, output: port.name)
+                      kind == .mask || kind == .data,
+                      isOutputEvaluable(reference) else { return nil }
+                return reference
             }
         }
+    }
+
+    /// Material sources not already assigned to another overlay. When editing an
+    /// existing layer, pass its index so its current source remains available.
+    func unusedMaterialSourceCandidates(excludingLayerAt excludedIndex: Int? = nil)
+        -> [GraphOutputReference] {
+        let assigned: [GraphOutputReference] = materialStack?.layers.enumerated()
+            .compactMap { index, layer in
+            guard index > 0, index != excludedIndex else { return nil }
+            return layer.source
+        } ?? []
+        let used = Set<GraphOutputReference>(assigned)
+        return materialSourceCandidates().filter { !used.contains($0) }
+    }
+
+    /// Stable candidate order with unused outputs first. Used sources remain in
+    /// the result because duplicate references are legal when explicitly chosen.
+    func materialSourceCandidatesPrioritizingUnused(
+        excludingLayerAt excludedIndex: Int? = nil
+    ) -> [GraphOutputReference] {
+        let all = materialSourceCandidates()
+        let unused = Set(unusedMaterialSourceCandidates(
+            excludingLayerAt: excludedIndex))
+        return all.filter { unused.contains($0) } + all.filter { !unused.contains($0) }
+    }
+
+    /// Conservative authoring-time evaluability check. Node evaluation is atomic,
+    /// so every required input dependency must be complete even when only one
+    /// named output is being considered as a material source.
+    func isOutputEvaluable(_ reference: GraphOutputReference) -> Bool {
+        outputDependenciesAreComplete(reference, visiting: [])
+    }
+
+    private func outputDependenciesAreComplete(
+        _ reference: GraphOutputReference,
+        visiting: Set<String>
+    ) -> Bool {
+        guard let graphNode = node(id: reference.node),
+              Self.outputPorts(for: graphNode.type).contains(where: {
+                  $0.name == reference.output
+              }),
+              !visiting.contains(reference.node) else { return false }
+
+        var nextVisiting = visiting
+        nextVisiting.insert(reference.node)
+        var inputKinds: [GraphFieldKind] = []
+        for input in 0..<inputCount(for: graphNode.type) {
+            guard let edge = connections.last(where: {
+                $0.to == reference.node && $0.input == input
+            }) else { return false }
+            let upstream = GraphOutputReference(node: edge.from, output: edge.output)
+            guard outputDependenciesAreComplete(upstream, visiting: nextVisiting),
+                  let upstreamKind = resolvedOutputKind(nodeId: edge.from,
+                                                        output: edge.output) else {
+                return false
+            }
+            let accepted = Self.inputKinds(for: graphNode.type, input: input)
+            guard accepted.isEmpty || accepted.contains(upstreamKind) else { return false }
+            inputKinds.append(upstreamKind)
+        }
+
+        if (graphNode.type == "combine" || graphNode.type == "blend"),
+           inputKinds.count == 2, inputKinds[0] != inputKinds[1] {
+            return false
+        }
+        return true
     }
 
     func materialStackValidationMessage() -> String? {
         guard let stack = materialStack else { return "No material stack configured" }
         guard resolvedOutputKind(nodeId: stack.terrain.node,
-                                 output: stack.terrain.output) == .terrain else {
+                                 output: stack.terrain.output) == .terrain,
+              isOutputEvaluable(stack.terrain) else {
             return "Choose a valid terrain output"
         }
         guard (1...4).contains(stack.layers.count), stack.layers[0].source == nil else {
@@ -760,7 +846,8 @@ struct GraphDocument: Codable {
             guard let source = layer.source,
                   let kind = resolvedOutputKind(nodeId: source.node,
                                                 output: source.output),
-                  kind == .mask || kind == .data else {
+                  (kind == .mask || kind == .data),
+                  isOutputEvaluable(source) else {
                 return "Layer \(layer.name) needs a mask or data source"
             }
         }
@@ -861,6 +948,15 @@ struct GraphDocument: Codable {
                                    inheritInput: inherited >= 0 ? Int(inherited) : nil,
                                    isDefault: theia.graph_node_type_output_is_default(type, index))
         }
+    }
+
+    private static func inputKinds(for type: String,
+                                   input: UInt32) -> Set<GraphFieldKind> {
+        Set(readCxxString {
+            theia.graph_node_type_input_kinds(type, input, $0, $1)
+        }.split(separator: ",").compactMap {
+            GraphFieldKind(rawValue: String($0))
+        })
     }
 
     static func defaultOutputName(for type: String) -> String {

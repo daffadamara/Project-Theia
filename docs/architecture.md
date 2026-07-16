@@ -6,6 +6,10 @@ Theia is split into a portable graph engine and two Swift front ends.
 
 - `TheiaCore` owns graph validation, incremental content-hash caching, Metal
   compute, CPU hydrology, editor mask edits, and all export writers.
+- GPU hydraulic erosion follows a documented virtual-pipe/shallow-water update
+  with non-negative water, bounded wet/dry velocity and bed exchange, then an
+  input-relative conservative settling pass that removes solver-created
+  needles without blurring legitimate source relief.
 - `include/Theia/Theia.hpp` is the only Swift-facing API. Metal and
   implementation-only C++ types stay private.
 - Graph JSON reloads are transactional. Successful reloads preserve compatible
@@ -22,8 +26,9 @@ Theia is split into a portable graph engine and two Swift front ends.
   migrate without acquiring a material stack.
 - A material stack is a derived document asset over scalar graph outputs, not a
   new field kind. The core evaluates one terrain reference and up to three
-  deduplicated mask/data sources, normalizes four weights, and transactionally
-  exports linear RGBA8 weights plus a channel/source manifest.
+  deduplicated mask/data sources, normalizes four weights, caches that derived
+  RGBA field by ordered source content keys, and transactionally exports linear
+  RGBA8 weights plus a channel/source manifest.
 - `ui.maskErases[nodeId][outputName]` is the one semantic editor field: it participates in node
   hashes and graph evaluation so preview, downstream nodes, CLI, and viewer
   export agree. It is applied only when the resolved output kind is `mask`.
@@ -35,9 +40,12 @@ Theia is split into a portable graph engine and two Swift front ends.
   migrations.
 - `GraphDocumentHistory` owns bounded undo/redo state.
 - `TerrainModel` coordinates document mutations and MainActor presentation.
+- High-frequency camera revision state lives in a dedicated observable consumed
+  only by the axis gizmo; orbit/pan/zoom does not invalidate `TerrainModel` or
+  rebuild the material authoring panel.
 - `TerrainPreviewWorker` owns a separate graph handle on a serial background
-  queue. New snapshots supersede queued work and stale completed results are
-  discarded.
+  queue. A short coalescing window removes rapid intermediate edits; new
+  snapshots supersede queued work and stale completed results are discarded.
 - The ephemeral `previewReference` supplies preview data, while
   `sink`/`sinkOutput` changes only through an explicit authoring action.
   Non-terrain fields reuse a
@@ -46,8 +54,8 @@ Theia is split into a portable graph engine and two Swift front ends.
 - `TerrainEngine` is retained for synchronous validation and explicit save.
 - `Renderer`, `TerrainSurfacePicker`, and `TerrainShaders` own rendering and
   surface-aware viewport interaction. Material preview passes packed scalar
-  weights to Metal, decodes stored sRGB colors to linear light, blends, lights,
-  and encodes for the non-sRGB display target.
+  weights to Metal, decodes stored sRGB colors once on the CPU, then blends,
+  lights, and encodes for the non-sRGB display target.
 - Export, graph output, node inspector, viewport controls, and the main content
   shell are separate SwiftUI files to keep feature boundaries reviewable.
 

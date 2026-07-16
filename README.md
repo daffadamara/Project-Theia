@@ -1,6 +1,6 @@
 # Theia
 
-**Current version:** `0.11.0-alpha.1`
+**Current version:** `0.11.0-alpha.2`
 
 A node-based procedural terrain generator for macOS, built on Metal compute —
 a Mac-native take on tools like GAEA and World Machine (which are Windows-only).
@@ -115,9 +115,18 @@ change CLI/export behavior. Use **Set as Graph Output** to update the persisted
 Graph format v3 can store one semantic `materialStack`: a terrain reference,
 one base/fallback color, and up to three overlay sources resolved as `mask` or
 `data`. The viewer's global Material Layers panel authors channel order,
-sources, names, and sRGB preview colors. Preview colors are decoded to linear
+sources, names, and sRGB preview colors. **Add Overlay** requires an explicit
+source choice and offers unused outputs first; duplicate sources remain an
+explicit advanced choice. A centered `data` field such as
+`erosionfilter.ridge` should pass through a `remap` node before it is used as
+coverage (`0.5` is otherwise 50% coverage). Preview colors are decoded to linear
 light before a convex weight blend; color-only edits update shader uniforms
-without reevaluating the graph. `export-material` writes the terrain artifact,
+without reevaluating the graph or rebuilding preview buffers. Scalar outputs
+and packed weights are cached, while rapid layer edits are coalesced by the
+preview worker. Deleting a referenced source clears that layer's source without
+reordering its public RGBA channel; the stack remains repairable, while material
+preview/export stay blocked until a valid source is chosen. `export-material`
+writes the terrain artifact,
 optional OBJ, linear `<basename>_weights.png` (`RGBA8`, every texel sums to
 `255`), and a channel/source manifest.
 When a mask preview is active, the viewport exposes an erase brush for hiding
@@ -126,6 +135,8 @@ press `E`), then drag over the terrain; brush radius and `Clear` remain availabl
 in viewport settings. Those edits are saved per node/output in `ui.maskErases`, consumed by the
 core during graph evaluation, propagated to downstream nodes, and included in
 CLI/viewer exports. Other editor-only `ui` metadata remains non-semantic.
+The brush is disabled for composite material preview, so it can never alter the
+terrain/weight buffers accidentally; use **Inspect Source** to edit a mask.
 
 Viewport navigation follows common 3D editor conventions: left-drag orbits,
 Shift-left-drag / middle-drag / right-drag pans, wheel or pinch zooms,
@@ -143,7 +154,7 @@ menus, and a camera-aware axis gizmo for snapping to X/Y/Z views.
 |-------------|:------:|----------------------------------------------------------|
 | `perlin`    |   0    | fBm Perlin noise (seed, octaves, frequency, lacunarity, gain) |
 | `ridged`    |   0    | ridged multifractal-style fBm generator                       |
-| `hydraulic` |   1    | hydraulic erosion, Mei et al. 2007 virtual-pipes model   |
+| `hydraulic` |   1    | stable GPU hydraulic erosion with virtual-pipe flow, sediment transport, and conservative bank settling |
 | `dropleterosion` | 1 | deterministic particle hydrology with discharge/momentum feedback |
 | `erosionfilter` | 1 | point-local gully filter; outputs `height` terrain and `ridge` data |
 | `river` | 1 | terrain-traced river mask with seed, headwaters, water, and width controls |

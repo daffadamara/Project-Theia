@@ -534,14 +534,26 @@ private struct ParameterPresentation {
     }
 
     static func `for`(_ param: GraphParameter) -> ParameterPresentation {
-        ParameterPresentation(label: label(for: param.name),
+        ParameterPresentation(label: label(for: param),
                               detail: detail(for: param),
                               unit: unit(for: param),
                               icon: icon(for: param),
                               group: group(for: param))
     }
 
-    private static func label(for name: String) -> String {
+    private static func label(for param: GraphParameter) -> String {
+        if param.nodeType == "hydraulic" {
+            switch param.name {
+            case "rain": return "Rainfall"
+            case "suspension": return "Erosion Rate"
+            case "sedimentCapacity": return "Sediment Capacity"
+            case "minTilt": return "Slope Floor"
+            case "heightScale": return "Vertical Scale"
+            case "dt": return "Time Step"
+            default: break
+            }
+        }
+        let name = param.name
         switch name {
         case "dt": return "Delta Time"
         case "t": return "Mix"
@@ -577,6 +589,37 @@ private struct ParameterPresentation {
     }
 
     private static func detail(for param: GraphParameter) -> String? {
+        if param.nodeType == "hydraulic" {
+            switch param.name {
+            case "iterations":
+                return "Controls simulation duration and erosion development."
+            case "rain":
+                return "Adds water uniformly during each simulation step."
+            case "sedimentCapacity":
+                return "Controls how much material moving water can carry."
+            case "suspension":
+                return "Controls how quickly flowing water picks up terrain."
+            case "deposition":
+                return "Controls how quickly excess sediment returns to the bed."
+            case "dt":
+                return "Numerical timestep, not effect strength. Keep it low."
+            case "minTilt":
+                return "Minimum slope used for capacity. High values erase slope selectivity."
+            case "heightScale":
+                return "Vertical scale inside the simulation; output height is unchanged."
+            case "gravity":
+                return "Pressure acceleration used by the virtual-pipe flow."
+            case "pipeArea":
+                return "Cross-section of each virtual flow pipe."
+            case "pipeLength":
+                return "Length of each virtual flow pipe."
+            case "cellSize":
+                return "Horizontal spacing represented by one terrain cell."
+            case "evaporation":
+                return "Removes water after flow and sediment transport."
+            default: break
+            }
+        }
         switch param.name {
         case "frequency": return "Controls the overall scale."
         case "gain": return "Controls the amplitude."
@@ -690,6 +733,14 @@ private struct ParameterPresentation {
     }
 
     private static func group(for param: GraphParameter) -> ParameterGroup {
+        if param.nodeType == "hydraulic" {
+            switch param.name {
+            case "iterations", "rain", "sedimentCapacity", "suspension", "deposition":
+                return .basic
+            default:
+                return .advanced
+            }
+        }
         let advancedNames: Set<String> = [
             "particles", "maxAge", "iterations", "dt", "pipeArea",
             "pipeLength", "rain", "sedimentCapacity", "suspension",
@@ -699,7 +750,7 @@ private struct ParameterPresentation {
         if advancedNames.contains(param.name) {
             return .advanced
         }
-        if param.nodeType == "hydraulic" || param.nodeType == "dropleterosion" {
+        if param.nodeType == "dropleterosion" {
             switch param.name {
             case "heightScale", "depth", "downcutting", "riverValleyWidth":
                 return .basic
@@ -811,13 +862,27 @@ struct SliderConfig {
             return SliderConfig(range: 0.1...32, step: 0.1, precision: 1)
         case "lacunarity":
             return SliderConfig(range: 1...4, step: 0.05, precision: 2)
-        case "gain", "t", "rain", "sedimentCapacity",
-             "suspension", "minTilt", "opacity", "amount",
+        case "gain", "t", "opacity", "amount",
              "water", "depth", "downcutting":
+            return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "rain":
+            if param.nodeType == "hydraulic" {
+                return SliderConfig(range: 0...0.05, step: 0.001, precision: 3)
+            }
+            return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "sedimentCapacity", "suspension":
+            return SliderConfig(range: 0...1, step: 0.01, precision: 2)
+        case "minTilt":
+            if param.nodeType == "hydraulic" {
+                return SliderConfig(range: 0...0.15, step: 0.005, precision: 3)
+            }
             return SliderConfig(range: 0...1, step: 0.01, precision: 2)
         case "deposition":
             return SliderConfig(range: 0...0.6, step: 0.01, precision: 2)
         case "evaporation":
+            if param.nodeType == "hydraulic" {
+                return SliderConfig(range: 0...0.1, step: 0.005, precision: 3)
+            }
             return SliderConfig(range: 0...0.4, step: 0.005, precision: 3)
         case "width":
             if param.nodeType == "river" {
@@ -902,10 +967,19 @@ struct SliderConfig {
             if param.nodeType == "slopemask" {
                 return SliderConfig(range: 1...300, step: 1, precision: 0)
             }
+            if param.nodeType == "hydraulic" {
+                return SliderConfig(range: 10...150, step: 1, precision: 0)
+            }
             return SliderConfig(range: 1...200, step: 1, precision: 0)
         case "dt":
+            if param.nodeType == "hydraulic" {
+                return SliderConfig(range: 0.001...0.025, step: 0.001, precision: 3)
+            }
             return SliderConfig(range: 0.001...0.1, step: 0.001, precision: 3)
         case "gravity":
+            if param.nodeType == "hydraulic" {
+                return SliderConfig(range: 0...20, step: 0.1, precision: 1)
+            }
             return SliderConfig(range: 0...6, step: 0.1, precision: 1)
         case "pipeArea", "pipeLength", "cellSize":
             return SliderConfig(range: 0.1...4, step: 0.1, precision: 1)
